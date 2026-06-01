@@ -217,6 +217,7 @@ interface KiroApi {
       accessToken: string
       refreshToken: string
       expiresIn?: number
+      profileArn?: string
       subscriptionType: string
       subscriptionTitle: string
       subscription?: {
@@ -249,6 +250,26 @@ interface KiroApi {
       daysRemaining?: number
       expiresAt?: number
     }
+    error?: string
+  }>
+
+  // 获取/刷新账号的真实 profileArn（回填历史 IdC 账号的占位符 ARN）
+  fetchAccountProfileArn: (account: {
+    id?: string
+    credentials?: {
+      accessToken?: string
+      refreshToken?: string
+      clientId?: string
+      clientSecret?: string
+      region?: string
+      authMethod?: string
+    }
+  }) => Promise<{
+    success: boolean
+    profileArn?: string
+    newAccessToken?: string
+    newRefreshToken?: string
+    expiresIn?: number
     error?: string
   }>
 

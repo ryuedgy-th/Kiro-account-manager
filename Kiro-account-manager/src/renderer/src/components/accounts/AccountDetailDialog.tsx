@@ -316,6 +316,8 @@ export function AccountDetailDialog({
                  </div>
                  {/* 代理绑定（B4） */}
                  <ProxyBindingSection accountId={account.id} accountEmail={account.email || ''} isEn={isEn} />
+                 {/* Profile ARN（IdC/Enterprise 需真实 ARN，否则反代 403） */}
+                 <ProfileArnSection account={account} isEn={isEn} />
                </div>
              </section>
 
@@ -453,6 +455,93 @@ export function AccountDetailDialog({
       </div>
     </div>,
     document.body
+  )
+}
+
+/** Profile ARN 段：IdC/Enterprise 需真实 ARN，占位符会导致反代 403 */
+function ProfileArnSection({ account, isEn }: { account: Account; isEn: boolean }): React.ReactNode {
+  const { updateAccount } = useAccountsStore()
+  const [loading, setLoading] = useState(false)
+  const [msg, setMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null)
+
+  const arn = account.profileArn
+  const isPlaceholder = !arn || arn.includes('AAAACCCCXXXX')
+  const isSocial = account.credentials?.authMethod === 'social' || account.idp === 'Google' || account.idp === 'Github'
+  // 社交账号用共享 ARN，无需真实 profileArn；仅 IdC/Enterprise 需要
+  const needsRealArn = !isSocial && isPlaceholder
+
+  const handleRefresh = async (): Promise<void> => {
+    setLoading(true)
+    setMsg(null)
+    try {
+      const res = await window.api.fetchAccountProfileArn({
+        id: account.id,
+        credentials: {
+          accessToken: account.credentials?.accessToken,
+          refreshToken: account.credentials?.refreshToken,
+          clientId: account.credentials?.clientId,
+          clientSecret: account.credentials?.clientSecret,
+          region: account.credentials?.region,
+          authMethod: account.credentials?.authMethod
+        }
+      })
+      if (res.success && res.profileArn) {
+        const updates: Partial<Account> = { profileArn: res.profileArn }
+        // 若顺带刷新了 token，一并持久化
+        if (res.newAccessToken) {
+          updates.credentials = {
+            ...account.credentials,
+            accessToken: res.newAccessToken,
+            refreshToken: res.newRefreshToken || account.credentials?.refreshToken,
+            expiresAt: res.expiresIn ? Date.now() + res.expiresIn * 1000 : account.credentials?.expiresAt
+          } as Account['credentials']
+        }
+        updateAccount(account.id, updates)
+        setMsg({ type: 'ok', text: isEn ? 'Profile ARN updated' : 'Profile ARN 已更新' })
+      } else {
+        setMsg({ type: 'err', text: res.error || (isEn ? 'Failed to fetch' : '获取失败') })
+      }
+    } catch (e) {
+      setMsg({ type: 'err', text: e instanceof Error ? e.message : 'Error' })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="space-y-1 mt-3">
+      <label className="text-xs font-medium text-muted-foreground">Profile ARN</label>
+      <div className={cn(
+        'flex items-center gap-2 px-3 py-2 rounded-lg border',
+        needsRealArn ? 'bg-amber-500/10 border-amber-500/30' : 'bg-muted/40 border-border'
+      )}>
+        <span className="text-xs font-mono flex-1 truncate" title={arn || '-'}>
+          {arn ? (isPlaceholder ? (isEn ? '(placeholder — not valid)' : '(占位符 — 无效)') : arn) : '-'}
+        </span>
+        {needsRealArn && (
+          <Badge variant="outline" className="text-[10px] text-amber-600 dark:text-amber-400 border-amber-500/40">
+            {isEn ? 'invalid' : '无效'}
+          </Badge>
+        )}
+        <Button size="sm" variant="ghost" className="h-7 text-xs" disabled={loading} onClick={handleRefresh}>
+          {loading
+            ? <Loader2 className="h-3 w-3 animate-spin" />
+            : (isEn ? 'Refresh ARN' : '刷新 ARN')}
+        </Button>
+      </div>
+      {needsRealArn && !msg && (
+        <p className="text-[11px] text-amber-600 dark:text-amber-400">
+          {isEn
+            ? 'IdC/Enterprise accounts need a real Profile ARN, or proxy calls return 403. Click "Refresh ARN".'
+            : 'IdC/企业账号需要真实 Profile ARN，否则反代调用会 403。点击"刷新 ARN"。'}
+        </p>
+      )}
+      {msg && (
+        <p className={cn('text-[11px]', msg.type === 'ok' ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive')}>
+          {msg.text}
+        </p>
+      )}
+    </div>
   )
 }
 

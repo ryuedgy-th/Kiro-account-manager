@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { 
-  Key, Plus, Trash2, Copy, Check, RefreshCw, Eye, EyeOff, 
-  BarChart3, Clock, Zap, MessageSquare, ExternalLink
+import {
+  Key, Plus, Trash2, Copy, Check, RefreshCw, Eye, EyeOff,
+  BarChart3, Clock, Zap, MessageSquare, ExternalLink, Users, Search
 } from 'lucide-react'
 import { Select } from '@/components/ui'
 import { cn } from '@/lib/utils'
@@ -54,9 +54,9 @@ interface ApiKey {
 }
 
 export function ApiKeyManager() {
-  const { language } = useAccountsStore()
+  const { language, accounts } = useAccountsStore()
   const isEn = language === 'en'
-  
+
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
   const [loading, setLoading] = useState(true)
   const [newKeyName, setNewKeyName] = useState('')
@@ -66,6 +66,18 @@ export function ApiKeyManager() {
   const [showKeys, setShowKeys] = useState<Set<string>>(new Set())
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [showUsageDialog, setShowUsageDialog] = useState(false)
+  // P2-21 API Key → 账号白名单绑定（apiKeyId -> accountId[]）；空数组/未配置 = 允许所有账号
+  const [bindings, setBindings] = useState<Record<string, string[]>>({})
+  const [bindingSearch, setBindingSearch] = useState('')
+
+  // 账号列表（id + 显示名），用于绑定选择
+  const accountList = useMemo(() => {
+    const map = accounts as Map<string, { id: string; email?: string; nickname?: string }>
+    return Array.from(map.values()).map(a => ({
+      id: a.id,
+      label: a.nickname || a.email || a.id
+    }))
+  }, [accounts])
 
   const loadApiKeys = useCallback(async () => {
     try {
@@ -80,9 +92,56 @@ export function ApiKeyManager() {
     }
   }, [])
 
+  // 加载当前的账号绑定配置
+  const loadBindings = useCallback(async () => {
+    try {
+      const status = await window.api.proxyGetStatus()
+      const cfg = status?.config as { apiKeyAccountBindings?: Record<string, string[]> } | undefined
+      setBindings(cfg?.apiKeyAccountBindings || {})
+    } catch (error) {
+      console.error('Failed to load API key bindings:', error)
+    }
+  }, [])
+
   useEffect(() => {
     loadApiKeys()
-  }, [loadApiKeys])
+    loadBindings()
+  }, [loadApiKeys, loadBindings])
+
+  // 切换某个账号在当前 key 的绑定状态，并持久化到反代配置
+  const toggleBinding = useCallback(async (apiKeyId: string, accountId: string) => {
+    const current = bindings[apiKeyId] || []
+    const next = current.includes(accountId)
+      ? current.filter(id => id !== accountId)
+      : [...current, accountId]
+    const nextBindings = { ...bindings }
+    if (next.length === 0) {
+      delete nextBindings[apiKeyId]
+    } else {
+      nextBindings[apiKeyId] = next
+    }
+    setBindings(nextBindings)
+    try {
+      await window.api.proxyUpdateConfig({ apiKeyAccountBindings: nextBindings })
+    } catch (error) {
+      console.error('Failed to save API key binding:', error)
+      // 失败回滚到上一状态
+      setBindings(bindings)
+    }
+  }, [bindings])
+
+  // 清空某个 key 的绑定（= 允许所有账号）
+  const clearBinding = useCallback(async (apiKeyId: string) => {
+    const nextBindings = { ...bindings }
+    delete nextBindings[apiKeyId]
+    setBindings(nextBindings)
+    try {
+      await window.api.proxyUpdateConfig({ apiKeyAccountBindings: nextBindings })
+    } catch (error) {
+      console.error('Failed to clear API key binding:', error)
+      setBindings(bindings)
+    }
+  }, [bindings])
 
   const handleAddKey = async () => {
     if (!newKeyName.trim()) return
@@ -112,6 +171,15 @@ export function ApiKeyManager() {
       if (result.success) {
         setApiKeys(prev => prev.filter(k => k.id !== id))
         if (selectedKey === id) setSelectedKey(null)
+        // 同步清理该 key 的账号绑定，避免遗留无主绑定
+        if (bindings[id]) {
+          const nextBindings = { ...bindings }
+          delete nextBindings[id]
+          setBindings(nextBindings)
+          window.api.proxyUpdateConfig({ apiKeyAccountBindings: nextBindings }).catch(err =>
+            console.error('Failed to clean up binding after key deletion:', err)
+          )
+        }
       }
     } catch (error) {
       console.error('Failed to delete API key:', error)
@@ -259,7 +327,18 @@ export function ApiKeyManager() {
                   </div>
                   
                   <div className="flex-1 min-w-0 overflow-hidden">
-                    <div className="font-medium truncate">{apiKey.name}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium truncate">{apiKey.name}</span>
+                      {(bindings[apiKey.id]?.length ?? 0) > 0 && (
+                        <span
+                          className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary whitespace-nowrap"
+                          title={isEn ? 'Locked to specific accounts' : '已锁定到指定账号'}
+                        >
+                          <Users className="h-2.5 w-2.5" />
+                          {bindings[apiKey.id].length}
+                        </span>
+                      )}
+                    </div>
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                       <code className="bg-muted px-1 rounded">
                         {showKeys.has(apiKey.id) ? apiKey.key : maskKey(apiKey.key)}
@@ -378,6 +457,96 @@ export function ApiKeyManager() {
                 />
                 <span className="text-xs text-muted-foreground">{isEn ? '(0 = unlimited)' : '(0 = 无限制)'}</span>
               </div>
+
+              {/* P2-21 账号绑定：限制此 Key 只能使用指定账号 */}
+              {(() => {
+                const bound = bindings[selectedKeyData.id] || []
+                const isBound = bound.length > 0
+                const filteredAccounts = bindingSearch.trim()
+                  ? accountList.filter(a => a.label.toLowerCase().includes(bindingSearch.trim().toLowerCase()))
+                  : accountList
+                return (
+                  <div className="space-y-2 rounded-lg border p-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Users className="h-4 w-4 text-primary" />
+                        <span className="text-sm font-medium">{isEn ? 'Account Binding' : '账号绑定'}</span>
+                      </div>
+                      <span className={cn(
+                        'text-xs px-2 py-0.5 rounded-full',
+                        isBound ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
+                      )}>
+                        {isBound
+                          ? (isEn ? `${bound.length} bound` : `已绑定 ${bound.length} 个`)
+                          : (isEn ? 'All accounts' : '所有账号')}
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {isEn
+                        ? 'This key may only use the selected accounts. Leave empty to allow all accounts.'
+                        : '此 Key 仅能使用选中的账号。不选 = 允许所有账号。'}
+                    </p>
+
+                    {accountList.length === 0 ? (
+                      <div className="text-xs text-muted-foreground py-2 text-center">
+                        {isEn ? 'No accounts available' : '暂无可用账号'}
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-2">
+                          <div className="relative flex-1">
+                            <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground" />
+                            <Input
+                              value={bindingSearch}
+                              onChange={e => setBindingSearch(e.target.value)}
+                              placeholder={isEn ? 'Search accounts...' : '搜索账号...'}
+                              className="h-8 pl-7 text-xs"
+                            />
+                          </div>
+                          {isBound && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 whitespace-nowrap"
+                              onClick={() => clearBinding(selectedKeyData.id)}
+                            >
+                              {isEn ? 'Clear' : '清空'}
+                            </Button>
+                          )}
+                        </div>
+                        <div className="max-h-44 overflow-y-auto space-y-1 pr-1">
+                          {filteredAccounts.map(acc => {
+                            const checked = bound.includes(acc.id)
+                            return (
+                              <label
+                                key={acc.id}
+                                className={cn(
+                                  'flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer text-sm transition-colors',
+                                  checked ? 'bg-primary/5' : 'hover:bg-muted/50'
+                                )}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleBinding(selectedKeyData.id, acc.id)}
+                                  className="accent-primary"
+                                />
+                                <span className="truncate" title={acc.label}>{acc.label}</span>
+                              </label>
+                            )
+                          })}
+                          {filteredAccounts.length === 0 && (
+                            <div className="text-xs text-muted-foreground py-2 text-center">
+                              {isEn ? 'No matching accounts' : '未找到匹配账号'}
+                            </div>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )
+              })()}
+
               <div className="text-xs text-muted-foreground space-y-1">
                 <div className="flex items-center gap-2">
                   <Clock className="h-3 w-3" />

@@ -29,6 +29,13 @@ import type {
 } from './types'
 import { buildKiroPayload, mapModelId } from './kiroApi'
 import { ToolNameRegistry } from './toolNameRegistry'
+import { proxyLogger } from './logger'
+import {
+  isServerWebTool,
+  WEB_SEARCH_INPUT_SCHEMA, WEB_FETCH_INPUT_SCHEMA,
+  WEB_SEARCH_TOOL_DESCRIPTION, WEB_FETCH_TOOL_DESCRIPTION,
+  WEB_SEARCH_TOOL_NAME, WEB_FETCH_TOOL_NAME
+} from './webTools'
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
@@ -44,6 +51,27 @@ function modelSupportsThinkingParam(modelId: string): boolean {
   if (lower === 'auto') return false
   // claude-sonnet-4、claude-opus-4、claude-haiku-4.5 等都支持
   return true
+}
+
+// 统一构建 additionalModelRequestFields（thinking + reasoning effort）
+// effort 走 additionalModelRequestFields.output_config.effort（与 /v1/models 暴露的 schema 对齐，
+// 见 proxyServer.ts extractThinkingEfforts：output_config 与 thinking 同级，位于 additionalModelRequestFields 下）
+// 仅对支持 thinking 的 Claude 4+ 模型传递；非 Claude 模型 schema 无这些属性，传了会 400
+function buildAdditionalModelRequestFields(
+  modelId: string,
+  thinking?: { type: string } | undefined,
+  effort?: string | undefined
+): Record<string, unknown> | undefined {
+  if (!modelSupportsThinkingParam(modelId)) return undefined
+  const fields: Record<string, unknown> = {}
+  if (thinking && thinking.type !== 'disabled') {
+    fields.thinking = { type: 'adaptive' }
+  }
+  const normalizedEffort = effort?.trim()
+  if (normalizedEffort) {
+    fields.output_config = { effort: normalizedEffort }
+  }
+  return Object.keys(fields).length > 0 ? fields : undefined
 }
 
 function toKiroCachePoint(cacheControl?: { type: string }): KiroCachePoint | undefined {
@@ -145,6 +173,8 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   const toolChoice = convertResponseToolChoice(request.tool_choice)
   if (toolChoice !== undefined) chatRequest.tool_choice = toolChoice
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
+  // Responses API 的 reasoning.effort 映射到 chat 的 reasoning_effort，最终透传到 Kiro
+  if (request.reasoning?.effort) chatRequest.reasoning_effort = request.reasoning.effort
   if (request.metadata !== undefined) chatRequest.metadata = request.metadata
   if (request.kiro_context !== undefined) chatRequest.kiro_context = request.kiro_context
   return chatRequest
@@ -433,12 +463,13 @@ export function openaiToKiro(
   // 转换工具定义
   const kiroTools = convertOpenAITools(request.tools, toolNameRegistry)
 
-  // OpenAI 兼容请求的 thinking 映射到 Kiro additionalModelRequestFields
+  // OpenAI 兼容请求的 thinking + reasoning_effort 映射到 Kiro additionalModelRequestFields
   // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
-  let additionalModelRequestFields: Record<string, unknown> | undefined
-  if (request.thinking && request.thinking.type !== 'disabled' && modelSupportsThinkingParam(modelId)) {
-    additionalModelRequestFields = { thinking: { type: 'adaptive' } }
-  }
+  const additionalModelRequestFields = buildAdditionalModelRequestFields(
+    modelId,
+    request.thinking,
+    request.reasoning_effort
+  )
 
   return buildKiroPayload(
     finalContent,
@@ -590,6 +621,28 @@ function normalizeDocumentFormat(mediaType: string | undefined, name: string): s
 // Kiro API 工具描述最大长度
 const KIRO_MAX_TOOL_DESC_LEN = 10237 // 留出 "..." 的空间
 
+// Anthropic 的 server-side / Anthropic-defined 工具（web_search / computer / text_editor / bash / memory / tool_search 等）
+// 用 { type, name } 声明、不带 input_schema，需由供应商在服务端执行或走 native InvokeModel + anthropic_beta。
+// 本代理经 CodeWhisperer GenerateAssistantResponse（Amazon Q 专有协议）转发，其 toolSpecification 只有
+// { name, description, inputSchema }，没有声明 server 工具的 type 字段，后端也没有对应 handler；
+// 传入空 inputSchema 会被以 "inputSchema is empty" 整条请求 400 拒绝。
+// 注：AWS 文档明确 "web_search_20250305 server tool is not supported on Amazon Bedrock"；
+// 其它 Anthropic-defined 工具即便 Bedrock native 支持，也无法经此 CodeWhisperer 通道执行。
+// 故在转换前过滤掉缺少可用 JSON schema 的工具，保留普通 custom 工具正常工作。
+// 注意：无参工具的合法 schema 是 { type: 'object' }（可无 properties），不应被误删——
+// 仅当 schema 为 undefined/null/非对象/空对象时才判定为不受支持的 server 工具。
+function hasUsableInputSchema(inputSchema: unknown): boolean {
+  if (inputSchema === null || typeof inputSchema !== 'object') return false
+  // 空对象 {} 视为不可用（server 工具常表现为无 schema）；{ type: 'object' } 等有键的对象视为可用
+  return Object.keys(inputSchema as Record<string, unknown>).length > 0
+}
+
+// OpenAI function 工具一律是 custom 工具（无 server 工具概念），parameters 可选：
+// 无参函数是合法用例。但 Bedrock 不接受空 inputSchema，故将缺失/空的 schema 规范化为合法的空对象 schema。
+function normalizeCustomToolSchema(schema: unknown): Record<string, unknown> {
+  return hasUsableInputSchema(schema) ? (schema as Record<string, unknown>) : { type: 'object', properties: {} }
+}
+
 function convertOpenAITools(
   tools: OpenAITool[] | undefined,
   toolNameRegistry: ToolNameRegistry
@@ -606,7 +659,7 @@ function convertOpenAITools(
       toolSpecification: {
         name: shortenToolName(tool.function.name, toolNameRegistry),
         description,
-        inputSchema: { json: tool.function.parameters }
+        inputSchema: { json: normalizeCustomToolSchema(tool.function.parameters) }
       }
     }
     const cachePoint = toKiroCachePoint(tool.cache_control)
@@ -713,7 +766,8 @@ export function createOpenaiStreamChunk(
 export function claudeToKiro(
   request: ClaudeRequest,
   profileArn?: string,
-  toolNameRegistry: ToolNameRegistry = new ToolNameRegistry()
+  toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
+  webToolsEnabled = false
 ): KiroPayload {
   const modelId = mapModelId(request.model)
   const origin = 'AI_EDITOR'
@@ -907,15 +961,16 @@ export function claudeToKiro(
   const finalContent = currentContent || (currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue')
 
   // 转换工具定义
-  const kiroTools = convertClaudeTools(request.tools, toolNameRegistry)
+  const kiroTools = convertClaudeTools(request.tools, toolNameRegistry, webToolsEnabled)
 
-  // 将 Claude thinking 参数映射为 Kiro additionalModelRequestFields
+  // 将 Claude thinking + output_config.effort 参数映射为 Kiro additionalModelRequestFields
   // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
-  // 非 Claude 模型（deepseek/minimax/glm 等）的 schema 没有 thinking 属性，传了会 400
-  let additionalModelRequestFields: Record<string, unknown> | undefined
-  if (request.thinking && request.thinking.type !== 'disabled' && modelSupportsThinkingParam(modelId)) {
-    additionalModelRequestFields = { thinking: { type: 'adaptive' } }
-  }
+  // 非 Claude 模型（deepseek/minimax/glm 等）的 schema 没有这些属性，传了会 400
+  const additionalModelRequestFields = buildAdditionalModelRequestFields(
+    modelId,
+    request.thinking,
+    request.output_config?.effort
+  )
 
   return buildKiroPayload(
     finalContent,
@@ -1032,6 +1087,13 @@ function extractClaudeAssistantContent(
           name: toolNameRegistry.toKiroName(block.name),
           input: block.input as Record<string, unknown>
         })
+      } else if (block.type === 'server_tool_use' || block.type === 'web_search_tool_result') {
+        // 多轮场景：客户端会把上一轮我们合成的 server_tool_use / web_search_tool_result
+        // 原样回传进 history。这两类是 Anthropic server-tool 专有 block，由代理侧执行并已完成，
+        // Kiro/CodeWhisperer 后端不认识它们（且 server_tool_use 不在 tools 声明里，作为 toolUse 回传
+        // 会因缺少配对的 tool schema / tool_result 触发 400）。因此显式丢弃，不转成 Kiro toolUse。
+        // 真正的回答文本与引用已在同一条 assistant message 的独立 text block 中，照常累加。
+        continue
       }
     }
   }
@@ -1056,12 +1118,37 @@ function extractClaudeAssistantContent(
 }
 
 function convertClaudeTools(
-  tools: { name: string; description: string; input_schema: unknown; cache_control?: { type: string } }[] | undefined,
-  toolNameRegistry: ToolNameRegistry
+  tools: { name: string; description: string; input_schema: unknown; cache_control?: { type: string }; type?: string }[] | undefined,
+  toolNameRegistry: ToolNameRegistry,
+  webToolsEnabled = false
 ): KiroToolWrapper[] {
   if (!tools) return []
 
   return tools.flatMap(tool => {
+    // web_search / web_fetch 是 server-side 工具，客户端不带 input_schema。
+    // 若代理启用了 web 工具执行，则转成带 schema 的 custom tool 让 Kiro 模型可调用（代理侧拦截执行）；
+    // 否则与其它 server 工具一样丢弃，避免空 inputSchema 触发 Bedrock 400。
+    const webKind = isServerWebTool(tool.name, tool.type)
+    if (webKind) {
+      if (!webToolsEnabled) {
+        proxyLogger.warn('Translator', `Dropping web tool "${tool.name}": web search not configured (no provider/apiKey)`)
+        return []
+      }
+      const isSearch = webKind === 'web_search'
+      const kiroWebTool: KiroToolWrapper = {
+        toolSpecification: {
+          name: shortenToolName(isSearch ? WEB_SEARCH_TOOL_NAME : WEB_FETCH_TOOL_NAME, toolNameRegistry),
+          description: isSearch ? WEB_SEARCH_TOOL_DESCRIPTION : WEB_FETCH_TOOL_DESCRIPTION,
+          inputSchema: { json: isSearch ? WEB_SEARCH_INPUT_SCHEMA : WEB_FETCH_INPUT_SCHEMA }
+        }
+      }
+      return [kiroWebTool]
+    }
+    // 过滤掉其它 server-side 工具（computer/bash/text_editor 等），缺少可用 inputSchema 会导致 Bedrock 整条 400
+    if (!hasUsableInputSchema(tool.input_schema)) {
+      proxyLogger.warn('Translator', `Dropping unsupported server-side tool "${tool.name}"${tool.type ? ` (type: ${tool.type})` : ''}: Kiro/CodeWhisperer backend only supports custom tools with inputSchema`)
+      return []
+    }
     let description = tool.description || `Tool: ${tool.name}`
     // 截断过长的描述
     if (description.length > KIRO_MAX_TOOL_DESC_LEN) {

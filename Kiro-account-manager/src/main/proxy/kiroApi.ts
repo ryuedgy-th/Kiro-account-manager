@@ -18,6 +18,7 @@ import type {
 import { proxyLogger } from './logger'
 import { getKProxyService } from '../kproxy'
 import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
+import { isServerWebTool, executeWebToolStructured, type WebToolConfig } from './webTools'
 import {
   countTokens,
   getModelContextLength,
@@ -132,7 +133,7 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
     proxyLogger.debug('KiroAPI', `Using proxy agent: ${agent.constructor.name}`)
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
   }
-  return await fetch(url, options)
+  return await undiciFetch(url, options as unknown as UndiciRequestInit) as unknown as Response
 }
 
 // Kiro API 端点配置
@@ -189,10 +190,22 @@ const AGENT_MODE_VIBE = 'vibe' // CLI 模式
 const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
 const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
 
-function resolveProfileArn(account: ProxyAccount): string {
-  if (account.profileArn) return account.profileArn
+// 占位符 profileArn（历史遗留的假值）——视为"无 profileArn"
+// IdC/Enterprise 账号的真实 profileArn 因 org 而异，必须经 ListAvailableProfiles 获取
+const PLACEHOLDER_PROFILE_ARN = KIRO_BUILDER_ID_PROFILE_ARN
+
+function isRealProfileArn(arn?: string): arn is string {
+  return !!arn && arn !== PLACEHOLDER_PROFILE_ARN && !arn.includes('AAAACCCCXXXX')
+}
+
+// 解析请求应携带的 profileArn：
+// - 账号已有真实 profileArn → 使用它（IdC/Enterprise 经 ListAvailableProfiles 写入）
+// - 社交登录(Github/Google) → 共享 ARN（真实可用）
+// - 其余无真实值 → 返回 undefined（不携带 profileArn），绝不回退到占位符
+function resolveProfileArn(account: ProxyAccount): string | undefined {
+  if (isRealProfileArn(account.profileArn)) return account.profileArn
   if (account.provider === 'Github' || account.provider === 'Google') return KIRO_SOCIAL_PROFILE_ARN
-  return KIRO_BUILDER_ID_PROFILE_ARN
+  return undefined
 }
 
 // Agentic 模式系统提示 - 防止大文件写入超时
@@ -228,8 +241,21 @@ const CODEWHISPERER_MODEL_CACHE_TTL = 5 * 60 * 1000
 
 const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
 
+// Kiro 支持的非 Claude 模型族 + 路由别名，按前缀透传（向前兼容新版本号，如 deepseek-3.2 → deepseek-4）
+// 依据 /v1/models 实际返回：deepseek / minimax / glm / qwen 系列 + auto / simple-task 路由别名
+const KIRO_PASSTHROUGH_MODEL_RE = /^(deepseek|minimax|glm|qwen|kimi|auto|simple-task)/
+
 // 模型 ID 映射
 const MODEL_ID_MAP: Record<string, string> = {
+  // Claude 4.8 / 4.7 / 4.6 系列 (Claude Code 使用 dash，Kiro canonical 使用 dot)
+  'claude-opus-4-8': 'claude-opus-4.8',
+  'claude-opus-4.8': 'claude-opus-4.8',
+  'claude-opus-4-7': 'claude-opus-4.7',
+  'claude-opus-4.7': 'claude-opus-4.7',
+  'claude-opus-4-6': 'claude-opus-4.6',
+  'claude-opus-4.6': 'claude-opus-4.6',
+  'claude-sonnet-4-6': 'claude-sonnet-4.6',
+  'claude-sonnet-4.6': 'claude-sonnet-4.6',
   // Claude 4.5 系列
   'claude-sonnet-4-5': 'claude-sonnet-4.5',
   'claude-sonnet-4.5': 'claude-sonnet-4.5',
@@ -254,7 +280,8 @@ const MODEL_ID_MAP: Record<string, string> = {
 }
 
 export function mapModelId(model: string): string {
-  const modelId = model.trim()
+  // 去掉 Claude Code 等客户端附加的能力后缀，如 "claude-opus-4-8[1m]" → "claude-opus-4-8"
+  const modelId = model.trim().replace(/\[[^\]]*\]\s*$/, '').trim()
   if (!modelId) return MODEL_ID_MAP.default
   if (isCodeWhispererModelId(modelId)) return modelId
   const lower = modelId.toLowerCase()
@@ -263,7 +290,11 @@ export function mapModelId(model: string): string {
   // 2) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
   //    用于向前兼容尚未加入 MODEL_ID_MAP 的新发布模型
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
-  // 3) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
+  // 3) Kiro 支持的非 Claude 模型（deepseek/minimax/glm/qwen 等）及路由别名（auto/simple-task）原样透传
+  //    关键：这些不能 fallback 到 Claude，否则 (a) 用户选的模型被静默替换，
+  //    (b) modelSupportsThinkingParam 会误判为 Claude 而注入 thinking/effort 导致 400
+  if (KIRO_PASSTHROUGH_MODEL_RE.test(lower)) return modelId
+  // 4) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
   console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
   return MODEL_ID_MAP.default
 }
@@ -1117,16 +1148,22 @@ function getAccountMachineId(accountId: string, accountMachineId?: string): stri
 }
 
 // 获取认证方式对应的请求头
-function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
-  const isIDC = account.authMethod?.toLowerCase() === 'idc'
+function getAuthHeaders(account: ProxyAccount, endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
+  // 应用身份(application identity)由"端点"决定，而非账号的 authMethod。
+  // 关键修复：旧代码对所有 IdC 账号强制使用 Amazon Q CLI 身份(vibe + aws-sdk-rust UA)，
+  // 但很多 IdC/Enterprise 订阅只授权 Kiro IDE 应用，CLI 身份会被后端拒绝：
+  //   403 "Your subscription does not support this application"
+  // 已用真实 token 验证：IDE 身份(spec + KiroIDE UA) 返回 200，CLI 身份返回 403。
+  // 仅当用户显式选择 AmazonQCLI 端点时才使用 CLI 身份。
+  const isCliEndpoint = endpoint.name === 'AmazonQCLI'
   const machineId = getAccountMachineId(account.id, account.machineId)
-  const agentMode = isIDC ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
-  
+  const agentMode = isCliEndpoint ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
+
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'x-amzn-kiro-agent-mode': agentMode,
-    'x-amz-user-agent': isIDC ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
-    'user-agent': isIDC ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
+    'x-amz-user-agent': isCliEndpoint ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
+    'user-agent': isCliEndpoint ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${account.accessToken}`
@@ -1182,7 +1219,14 @@ export async function callKiroApiStream(
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
-      requestPayload.profileArn = resolveProfileArn(account)
+      // 仅在解析出真实 profileArn 时才设置；否则保留 payload 原值（可能为空）
+      // 关键修复：旧代码无条件用 resolveProfileArn 覆盖，IdC 账号会被写入占位符导致 403
+      const resolvedArn = resolveProfileArn(account)
+      if (resolvedArn !== undefined) {
+        requestPayload.profileArn = resolvedArn
+      } else {
+        delete requestPayload.profileArn
+      }
       const requestedModelId = getPayloadModelId(requestPayload)
       if (endpoint.name === 'CodeWhisperer') {
         applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId, signal))
@@ -1217,7 +1261,7 @@ export async function callKiroApiStream(
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
       const response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+        : await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal } as UndiciRequestInit) as unknown as Response
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
@@ -1889,6 +1933,132 @@ export async function callKiroApi(
   })
 }
 
+// ============================================================================
+// Web 工具 agentic 循环
+//
+// 当模型调用 web_search/web_fetch 时，由代理执行并把结果喂回 Kiro，循环到模型
+// 不再调用 web 工具为止。客户端 custom 工具（非 web）原样返回给上层，由客户端执行。
+//
+// 返回最终聚合结果：content + 非 web 的 toolUses（需透传给客户端）+ 累计 usage。
+// ============================================================================
+const DEFAULT_MAX_WEB_TOOL_ROUNDS = 2
+
+// 一次 web 工具调用的结构化记录，用于回传给客户端（server_tool_use + web_search_tool_result）
+export interface WebToolSearchRecord {
+  kind: 'web_search' | 'web_fetch'
+  toolUseId: string
+  input: Record<string, unknown>
+  sources: Array<{ title: string; url: string; pageAge?: string }>
+  isError: boolean
+}
+
+export interface WebToolLoopResult {
+  content: string
+  toolUses: KiroToolUse[]
+  usage: KiroUsage
+  reasoningContent?: { text?: string; signature?: string; redactedContent?: string }
+  webToolRounds: number
+  // 本轮所有 web 工具调用的结构化记录（按执行顺序），handler 据此生成原生 content block
+  searches: WebToolSearchRecord[]
+}
+
+// 把一次 Kiro 响应（assistant）+ 对应的 web 工具结果（user）追加进 history
+function appendWebToolTurn(
+  payload: KiroPayload,
+  assistantContent: string,
+  webToolUses: KiroToolUse[],
+  toolResults: KiroToolResult[]
+): void {
+  payload.conversationState.history = payload.conversationState.history || []
+  payload.conversationState.history.push({
+    assistantResponseMessage: {
+      content: assistantContent || '',
+      toolUses: webToolUses
+    }
+  })
+  // 把工具结果放入"当前消息"——下一轮请求就以它作为最新输入
+  const modelId = getPayloadModelId(payload)
+  // 关键：携带原始 tools 声明。Bedrock 要求只要消息含 toolUse/toolResult，
+  // 请求就必须带 toolConfig（即 tools）；否则报 "toolConfig field must be defined"。
+  const prevTools = payload.conversationState.currentMessage?.userInputMessage?.userInputMessageContext?.tools
+  payload.conversationState.currentMessage = {
+    userInputMessage: {
+      content: '',
+      modelId,
+      origin: 'AI_EDITOR',
+      userInputMessageContext: {
+        toolResults,
+        ...(prevTools && prevTools.length > 0 ? { tools: prevTools } : {})
+      }
+    }
+  }
+}
+
+// callKiroApi 的签名类型，供依赖注入（测试时可替换为 mock）
+type KiroCaller = (account: ProxyAccount, payload: KiroPayload, signal?: AbortSignal) => Promise<{
+  content: string
+  toolUses: KiroToolUse[]
+  usage: KiroUsage
+  reasoningContent?: { text?: string; signature?: string; redactedContent?: string }
+}>
+
+export async function runWebToolLoop(
+  account: ProxyAccount,
+  initialPayload: KiroPayload,
+  webConfig: WebToolConfig,
+  signal?: AbortSignal,
+  kiroCaller: KiroCaller = callKiroApi
+): Promise<WebToolLoopResult> {
+  const maxRounds = webConfig.maxRounds ?? DEFAULT_MAX_WEB_TOOL_ROUNDS
+  const payload = clonePayload(initialPayload)
+  let aggUsage: KiroUsage = { inputTokens: 0, outputTokens: 0, credits: 0 }
+  let webToolRounds = 0
+  const searches: WebToolSearchRecord[] = []
+
+  for (let round = 0; round <= maxRounds; round++) {
+    if (signal?.aborted) throw new Error('aborted')
+    const result = await kiroCaller(account, payload, signal)
+    // 累计 usage（多轮 round-trip 都计入）
+    aggUsage = {
+      inputTokens: aggUsage.inputTokens + (result.usage.inputTokens || 0),
+      outputTokens: aggUsage.outputTokens + (result.usage.outputTokens || 0),
+      credits: (aggUsage.credits || 0) + (result.usage.credits || 0),
+      cacheReadTokens: (aggUsage.cacheReadTokens || 0) + (result.usage.cacheReadTokens || 0),
+      cacheWriteTokens: (aggUsage.cacheWriteTokens || 0) + (result.usage.cacheWriteTokens || 0),
+      reasoningTokens: (aggUsage.reasoningTokens || 0) + (result.usage.reasoningTokens || 0)
+    }
+
+    // 分离 web 工具调用 与 需要透传客户端的工具调用
+    const webCalls = result.toolUses.filter(tu => isServerWebTool(tu.name))
+    const passthroughCalls = result.toolUses.filter(tu => !isServerWebTool(tu.name))
+
+    // 没有 web 工具调用 → 循环结束，把结果（含透传 toolUses）交回上层
+    if (webCalls.length === 0 || round === maxRounds) {
+      if (webCalls.length > 0 && round === maxRounds) {
+        proxyLogger.warn('WebToolLoop', `Hit max rounds (${maxRounds}); returning without executing remaining web tools`)
+      }
+      return { content: result.content, toolUses: passthroughCalls, usage: aggUsage, reasoningContent: result.reasoningContent, webToolRounds, searches }
+    }
+
+    // 执行所有 web 工具调用，收集 tool_result（同时记录结构化结果供回传客户端）
+    webToolRounds++
+    const toolResults: KiroToolResult[] = []
+    for (const call of webCalls) {
+      const kind = isServerWebTool(call.name)!
+      proxyLogger.info('WebToolLoop', `Round ${round + 1}: executing ${kind} (${JSON.stringify(call.input).slice(0, 120)})`)
+      const exec = await executeWebToolStructured(kind, call.input, webConfig, signal)
+      toolResults.push({ content: [{ text: exec.text }], status: exec.isError ? 'error' : 'success', toolUseId: call.toolUseId })
+      searches.push({ kind, toolUseId: call.toolUseId, input: call.input, sources: exec.sources, isError: exec.isError })
+    }
+
+    // 把本轮 assistant + 工具结果写入 history，准备下一轮
+    appendWebToolTurn(payload, result.content, webCalls, toolResults)
+  }
+
+  // 理论不可达（循环内已 return）
+  return { content: '', toolUses: [], usage: aggUsage, webToolRounds, searches }
+}
+
 // Kiro 官方模型信息
 export interface KiroModel {
   modelId: string
@@ -1938,7 +2108,8 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      params.set('profileArn', resolveProfileArn(account))
+      const modelsProfileArn = resolveProfileArn(account)
+      if (modelsProfileArn) params.set('profileArn', modelsProfileArn)
       if (nextToken) params.set('nextToken', nextToken)
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
@@ -2068,7 +2239,7 @@ export async function fetchSubscriptionToken(
   // clientToken 是必需参数，需要生成 UUID
   const payload: Record<string, string> = {
     clientToken: uuidv4(),
-    profileArn,
+    ...(profileArn ? { profileArn } : {}),
     provider: 'STRIPE'
   }
   if (subscriptionType) {

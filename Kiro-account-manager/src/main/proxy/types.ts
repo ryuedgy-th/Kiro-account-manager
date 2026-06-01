@@ -14,7 +14,7 @@ export interface OpenAIChatRequest {
   conversation_id?: string
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
-  reasoning_effort?: 'low' | 'medium' | 'high' | 'max' | string
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | string
   thinking?: { type: 'enabled'; budget_tokens?: number } | { type: 'adaptive' } | { type: 'disabled' }
 }
 
@@ -115,7 +115,7 @@ export interface OpenAIResponsesRequest {
   tools?: OpenAITool[]
   tool_choice?: string | { type: string; name?: string; function?: { name: string } }
   previous_response_id?: string
-  reasoning?: unknown
+  reasoning?: { effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | string } | null
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
 }
@@ -174,7 +174,7 @@ export interface ClaudeRequest {
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
   anthropic_beta?: string[]
-  output_config?: { effort?: string; task_budget?: { type: 'tokens'; total: number; remaining?: number } }
+  output_config?: { effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | string; task_budget?: { type: 'tokens'; total: number; remaining?: number } }
   context_management?: { type?: string; [key: string]: unknown }
 }
 
@@ -191,7 +191,7 @@ export interface ClaudeSystemBlock {
 }
 
 export interface ClaudeContentBlock {
-  type: 'text' | 'image' | 'document' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking'
+  type: 'text' | 'image' | 'document' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking' | 'server_tool_use' | 'web_search_tool_result'
   text?: string
   thinking?: string
   signature?: string
@@ -201,8 +201,34 @@ export interface ClaudeContentBlock {
   name?: string
   input?: unknown
   tool_use_id?: string
-  content?: string | ClaudeContentBlock[]
+  content?: string | ClaudeContentBlock[] | ClaudeWebSearchResultBlock[] | ClaudeWebSearchToolResultError
   cache_control?: ClaudeCacheControl
+  // server_tool_use / web_search 引用（Anthropic 原生 web_search 回包字段）
+  citations?: ClaudeCitation[]
+}
+
+// web_search_tool_result.content 中的单条搜索结果
+export interface ClaudeWebSearchResultBlock {
+  type: 'web_search_result'
+  url: string
+  title: string
+  encrypted_content?: string
+  page_age?: string
+}
+
+// web_search_tool_result 出错时的 content 形态
+export interface ClaudeWebSearchToolResultError {
+  type: 'web_search_tool_result_error'
+  error_code: string
+}
+
+// text block 上的 web_search 引用
+export interface ClaudeCitation {
+  type: 'web_search_result_location'
+  url: string
+  title: string
+  encrypted_index?: string
+  cited_text?: string
 }
 
 export type ClaudeDocumentSource =
@@ -233,6 +259,10 @@ export interface ClaudeResponse {
     output_tokens: number
     cache_creation_input_tokens?: number
     cache_read_input_tokens?: number
+    // Anthropic 原生 web_search 计数：客户端据此显示 "Did N searches"
+    server_tool_use?: {
+      web_search_requests: number
+    }
   }
 }
 
@@ -242,7 +272,7 @@ export interface ClaudeStreamEvent {
   index?: number
   content_block?: ClaudeContentBlock
   delta?: { type: string; text?: string; thinking?: string; signature?: string; data?: string; reasoning_content?: string; stop_reason?: string; stop_sequence?: string }
-  usage?: { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
+  usage?: { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number; server_tool_use?: { web_search_requests: number } }
   error?: { type: string; message: string }
 }
 
@@ -518,6 +548,17 @@ export interface ProxyConfig {
   multiAccountGroupIds?: string[]
   // 模型映射规则
   modelMappings?: ModelMappingRule[]
+
+  // 服务端 web 工具（web_search / web_fetch）配置
+  // 启用后，代理会拦截模型发起的 web_search/web_fetch 调用并在代理侧执行（经第三方搜索 API），
+  // 把结果喂回对话。未配置 apiKey 或 enabled=false 时，web 工具会被丢弃（避免 Bedrock 400）。
+  webSearch?: {
+    enabled: boolean
+    provider: 'tavily'
+    apiKey: string
+    /** web 工具循环的最大轮数，防止无限循环（默认 5） */
+    maxRounds?: number
+  }
 
   // ============ 安全 / 限流 / 可观测（v1.8 新增） ============
   /** 入站请求体最大字节数（默认 10MB）。超过返回 413 */

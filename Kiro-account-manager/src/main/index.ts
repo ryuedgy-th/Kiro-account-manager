@@ -476,7 +476,8 @@ function initProxyServer(): ProxyServer {
           }))
         if (proxyAccounts.length > 0 && proxyServer) {
           const pool = proxyServer.getAccountPool()
-          proxyAccounts.forEach(acc => pool.addAccount(acc))
+          // 幂等 diff 同步：onPoolEmpty 可能被多个并发请求触发，避免重复 addAccount 刷屏
+          pool.setAccounts(proxyAccounts)
           const boundCount = proxyAccounts.filter(a => a.proxyUrl).length
           console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store (${boundCount} with bound proxy)`)
         }
@@ -726,6 +727,55 @@ async function refreshTokenByMethod(
   }
   // 否则使用 OIDC 刷新 (IdC/BuilderId)
   return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl)
+}
+
+// 通过 AWS ListAvailableProfiles 获取账号真实的 profileArn
+// IdC/Enterprise 账号的 profileArn 因 org 而异（绑定 AWS account + SSO instance），不能硬编码
+// 端点：POST https://codewhisperer.{region}.amazonaws.com/ + X-Amz-Target，body {}
+// 已用真实 token 验证：返回 profiles[].arn（如 arn:aws:codewhisperer:us-east-1:308748779142:profile/C3XAPPURAUPM）
+async function fetchProfileArn(
+  accessToken: string,
+  region: string = 'us-east-1',
+  proxyUrl?: string
+): Promise<{ success: boolean; profileArn?: string; error?: string }> {
+  if (!accessToken) return { success: false, error: 'missing accessToken' }
+  const url = `https://codewhisperer.${region}.amazonaws.com/`
+  const ua = 'aws-sdk-js/1.0.18 ua/2.1 os/macos lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE'
+  try {
+    const response = await fetchWithAppProxy(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/x-amz-json-1.0',
+        'X-Amz-Target': 'AmazonCodeWhispererService.ListAvailableProfiles',
+        'User-Agent': ua
+      },
+      body: '{}'
+    }, proxyUrl)
+
+    const text = await response.text()
+    if (!response.ok) {
+      console.error(`[ProfileArn] ListAvailableProfiles failed: ${response.status}`)
+      return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` }
+    }
+
+    let data: { profiles?: Array<{ arn?: string }> }
+    try {
+      data = JSON.parse(text)
+    } catch {
+      return { success: false, error: 'Invalid JSON from ListAvailableProfiles' }
+    }
+
+    const arn = data.profiles?.find(p => typeof p.arn === 'string' && p.arn.includes(':profile/'))?.arn
+    if (!arn) {
+      return { success: false, error: 'No profileArn in response' }
+    }
+    console.log(`[ProfileArn] Resolved real profileArn (region: ${region})`)
+    return { success: true, profileArn: arn }
+  } catch (error) {
+    console.error('[ProfileArn] fetch error:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
 }
 
 function generateInvocationId(): string {
@@ -1711,8 +1761,8 @@ function createWindow(): void {
             }))
           if (proxyAccounts.length > 0) {
             const pool = server.getAccountPool()
-            pool.clear()
-            proxyAccounts.forEach(acc => pool.addAccount(acc))
+            // 幂等 diff 同步，避免冷启动重试期间反复 clear()+addAccount() 刷屏
+            pool.setAccounts(proxyAccounts)
           }
           return proxyAccounts.length
         }
@@ -3728,7 +3778,20 @@ app.whenReady().then(async () => {
       }
       
       console.log('[Verify] Success! Email:', email)
-      
+
+      // Step 3: IdC/Enterprise 账号获取真实 profileArn（社交登录用共享 ARN，无需获取）
+      // 真实 profileArn 因 org 而异，不能硬编码占位符，否则反代调用会 403
+      let resolvedProfileArn: string | undefined
+      if (authMethod !== 'social') {
+        const arnResult = await fetchProfileArn(refreshResult.accessToken, region)
+        if (arnResult.success && arnResult.profileArn) {
+          resolvedProfileArn = arnResult.profileArn
+          console.log('[Verify] Fetched real profileArn for IdC/Enterprise account')
+        } else {
+          console.warn(`[Verify] Could not fetch profileArn: ${arnResult.error}`)
+        }
+      }
+
       return {
         success: true,
         data: {
@@ -3737,6 +3800,7 @@ app.whenReady().then(async () => {
           accessToken: refreshResult.accessToken,
           refreshToken: refreshResult.refreshToken || refreshToken,
           expiresIn: refreshResult.expiresIn,
+          ...(resolvedProfileArn ? { profileArn: resolvedProfileArn } : {}),
           subscriptionType,
           subscriptionTitle,
           subscription: {
@@ -3773,6 +3837,57 @@ app.whenReady().then(async () => {
     } catch (error) {
       console.error('[Verify] Error:', error)
       return { success: false, error: error instanceof Error ? error.message : '验证失败' }
+    }
+  })
+
+  // IPC: 获取/刷新账号的真实 profileArn（用于回填历史 IdC 账号的占位符 ARN）
+  // 用当前 accessToken（必要时先刷新）调用 ListAvailableProfiles
+  ipcMain.handle('fetch-account-profile-arn', async (_event, account: {
+    id?: string
+    credentials?: {
+      accessToken?: string
+      refreshToken?: string
+      clientId?: string
+      clientSecret?: string
+      region?: string
+      authMethod?: string
+    }
+  }) => {
+    try {
+      const { accessToken, refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod } = account.credentials || {}
+
+      // 账号绑定代理（如有）
+      const boundProxyUrl = proxyServer
+        ? proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl
+        : undefined
+
+      // 先尝试用现有 accessToken；401 时刷新后重试
+      let token = accessToken
+      let firstError = ''
+      if (token) {
+        const r = await fetchProfileArn(token, region, boundProxyUrl)
+        if (r.success && r.profileArn) return { success: true, profileArn: r.profileArn }
+        firstError = r.error || ''
+      }
+
+      // token 缺失或失败 → 刷新后重试
+      const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
+      if (canRefresh) {
+        const refreshed = await refreshTokenByMethod(refreshToken!, clientId || '', clientSecret || '', region, authMethod, boundProxyUrl)
+        if (refreshed.success && refreshed.accessToken) {
+          token = refreshed.accessToken
+          const r2 = await fetchProfileArn(token, region, boundProxyUrl)
+          if (r2.success && r2.profileArn) {
+            return { success: true, profileArn: r2.profileArn, newAccessToken: token, newRefreshToken: refreshed.refreshToken, expiresIn: refreshed.expiresIn }
+          }
+          return { success: false, error: r2.error || firstError || '获取 profileArn 失败' }
+        }
+        return { success: false, error: `Token 刷新失败: ${refreshed.error}` }
+      }
+
+      return { success: false, error: firstError || '缺少可用的 accessToken' }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
     }
   })
 
@@ -5583,11 +5698,9 @@ app.whenReady().then(async () => {
     try {
       const server = initProxyServer()
       const pool = server.getAccountPool()
-      pool.clear()
-      for (const account of accounts) {
-        pool.addAccount(account)
-      }
-      return { success: true, accountCount: pool.size }
+      // 幂等 diff 同步：仅增删变化的账号，保留既有运行时状态，无变化不刷日志
+      const count = pool.setAccounts(accounts)
+      return { success: true, accountCount: count }
     } catch (error) {
       console.error('[ProxyServer] Sync accounts failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to sync accounts' }

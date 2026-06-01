@@ -97,6 +97,13 @@ interface ProxyConfig {
   enableMetrics?: boolean
   fallbackPort?: number
   enableAuditLog?: boolean
+  // 服务端 web_search / web_fetch（经第三方搜索 API，由代理执行）
+  webSearch?: {
+    enabled: boolean
+    provider: 'tavily'
+    apiKey: string
+    maxRounds?: number
+  }
 }
 
 export function ProxyPanel() {
@@ -131,6 +138,7 @@ export function ProxyPanel() {
   const [showAccountSelectDialog, setShowAccountSelectDialog] = useState(false)
   const [showApiKeyManager, setShowApiKeyManager] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
+  const [showWebSearchKey, setShowWebSearchKey] = useState(false)
   const [apiKeyFormat, setApiKeyFormat] = useState<'sk' | 'simple' | 'token'>('sk')
   const [apiKeyCopied, setApiKeyCopied] = useState(false)
   const [apiKeyGenerated, setApiKeyGenerated] = useState(false)
@@ -415,11 +423,18 @@ export function ProxyPanel() {
     }
   }, [fetchStatus, loadAvailableModels])
 
-  // 账号变化时同步
+  // 账号变化时同步（防抖）
+  //
+  // accounts 来自 zustand，每次 mutation 都会生成新的 Map 引用；而 syncAccounts 依赖 accounts，
+  // 因此 accounts 一变 -> syncAccounts 重建 -> 本 effect 重跑。若不防抖，启动期 token 刷新 / 自动切换 /
+  // 自动保存等周期任务连续改写 accounts 时，会以极高频率触发 IPC 同步（曾导致主进程日志被刷爆）。
+  // 这里合并 500ms 内的多次变化为一次同步。
   useEffect(() => {
-    if (isRunning) {
+    if (!isRunning) return
+    const timer = setTimeout(() => {
       syncAccounts()
-    }
+    }, 500)
+    return () => clearTimeout(timer)
   }, [accounts, isRunning, syncAccounts])
 
   // 实时更新运行时间
@@ -1016,6 +1031,67 @@ export function ProxyPanel() {
                     className="h-9 flex-1"
                   />
                 </div>
+              </div>
+
+              {/* Web Search (web_search / web_fetch) — 占 3 列：开关 + Provider + API Key */}
+              <div className="col-span-3 space-y-1.5 border-t border-border pt-3 mt-1">
+                <Label className="text-xs flex items-center gap-1.5" title={isEn ? 'When enabled, the proxy intercepts web_search/web_fetch calls and executes them via a third-party search API (Tavily). The user query is sent to that third party. Opt-in.' : '启用后，代理会拦截模型的 web_search/web_fetch 调用，经第三方搜索 API（Tavily）执行。用户查询会发送给该第三方，请知悉后再启用。'}>
+                  {isEn ? 'Web Search (web_search / web_fetch)' : '联网搜索 (web_search / web_fetch)'}
+                </Label>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent w-[160px] flex-shrink-0">
+                    <span className="text-xs text-muted-foreground">{isEn ? 'Enable' : '启用'}</span>
+                    <Switch
+                      id="webSearchEnabled"
+                      checked={config.webSearch?.enabled || false}
+                      onCheckedChange={(checked) => {
+                        const next = {
+                          enabled: checked,
+                          provider: 'tavily' as const,
+                          apiKey: config.webSearch?.apiKey || '',
+                          maxRounds: config.webSearch?.maxRounds
+                        }
+                        setConfig(prev => ({ ...prev, webSearch: next }))
+                        window.api.proxyUpdateConfig({ webSearch: next })
+                      }}
+                      disabled={isRunning}
+                      className="scale-90"
+                    />
+                  </div>
+                  <div className="relative flex-1">
+                    <Input
+                      id="webSearchApiKey"
+                      type={showWebSearchKey ? 'text' : 'password'}
+                      value={config.webSearch?.apiKey || ''}
+                      onChange={(e) => {
+                        const apiKey = e.target.value
+                        const next = {
+                          enabled: config.webSearch?.enabled || false,
+                          provider: 'tavily' as const,
+                          apiKey,
+                          maxRounds: config.webSearch?.maxRounds
+                        }
+                        setConfig(prev => ({ ...prev, webSearch: next }))
+                        window.api.proxyUpdateConfig({ webSearch: next })
+                      }}
+                      disabled={isRunning}
+                      placeholder={isEn ? 'Tavily API key (tvly-...)' : 'Tavily API 密钥 (tvly-...)'}
+                      className="h-9 pr-16"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowWebSearchKey(v => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground hover:text-foreground"
+                    >
+                      {showWebSearchKey ? (isEn ? 'Hide' : '隐藏') : (isEn ? 'Show' : '显示')}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {isEn
+                    ? 'Get a free key at tavily.com. Queries are sent to Tavily. Each web turn costs extra Kiro round-trips.'
+                    : '可在 tavily.com 免费申请密钥。查询会发送给 Tavily，每次联网会额外消耗 Kiro 调用次数。'}
+                </p>
               </div>
             </div>
           </div>

@@ -12,13 +12,14 @@ import type {
   ClaudeRequest,
   ClaudeContentBlock,
   ClaudeCacheControl,
+  ClaudeStreamEvent,
   ProxyConfig,
   ProxyStats,
   ProxyAccount,
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, type KiroModel, type WebToolSearchRecord } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -33,6 +34,44 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { isServerWebTool, type WebToolConfig } from './webTools'
+
+
+// 把代理侧执行的 web 工具记录，转换为 Anthropic 原生 content block 序列：
+// 每次调用产出一对 [server_tool_use, web_search_tool_result]，顺序与执行顺序一致。
+// 客户端（Claude Code）据此统计搜索次数并渲染可点击来源。
+function buildWebSearchContentBlocks(searches: WebToolSearchRecord[]): ClaudeContentBlock[] {
+  const blocks: ClaudeContentBlock[] = []
+  for (const s of searches) {
+    // 1) server_tool_use：模型发起的查询调用（名义上仍叫 web_search，与客户端声明对齐）
+    blocks.push({
+      type: 'server_tool_use',
+      id: s.toolUseId,
+      name: s.kind, // 'web_search' | 'web_fetch'
+      input: s.input
+    })
+    // 2) web_search_tool_result：搜索结果（或错误）
+    if (s.isError) {
+      blocks.push({
+        type: 'web_search_tool_result',
+        tool_use_id: s.toolUseId,
+        content: { type: 'web_search_tool_result_error', error_code: 'unavailable' }
+      })
+    } else {
+      blocks.push({
+        type: 'web_search_tool_result',
+        tool_use_id: s.toolUseId,
+        content: s.sources.map(src => ({
+          type: 'web_search_result' as const,
+          url: src.url,
+          title: src.title,
+          ...(src.pageAge ? { page_age: src.pageAge } : {})
+        }))
+      })
+    }
+  }
+  return blocks
+}
 
 
 export interface ProxyServerEvents {
@@ -658,8 +697,10 @@ export class ProxyServer {
   private validateClaudeContentBlocks(blocks: ClaudeContentBlock[]): void {
     blocks.forEach(block => {
       this.validateCacheControl(block.cache_control)
-      if (Array.isArray(block.content)) {
-        this.validateClaudeContentBlocks(block.content)
+      // 仅对嵌套的 Claude content block 递归校验；web_search_result / error 等 server-tool
+      // 专有子结构没有 cache_control，跳过避免类型不匹配。
+      if (Array.isArray(block.content) && block.type !== 'web_search_tool_result') {
+        this.validateClaudeContentBlocks(block.content as ClaudeContentBlock[])
       }
     })
   }
@@ -704,7 +745,7 @@ export class ProxyServer {
       const { fetch: undiciFetch } = require('undici')
       const response = agent
         ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
-        : await fetch(url, { signal: controller.signal })
+        : await undiciFetch(url, { signal: controller.signal }) as unknown as globalThis.Response
       if (!response.ok) {
         throw new Error(`Failed to download image: HTTP ${response.status}`)
       }
@@ -1146,6 +1187,31 @@ export class ProxyServer {
     return new Set(bindings)
   }
 
+  /**
+   * 把"允许账号白名单"转换成 getNextAccount(excludeIds) 需要的"排除集合"。
+   * 排除 = 当前池中所有不在白名单内的账号。
+   * 返回 undefined = 不限制（无绑定时）。
+   */
+  private excludeSetForAllowed(allowedIds?: Set<string>): Set<string> | undefined {
+    if (!allowedIds) return undefined
+    const exclude = new Set<string>()
+    for (const acc of this.accountPool.getAllAccounts()) {
+      if (!allowedIds.has(acc.id)) exclude.add(acc.id)
+    }
+    return exclude
+  }
+
+  /**
+   * 合并"白名单外排除集合"与额外要排除的账号 ID（如当前已失败的账号）。
+   * base 为 undefined（无绑定）时，仅排除 extra（若有），否则返回 undefined 表示不限制。
+   */
+  private excludeWith(base: Set<string> | undefined, ...extraIds: string[]): Set<string> | undefined {
+    if (!base && extraIds.length === 0) return undefined
+    const merged = new Set<string>(base ?? [])
+    for (const id of extraIds) merged.add(id)
+    return merged
+  }
+
   // 获取可用账号（包含 Token 刷新检查）
   // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
@@ -1200,28 +1266,44 @@ export class ProxyServer {
       }
     } else {
       // 禁用多账号轮询时，优先使用指定的账号
+      // P2-21: 若该 API Key 绑定了账号白名单，则所有挑选/兜底都必须落在白名单内
+      const pickFirstAllowed = (): ProxyAccount | null =>
+        this.accountPool.getAllAccounts().find(isAllowed) || null
+
       if (this.config.selectedAccountIds && this.config.selectedAccountIds.length > 0) {
         // 使用指定的第一个账号
         account = this.accountPool.getAccount(this.config.selectedAccountIds[0])
-        // 检查指定账号是否配额耗尽，若是则尝试自动切换
+        // P2-21: 指定账号不在 API Key 白名单内时，改用白名单内账号（绑定优先于全局 selectedAccountIds）
+        if (account && !isAllowed(account)) {
+          console.log(`[ProxyServer] Selected account ${account.email || account.id} not in API key whitelist, switching to an allowed account`)
+          account = pickFirstAllowed()
+        }
+        // 检查指定账号是否配额耗尽，若是则尝试自动切换（切换目标仍须在白名单内）
         if (account && this.accountPool.isQuotaExhausted(account) && this.config.autoSwitchOnQuotaExhausted) {
-          const nextAccount = this.accountPool.getNextAvailableAccount(account.id)
+          const exhaustedId = account.id
+          let nextAccount = this.accountPool.getNextAvailableAccount(exhaustedId)
+          if (nextAccount && !isAllowed(nextAccount)) {
+            nextAccount = this.accountPool.getAllAccounts().find(a =>
+              a.id !== exhaustedId && isAllowed(a) && !this.accountPool.isQuotaExhausted(a)
+            ) || null
+          }
           if (nextAccount) {
             console.log(`[ProxyServer] Selected account ${account.email || account.id} quota exhausted, auto-switching to ${nextAccount.email || nextAccount.id}`)
-            this.config.selectedAccountIds = [nextAccount.id]
-            this.events.onAccountUpdate?.(nextAccount)
+            // 绑定白名单是按 API Key 维度的，不应改写全局 selectedAccountIds；仅无白名单时持久化
+            if (!allowedIds) {
+              this.config.selectedAccountIds = [nextAccount.id]
+              this.events.onAccountUpdate?.(nextAccount)
+            }
             account = nextAccount
           }
         }
         if (!account) {
-          console.log(`[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not found, using first available`)
-          const allAccounts = this.accountPool.getAllAccounts()
-          account = allAccounts.length > 0 ? allAccounts[0] : null
+          console.log(`[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not usable, using first allowed/available`)
+          account = allowedIds ? pickFirstAllowed() : (this.accountPool.getAllAccounts()[0] || null)
         }
       } else {
-        // 没有指定账号，使用第一个可用账号
-        const allAccounts = this.accountPool.getAllAccounts()
-        account = allAccounts.length > 0 ? allAccounts[0] : null
+        // 没有指定账号，使用第一个可用账号（受白名单约束）
+        account = allowedIds ? pickFirstAllowed() : (this.accountPool.getAllAccounts()[0] || null)
       }
     }
     
@@ -1234,9 +1316,10 @@ export class ProxyServer {
     if (this.isTokenExpiringSoon(account)) {
       const refreshed = await this.refreshToken(account, signal)
       if (!refreshed) {
-        // 刷新失败，如果启用多账号才尝试获取下一个账号
+        // 刷新失败，如果启用多账号才尝试获取下一个账号（受 API Key 白名单约束）
         if (this.config.enableMultiAccount) {
-          return this.accountPool.getNextAccount()
+          const exclude = this.excludeSetForAllowed(allowedIds)
+          return this.accountPool.getNextAccount(exclude)
         }
         return null
       }
@@ -1277,17 +1360,30 @@ export class ProxyServer {
   }
 
   // 带重试的 API 调用
+  // P2-21 allowedIds：API Key 绑定的账号白名单；切换账号时不得越界，undefined = 不限制
   private async callWithRetry<T>(
     account: ProxyAccount,
     apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
     _path: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    allowedIds?: Set<string>
   ): Promise<{ result: T; account: ProxyAccount }> {
     const maxRetries = this.config.maxRetries || 3
     const retryDelay = this.config.retryDelayMs || 1000
     let lastError: Error | null = null
     let currentAccount = account
     let endpointIndex = 0
+    // 切换账号时用于排除白名单外的账号
+    const isAllowed = (acc: ProxyAccount | null): boolean => !acc || !allowedIds || allowedIds.has(acc.id)
+    const excludeOutOfWhitelist = this.excludeSetForAllowed(allowedIds)
+    // 在白名单内挑下一个可用账号（排除当前账号 + 白名单外账号）
+    const nextAllowedAvailable = (excludeId: string): ProxyAccount | null => {
+      const next = this.accountPool.getNextAvailableAccount(excludeId)
+      if (isAllowed(next)) return next
+      return this.accountPool.getAllAccounts().find(a =>
+        a.id !== excludeId && isAllowed(a) && !this.accountPool.isQuotaExhausted(a)
+      ) || null
+    }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       this.throwIfAborted(signal)
@@ -1332,14 +1428,15 @@ export class ProxyServer {
             })
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
-          // 切到下个可用账号（跳过被 suspended 的）
+          // 切到下个可用账号（跳过被 suspended 的；受 API Key 白名单约束）
           if (this.config.enableMultiAccount || this.config.autoSwitchOnQuotaExhausted) {
             const nextAccount = this.config.enableMultiAccount
-              ? this.accountPool.getNextAccount()
-              : this.accountPool.getNextAvailableAccount(currentAccount.id)
-            if (nextAccount && nextAccount.id !== currentAccount.id) {
+              ? this.accountPool.getNextAccount(this.excludeWith(excludeOutOfWhitelist, currentAccount.id))
+              : nextAllowedAvailable(currentAccount.id)
+            if (nextAccount && nextAccount.id !== currentAccount.id && isAllowed(nextAccount)) {
               currentAccount = nextAccount
-              if (!this.config.enableMultiAccount) {
+              // 绑定白名单按 API Key 维度，不改写全局 selectedAccountIds
+              if (!this.config.enableMultiAccount && !allowedIds) {
                 this.config.selectedAccountIds = [nextAccount.id]
                 this.events.onAccountUpdate?.(nextAccount)
               }
@@ -1358,10 +1455,10 @@ export class ProxyServer {
             currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
             continue
           }
-          // 刷新失败，只在启用多账号时切换账号
+          // 刷新失败，只在启用多账号时切换账号（受 API Key 白名单约束）
           if (this.config.enableMultiAccount) {
-            const nextAccount = this.accountPool.getNextAccount()
-            if (nextAccount && nextAccount.id !== currentAccount.id) {
+            const nextAccount = this.accountPool.getNextAccount(this.excludeWith(excludeOutOfWhitelist, currentAccount.id))
+            if (nextAccount && nextAccount.id !== currentAccount.id && isAllowed(nextAccount)) {
               currentAccount = nextAccount
               continue
             }
@@ -1374,22 +1471,24 @@ export class ProxyServer {
           this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
-            // 已尝试所有端点，检查是否需要切换账号
+            // 已尝试所有端点，检查是否需要切换账号（受 API Key 白名单约束）
             if (this.config.enableMultiAccount) {
               // 多账号模式：切换到下一个账号
-              const nextAccount = this.accountPool.getNextAccount()
-              if (nextAccount && nextAccount.id !== currentAccount.id) {
+              const nextAccount = this.accountPool.getNextAccount(this.excludeWith(excludeOutOfWhitelist, currentAccount.id))
+              if (nextAccount && nextAccount.id !== currentAccount.id && isAllowed(nextAccount)) {
                 currentAccount = nextAccount
               }
             } else if (this.config.autoSwitchOnQuotaExhausted) {
               // 单账号模式 + 启用自动切换：切换到下一个可用账号
-              const nextAccount = this.accountPool.getNextAvailableAccount(currentAccount.id)
-              if (nextAccount && nextAccount.id !== currentAccount.id) {
+              const nextAccount = nextAllowedAvailable(currentAccount.id)
+              if (nextAccount && nextAccount.id !== currentAccount.id && isAllowed(nextAccount)) {
                 console.log(`[ProxyServer] Auto-switching from ${currentAccount.id} to ${nextAccount.id} due to quota exhausted`)
                 currentAccount = nextAccount
-                // 更新配置中的选定账号
-                this.config.selectedAccountIds = [nextAccount.id]
-                this.events.onAccountUpdate?.(nextAccount)
+                // 绑定白名单按 API Key 维度，不改写全局 selectedAccountIds
+                if (!allowedIds) {
+                  this.config.selectedAccountIds = [nextAccount.id]
+                  this.events.onAccountUpdate?.(nextAccount)
+                }
               }
             }
           }
@@ -1647,6 +1746,22 @@ export class ProxyServer {
 
     // 触发配置保存事件
     this.events.onConfigChanged?.(this.config)
+  }
+
+  // 返回可用的 web 工具配置（启用且有 apiKey 时），否则 null
+  private getWebToolConfig(): WebToolConfig | null {
+    const ws = this.config.webSearch
+    if (ws && ws.enabled && ws.apiKey?.trim()) {
+      return { enabled: true, provider: ws.provider, apiKey: ws.apiKey, maxRounds: ws.maxRounds }
+    }
+    return null
+  }
+
+  // 判断 Claude 请求是否声明了需代理执行的 web 工具（web_search/web_fetch）
+  private claudeRequestUsesWebTools(request: ClaudeRequest): boolean {
+    const tools = request.tools as Array<{ name?: string; type?: string }> | undefined
+    if (!tools?.length) return false
+    return tools.some(t => isServerWebTool(t.name, t.type) !== null)
   }
 
   // 应用模型映射
@@ -2440,7 +2555,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
-          signal
+          signal,
+          this.getAllowedAccountIds(matchedApiKey?.id)
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2534,7 +2650,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
-          signal
+          signal,
+          this.getAllowedAccountIds(matchedApiKey?.id)
         )
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
@@ -2586,7 +2703,8 @@ export class ProxyServer {
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
-        signal
+        signal,
+        this.getAllowedAccountIds(matchedApiKey?.id)
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
@@ -2822,8 +2940,10 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
+      const webToolConfig = this.getWebToolConfig()
+      const useWebTools = !!webToolConfig && this.claudeRequestUsesWebTools(request)
 
-      const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry)
+      const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, useWebTools)
 
       // 构建 prompt cache profile（用于模拟缓存 usage）
       const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
@@ -2859,7 +2979,15 @@ export class ProxyServer {
         })
       }
 
-      if (request.stream) {
+      if (useWebTools && webToolConfig) {
+        // Web 工具路径：代理侧执行 web_search/web_fetch 循环，得到最终回答后再返回客户端。
+        // stream 与 non-stream 共用同一循环，只是输出格式不同（SSE replay vs 单个 JSON）。
+        await this.handleClaudeWebToolRequest(
+          res, account, kiroPayload, processedRequest, webToolConfig, toolNameRegistry,
+          startTime, matchedApiKey, signal,
+          cacheProfile && cacheUsage ? { cacheUsage, cacheProfile, accountId: account.id } : undefined
+        )
+      } else if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
           cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined)
@@ -2872,7 +3000,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',
-          signal
+          signal,
+          this.getAllowedAccountIds(matchedApiKey?.id)
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2899,6 +3028,112 @@ export class ProxyServer {
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
     }
+  }
+
+  // 处理带 web 工具的 Claude 请求：代理侧执行 web_search/web_fetch 循环，再把最终回答返回客户端。
+  // stream=false → 单个 JSON；stream=true → 把最终结果 replay 成 Anthropic SSE 事件。
+  private async handleClaudeWebToolRequest(
+    res: http.ServerResponse,
+    account: { id: string; accessToken: string; profileArn?: string },
+    kiroPayload: ReturnType<typeof claudeToKiro>,
+    request: ClaudeRequest,
+    webToolConfig: WebToolConfig,
+    toolNameRegistry: ToolNameRegistry,
+    startTime: number,
+    matchedApiKey: import('./types').ApiKey | undefined,
+    signal: AbortSignal | undefined,
+    cache?: { cacheUsage: { cacheCreationInputTokens: number; cacheReadInputTokens: number }; cacheProfile: unknown; accountId: string }
+  ): Promise<void> {
+    const loop = await runWebToolLoop(account as Parameters<typeof runWebToolLoop>[0], kiroPayload, webToolConfig, signal)
+    if (loop.webToolRounds > 0) {
+      proxyLogger.info('ProxyServer', `Web tool loop completed: ${loop.webToolRounds} round(s), ${loop.searches.length} search(es), model=${request.model}`)
+    }
+
+    const response = kiroToClaudeResponse(loop.content, loop.toolUses, loop.usage, request.model, toolNameRegistry, loop.reasoningContent)
+
+    // 把代理侧执行的 web 工具调用，还原成 Anthropic 原生 server_tool_use + web_search_tool_result
+    // content block，并加上 usage.server_tool_use.web_search_requests。
+    // 这样 Claude Code 等客户端才能正确显示 "Did N searches" 与可点击来源（否则显示 0 次）。
+    if (loop.searches.length > 0) {
+      const searchBlocks = buildWebSearchContentBlocks(loop.searches)
+      // server_tool_use / web_search_tool_result 放在最终回答文本之前
+      response.content = [...searchBlocks, ...response.content]
+      const searchCount = loop.searches.filter(s => s.kind === 'web_search').length
+      if (searchCount > 0) {
+        response.usage.server_tool_use = { web_search_requests: searchCount }
+      }
+    }
+
+    if (cache?.cacheUsage) {
+      if (cache.cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cache.cacheUsage.cacheCreationInputTokens
+      if (cache.cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cache.cacheUsage.cacheReadInputTokens
+      promptCacheTracker.update(cache.accountId, cache.cacheProfile as Parameters<typeof promptCacheTracker.update>[1])
+    }
+
+    this.throwIfResponseClosed(res, signal)
+    this.recordRequestSuccess()
+    this.stats.totalTokens += loop.usage.inputTokens + loop.usage.outputTokens
+    this.stats.inputTokens += loop.usage.inputTokens
+    this.stats.outputTokens += loop.usage.outputTokens
+    this.stats.totalCredits += loop.usage.credits || 0
+    this.events.onCreditsUpdate?.(this.stats.totalCredits)
+    this.accountPool.recordSuccess(account.id, loop.usage.inputTokens + loop.usage.outputTokens)
+    const respTime = Date.now() - startTime
+    this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: loop.usage.inputTokens + loop.usage.outputTokens, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime })
+    this.recordRequest({ path: '/v1/messages', model: request.model, accountId: account.id, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime, success: true })
+    if (matchedApiKey) {
+      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages')
+    }
+
+    if (!request.stream) {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(response))
+      return
+    }
+
+    // stream=true：把最终 response replay 成 Anthropic SSE
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+    const id = response.id || `msg_${uuidv4()}`
+    const write = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) }
+    write('message_start', createClaudeStreamEvent('message_start', {
+      message: { id, type: 'message', role: 'assistant', content: [], model: request.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: loop.usage.inputTokens, output_tokens: 0 } }
+    }))
+    response.content.forEach((block, index) => {
+      if (block.type === 'text') {
+        write('content_block_start', createClaudeStreamEvent('content_block_start', { index, content_block: { type: 'text', text: '' } }))
+        write('content_block_delta', createClaudeStreamEvent('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } }))
+        write('content_block_stop', createClaudeStreamEvent('content_block_stop', { index }))
+      } else if (block.type === 'thinking') {
+        write('content_block_start', createClaudeStreamEvent('content_block_start', { index, content_block: { type: 'thinking', thinking: '' } }))
+        write('content_block_delta', createClaudeStreamEvent('content_block_delta', { index, delta: { type: 'thinking_delta', thinking: block.thinking } }))
+        if (block.signature) write('content_block_delta', createClaudeStreamEvent('content_block_delta', { index, delta: { type: 'signature_delta', signature: block.signature } }))
+        write('content_block_stop', createClaudeStreamEvent('content_block_stop', { index }))
+      } else if (block.type === 'redacted_thinking') {
+        write('content_block_start', createClaudeStreamEvent('content_block_start', { index, content_block: { type: 'redacted_thinking', data: block.data } }))
+        write('content_block_stop', createClaudeStreamEvent('content_block_stop', { index }))
+      } else if (block.type === 'tool_use') {
+        write('content_block_start', createClaudeStreamEvent('content_block_start', { index, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } }))
+        write('content_block_delta', createClaudeStreamEvent('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } as unknown as ClaudeStreamEvent['delta'] }))
+        write('content_block_stop', createClaudeStreamEvent('content_block_stop', { index }))
+      } else if (block.type === 'server_tool_use') {
+        // web_search 的查询调用：start 带 id/name，input 通过 input_json_delta 流式补齐
+        write('content_block_start', createClaudeStreamEvent('content_block_start', { index, content_block: { type: 'server_tool_use', id: block.id, name: block.name, input: {} } as unknown as ClaudeContentBlock }))
+        write('content_block_delta', createClaudeStreamEvent('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input || {}) } as unknown as ClaudeStreamEvent['delta'] }))
+        write('content_block_stop', createClaudeStreamEvent('content_block_stop', { index }))
+      } else if (block.type === 'web_search_tool_result') {
+        // 搜索结果整体作为单个 content block 直接下发（含 content 数组）
+        write('content_block_start', createClaudeStreamEvent('content_block_start', { index, content_block: { type: 'web_search_tool_result', tool_use_id: block.tool_use_id, content: block.content } as unknown as ClaudeContentBlock }))
+        write('content_block_stop', createClaudeStreamEvent('content_block_stop', { index }))
+      }
+    })
+    write('message_delta', createClaudeStreamEvent('message_delta', {
+      delta: { stop_reason: response.stop_reason || 'end_turn', stop_sequence: null } as unknown as ClaudeStreamEvent['delta'],
+      usage: response.usage.server_tool_use
+        ? { output_tokens: loop.usage.outputTokens, server_tool_use: response.usage.server_tool_use }
+        : { output_tokens: loop.usage.outputTokens }
+    }))
+    write('message_stop', createClaudeStreamEvent('message_stop', {}))
+    res.end()
   }
 
   // 处理 Claude 流式响应

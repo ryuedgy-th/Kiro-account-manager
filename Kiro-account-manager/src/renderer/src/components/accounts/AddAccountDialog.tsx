@@ -213,6 +213,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           userId,
           nickname: email ? email.split('@')[0] : undefined,
           idp: providerName as 'BuilderId' | 'Google' | 'Github',
+          // IdC/Enterprise 账号的真实 profileArn（由 verify 通过 ListAvailableProfiles 获取）
+          profileArn: result.data.profileArn,
           credentials: {
             accessToken: result.data.accessToken,
             csrfToken: '',

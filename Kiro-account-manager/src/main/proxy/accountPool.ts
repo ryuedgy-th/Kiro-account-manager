@@ -488,6 +488,77 @@ export class AccountPool {
     this.currentIndex = 0
   }
 
+  // 批量同步账号池（幂等 diff，替代 clear()+addAccount() 全量重建）
+  //
+  // 旧做法每次都 clear() 再逐个 addAccount()：
+  //   1. 即使账号没变也会刷屏 console.log，导致日志被 "Added account" 淹没（曾见 45s 内 5w 条）
+  //   2. 丢弃已有账号的运行时状态（断路器冷却 / 配额 / 统计 / suspended），相当于每次同步都重置健康度
+  // 新做法只对真正变化的账号增删，保留既有账号的状态，并仅在有变化时汇总打印一行。
+  // 返回本次同步后的账号总数。
+  setAccounts(incoming: ProxyAccount[]): number {
+    const nextIds = new Set(incoming.map(a => a.id))
+    let added = 0
+    let removed = 0
+    let updated = 0
+
+    // 删除不在最新列表中的账号
+    for (const id of Array.from(this.accounts.keys())) {
+      if (!nextIds.has(id)) {
+        this.accounts.delete(id)
+        this.accountStats.delete(id)
+        removed++
+      }
+    }
+
+    // 新增 / 更新
+    for (const account of incoming) {
+      const existing = this.accounts.get(account.id)
+      if (!existing) {
+        // 新账号：复用 addAccount 的初始化逻辑，但抑制其逐条日志（下方汇总打印）
+        this.addAccountSilent(account)
+        added++
+      } else {
+        // 已存在：仅刷新凭证等可变字段，保留 isAvailable / 断路器 / 计数等运行时状态
+        const suspended = this.isSuspended(account)
+        this.accounts.set(account.id, {
+          ...existing,
+          ...account,
+          // suspended 状态以最新数据为准；未 suspended 时维持既有可用性（不强行复位断路器）
+          isAvailable: suspended ? false : existing.isAvailable
+        })
+        updated++
+      }
+    }
+
+    // 仅在确有变化时打印一行汇总，避免无变化的周期性同步刷屏
+    if (added > 0 || removed > 0) {
+      console.log(`[AccountPool] Synced accounts: +${added} -${removed} (~${updated} kept), total=${this.accounts.size}`)
+    }
+    return this.accounts.size
+  }
+
+  // addAccount 的静默版本：用于 setAccounts 批量同步，不打印逐条日志
+  private addAccountSilent(account: ProxyAccount): void {
+    const suspended = this.isSuspended(account)
+    this.accounts.set(account.id, {
+      ...account,
+      isAvailable: !suspended,
+      requestCount: 0,
+      errorCount: 0,
+      lastUsed: 0
+    })
+    this.accountStats.set(account.id, {
+      requests: 0,
+      tokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      errors: 0,
+      lastUsed: 0,
+      avgResponseTime: 0,
+      totalResponseTime: 0
+    })
+  }
+
   // 获取账号数量
   get size(): number {
     return this.accounts.size
