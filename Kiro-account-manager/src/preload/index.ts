@@ -1140,6 +1140,8 @@ const api = {
   // 启动自动注册
   registrationStartAuto: (config: {
     proxy?: string
+    upstreamProxy?: string
+    strictProxy?: boolean
     moEmailBaseURL?: string
     moEmailAPIKey?: string
     useOutlook?: boolean
@@ -1148,6 +1150,8 @@ const api = {
     tempMailPlusEmail?: string
     tempMailPlusEpin?: string
     tempMailPlusDomain?: string
+    useProton?: boolean
+    protonEmail?: string
     password?: string
     fullName?: string
     taskId?: string
@@ -1188,8 +1192,36 @@ const api = {
     url: string
     testUrl?: string
     timeoutMs?: number
+    upstreamProxy?: string
   }): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }> => {
     return ipcRenderer.invoke('proxy-pool:validate', params)
+  },
+
+  /** 代理链分阶段诊断（用于定位"上游/目标/端到端"哪一层失败） */
+  proxyPoolDiagnoseChain: (params: {
+    targetUrl: string
+    upstreamProxy: string
+    testHost?: string
+    testPort?: number
+  }): Promise<{
+    success: boolean
+    error?: string
+    diagnose?: {
+      upstreamReachable: boolean
+      upstreamError?: string
+      upstreamRtMs?: number
+      targetReachable: boolean
+      targetError?: string
+      targetRtMs?: number
+      targetStatus?: number
+      targetStatusText?: string
+      targetBodySnippet?: string
+      endToEndOk?: boolean
+      endToEndError?: string
+      endToEndRtMs?: number
+    }
+  }> => {
+    return ipcRenderer.invoke('proxy-pool:diagnose-chain', params)
   },
 
   // ============ 诊断 API ============
@@ -1220,9 +1252,48 @@ const api = {
     return ipcRenderer.invoke('diagnose:run', params)
   },
 
+  /**
+   * 账号测活：指定账号走反代逻辑给指定模型发一条测试消息，验证是否正常返回
+   */
+  diagnoseAccountLiveness: (params: {
+    account: {
+      id?: string; email?: string; accessToken?: string; refreshToken?: string
+      clientId?: string; clientSecret?: string; region?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
+    }
+    model?: string
+    message?: string
+    timeoutMs?: number
+  }): Promise<{
+    success: boolean
+    latencyMs: number
+    model?: string
+    content?: string
+    usage?: { inputTokens: number; outputTokens: number; credits: number }
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('diagnose:account-liveness', params)
+  },
+
   // 获取注册状态
   registrationStatus: (): Promise<{ inProgress: boolean }> => {
     return ipcRenderer.invoke('registration-status')
+  },
+
+  // Proton 邮箱：打开登录窗口（首次需手动登录，之后 session 持久化复用）
+  protonOpenLogin: (proxy?: string): Promise<{ success: boolean; loggedIn: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proton-open-login', proxy)
+  },
+
+  // Proton 邮箱：查询登录态（不弹窗）
+  protonLoginStatus: (proxy?: string): Promise<{ loggedIn: boolean }> => {
+    return ipcRenderer.invoke('proton-login-status', proxy)
+  },
+
+  // Proton 邮箱：关闭窗口（保留登录态）
+  protonClose: (): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('proton-close')
   },
 
   // 监听注册日志
@@ -1234,6 +1305,32 @@ const api = {
     ipcRenderer.on('registration-log', handler)
     return () => {
       ipcRenderer.removeListener('registration-log', handler)
+    }
+  },
+
+  /** 监听注册流程的实时 step 事件（用于批量任务的"当前步骤"可视化） */
+  onRegistrationStep: (callback: (data: {
+    taskId?: string
+    event: {
+      name:
+        | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
+        | 'oidc' | 'device' | 'email-created'
+        | 'portal' | 'workflow-init' | 'submit-email'
+        | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
+        | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
+        | 'verify-alive' | 'done'
+      ts: number
+      email?: string
+      exitIp?: string
+      extra?: Record<string, unknown>
+    }
+  }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: Parameters<typeof callback>[0]): void => {
+      callback(data)
+    }
+    ipcRenderer.on('registration-step', handler)
+    return () => {
+      ipcRenderer.removeListener('registration-step', handler)
     }
   },
 

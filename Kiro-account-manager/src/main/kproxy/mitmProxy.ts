@@ -26,6 +26,8 @@ export class MitmProxy {
   private stats: KProxyStats
   private events: KProxyEvents
   private tlsServers: Map<string, tls.Server> = new Map()
+  /** 跟踪所有 CONNECT 隧道客户端连接，stop() 时强制销毁，避免 server.close() 等 Keep-Alive 超时 */
+  private sockets = new Set<net.Socket>()
 
   constructor(certManager: CertManager, config: KProxyConfig, events: KProxyEvents = {}) {
     this.certManager = certManager
@@ -90,17 +92,27 @@ export class MitmProxy {
 
     // 关闭所有 TLS 服务器
     for (const [_host, tlsServer] of this.tlsServers) {
-      tlsServer.close()
+      try { tlsServer.close() } catch { /* ignore */ }
     }
     this.tlsServers.clear()
 
+    // 强制销毁所有活跃隧道连接：否则 server.close() 会等 Keep-Alive 连接自然超时（~60s）
+    for (const sock of this.sockets) {
+      try { sock.destroy() } catch { /* ignore */ }
+    }
+    this.sockets.clear()
+
+    const srv = this.server
+    this.server = null
     return new Promise((resolve) => {
-      this.server!.close(() => {
+      const finish = (): void => {
         console.log('[MitmProxy] Stopped')
-        this.server = null
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
-      })
+      }
+      srv.close(() => finish())
+      // 双保险：1 秒后无论 close 回调是否触发都 resolve
+      setTimeout(finish, 1000)
     })
   }
 
@@ -142,6 +154,9 @@ export class MitmProxy {
     clientSocket: net.Socket, 
     head: Buffer
   ): void {
+    // 跟踪隧道连接，stop() 时强制断开
+    this.sockets.add(clientSocket)
+    clientSocket.once('close', () => this.sockets.delete(clientSocket))
     this.stats.totalRequests++
     this.stats.lastRequestTime = Date.now()
 

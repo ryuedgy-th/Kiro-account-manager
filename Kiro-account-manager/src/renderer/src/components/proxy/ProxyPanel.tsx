@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { ProxySecurityPanel } from './ProxySecurityPanel'
@@ -106,6 +106,42 @@ interface ProxyConfig {
   }
 }
 
+// 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
+type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
+let _proxyRecentLogs: RecentLogEntry[] = []
+let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
+let _proxyResponseListenerRegistered = false
+function ensureProxyResponseListenerRegistered(): void {
+  if (_proxyResponseListenerRegistered) return
+  _proxyResponseListenerRegistered = true
+  window.api.onProxyResponse((info) => {
+    const now = new Date()
+    const year = now.getFullYear()
+    const month = (now.getMonth() + 1).toString().padStart(2, '0')
+    const day = now.getDate().toString().padStart(2, '0')
+    const hours = now.getHours().toString().padStart(2, '0')
+    const minutes = now.getMinutes().toString().padStart(2, '0')
+    const seconds = now.getSeconds().toString().padStart(2, '0')
+    const ms = now.getMilliseconds().toString().padStart(3, '0')
+    const fullTime = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${ms}`
+    _proxyRecentLogs = [{
+      time: fullTime,
+      path: info.path,
+      model: info.model,
+      status: info.status,
+      tokens: info.tokens,
+      inputTokens: info.inputTokens,
+      outputTokens: info.outputTokens,
+      cacheReadTokens: info.cacheReadTokens,
+      reasoningTokens: info.reasoningTokens,
+      credits: info.credits,
+      responseTime: info.responseTime,
+      error: info.error
+    }, ..._proxyRecentLogs.slice(0, 99)]
+    _refSetProxyRecentLogs?.(_proxyRecentLogs)
+  })
+}
+
 export function ProxyPanel() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -124,7 +160,7 @@ export function ProxyPanel() {
   const [availableCount, setAvailableCount] = useState(0)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [recentLogs, setRecentLogs] = useState<Array<{ time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }>>([])
+  const [recentLogs, setRecentLogs] = useState<RecentLogEntry[]>(_proxyRecentLogs)
   const [isSyncing, setIsSyncing] = useState(false)
   const [isRefreshingModels, setIsRefreshingModels] = useState(false)
   const [syncSuccess, setSyncSuccess] = useState(false)
@@ -227,16 +263,23 @@ export function ProxyPanel() {
   }, [])
 
   // 同步账号到反代池
-  const syncAccounts = useCallback(async () => {
+  // override 用于「改了分组配置立即重同步」场景：setConfig 后闭包里的 config 可能是旧值，
+  // 调用方传入新模式 / 新分组 ids，强制覆盖。
+  const syncAccounts = useCallback(async (override?: {
+    mode?: 'all' | 'groups'
+    groupIds?: string[]
+  }) => {
     setIsSyncing(true)
     setSyncSuccess(false)
     try {
+      const selMode = override?.mode ?? config.multiAccountSelectionMode ?? 'all'
+      const selGroupIds = override?.groupIds ?? config.multiAccountGroupIds ?? []
       let candidates = Array.from(accounts.values())
         .filter(acc => acc.status === 'active' && acc.credentials?.accessToken)
 
       // 多账号轮询 + 'groups' 范围：按选中分组过滤（'__ungrouped__' 表示未分组账号）
-      if (config.enableMultiAccount && config.multiAccountSelectionMode === 'groups') {
-        const gids = new Set(config.multiAccountGroupIds || [])
+      if (config.enableMultiAccount && selMode === 'groups') {
+        const gids = new Set(selGroupIds)
         candidates = candidates.filter(acc => {
           if (!acc.groupId) return gids.has('__ungrouped__')
           return gids.has(acc.groupId)
@@ -256,7 +299,9 @@ export function ProxyPanel() {
           clientSecret: acc.credentials?.clientSecret,
           region: acc.credentials?.region || 'us-east-1',
           authMethod: acc.credentials?.authMethod,
-          provider: acc.credentials?.provider || acc.idp
+          provider: acc.credentials?.provider || acc.idp,
+          // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
+          groupId: acc.groupId
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
@@ -374,34 +419,11 @@ export function ProxyPanel() {
       console.log('[Proxy] Request:', info)
     })
 
-    const unsubResponse = window.api.onProxyResponse((info) => {
-      const now = new Date()
-      const year = now.getFullYear()
-      const month = (now.getMonth() + 1).toString().padStart(2, '0')
-      const day = now.getDate().toString().padStart(2, '0')
-      const hours = now.getHours().toString().padStart(2, '0')
-      const minutes = now.getMinutes().toString().padStart(2, '0')
-      const seconds = now.getSeconds().toString().padStart(2, '0')
-      const ms = now.getMilliseconds().toString().padStart(3, '0')
-      const fullTime = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${ms}`
-      setRecentLogs(prev => [{
-        time: fullTime,
-        path: info.path,
-        model: info.model,
-        status: info.status,
-        tokens: info.tokens,
-        inputTokens: info.inputTokens,
-        outputTokens: info.outputTokens,
-        cacheReadTokens: info.cacheReadTokens,
-        reasoningTokens: info.reasoningTokens,
-        credits: info.credits,
-        responseTime: info.responseTime,
-        error: info.error
-      }, ...prev.slice(0, 99)]) // 保留最多 100 条
-
-      // 更新统计
-      fetchStatus()
-    })
+    // onProxyResponse：模块级单次订阅；这里只注册 setter 通道 + 拉取请求触发统计刷新
+    ensureProxyResponseListenerRegistered()
+    _refSetProxyRecentLogs = setRecentLogs
+    // 触发一次统计刷新即可（统计有独立的 fetchStatus，不依赖订阅）
+    const unsubStatsHook = window.api.onProxyResponse(() => { fetchStatus() })
 
     const unsubError = window.api.onProxyError((err) => {
       console.error('[Proxy] Error:', err)
@@ -417,25 +439,36 @@ export function ProxyPanel() {
 
     return () => {
       unsubRequest()
-      unsubResponse()
+      unsubStatsHook()
       unsubError()
       unsubStatus()
+      _refSetProxyRecentLogs = null
     }
   }, [fetchStatus, loadAvailableModels])
 
-  // 账号变化时同步（防抖）
-  //
-  // accounts 来自 zustand，每次 mutation 都会生成新的 Map 引用；而 syncAccounts 依赖 accounts，
-  // 因此 accounts 一变 -> syncAccounts 重建 -> 本 effect 重跑。若不防抖，启动期 token 刷新 / 自动切换 /
-  // 自动保存等周期任务连续改写 accounts 时，会以极高频率触发 IPC 同步（曾导致主进程日志被刷爆）。
-  // 这里合并 500ms 内的多次变化为一次同步。
+  // 用 ref 持有最新的 syncAccounts，避免把它放进下方 effect 依赖导致循环重触发
+  const syncAccountsRef = useRef(syncAccounts)
+  useEffect(() => { syncAccountsRef.current = syncAccounts }, [syncAccounts])
+
+  /**
+   * 账号集合签名：只反映"参与同步的账号 id + 分组"，**不含** token / 用量 / 状态时间戳。
+   * 这样后台 token 刷新、用量更新等高频变动不会触发重新同步（避免按钮疯狂闪烁），
+   * 仅在真正增删账号 / 改分组时才同步。token 更新由主进程账号池自身刷新逻辑处理。
+   */
+  const accountsSyncSignature = useMemo(() => {
+    return Array.from(accounts.values())
+      .filter(a => a.status === 'active' && a.credentials?.accessToken)
+      .map(a => `${a.id}:${a.groupId || ''}`)
+      .sort()
+      .join('|')
+  }, [accounts])
+
+  // 账号集合变化时同步（防抖 600ms + 仅签名变化才触发）
   useEffect(() => {
     if (!isRunning) return
-    const timer = setTimeout(() => {
-      syncAccounts()
-    }, 500)
+    const timer = setTimeout(() => { void syncAccountsRef.current() }, 600)
     return () => clearTimeout(timer)
-  }, [accounts, isRunning, syncAccounts])
+  }, [accountsSyncSignature, isRunning])
 
   // 实时更新运行时间
   const [uptime, setUptime] = useState(0)
@@ -513,7 +546,7 @@ export function ProxyPanel() {
                 {isEn ? 'Stop Service' : '停止服务'}
               </Button>
             )}
-            <Button onClick={syncAccounts} variant="outline" className="gap-2" disabled={!isRunning || isSyncing}>
+            <Button onClick={() => void syncAccounts()} variant="outline" className="gap-2" disabled={!isRunning || isSyncing}>
               {isSyncing ? <Loader2 className="h-4 w-4 animate-spin" /> : syncSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
               {isSyncing ? (isEn ? 'Syncing...' : '同步中...') : syncSuccess ? (isEn ? 'Synced!' : '已同步') : (isEn ? 'Sync Accounts' : '同步账号')}
             </Button>
@@ -755,6 +788,8 @@ export function ProxyPanel() {
                 const ids = Array.from(next)
                 setConfig(prev => ({ ...prev, multiAccountGroupIds: ids }))
                 window.api.proxyUpdateConfig({ multiAccountGroupIds: ids })
+                // 关键：立即用新分组 ids 重新同步账号池，避免「改了分组但反代仍用旧账号」的体感 bug
+                void syncAccounts({ mode: 'groups', groupIds: ids })
               }
               return (
                 <div className="col-span-2 flex flex-col gap-2">
@@ -777,6 +812,8 @@ export function ProxyPanel() {
                             onClick={() => {
                               setConfig(prev => ({ ...prev, multiAccountSelectionMode: mode }))
                               window.api.proxyUpdateConfig({ multiAccountSelectionMode: mode })
+                              // 关键：切换 all/groups 立即重新同步账号池
+                              void syncAccounts({ mode, groupIds: Array.from(selectedGids) })
                             }}
                           >
                             {label}

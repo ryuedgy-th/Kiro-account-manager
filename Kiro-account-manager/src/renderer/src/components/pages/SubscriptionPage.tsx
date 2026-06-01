@@ -1500,16 +1500,16 @@ export function SubscriptionPage() {
                           <span className="inline-flex items-center gap-1">
                             <CheckCircle className="h-4 w-4 text-green-500" />
                             {link.generatedAt && (
-                              <span className="text-[9px] text-muted-foreground tabular-nums" title="生成至今分钟数">
+                              <span className="text-[9px] text-muted-foreground tabular-nums" title={isEn ? 'Minutes since generated' : '生成至今分钟数'}>
                                 {Math.round((Date.now() - link.generatedAt) / 60000)}m
                               </span>
                             )}
                           </span>
                         )}
                         {link.status === 'expired' && (
-                          <span className="inline-flex items-center gap-1 text-amber-600" title="可能已过期">
+                          <span className="inline-flex items-center gap-1 text-amber-600" title={isEn ? 'May have expired' : '可能已过期'}>
                             <AlertTriangle className="h-4 w-4" />
-                            <span className="text-[9px]">过期</span>
+                            <span className="text-[9px]">{isEn ? 'Expired' : '过期'}</span>
                           </span>
                         )}
                         {link.status === 'error' && (

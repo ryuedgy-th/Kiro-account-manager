@@ -414,6 +414,8 @@ export interface ProxyAccount {
   machineId?: string  // 账户绑定的设备 ID（64位十六进制）
   /** 账号绑定的出口代理 URL（http/https）；为空则使用全局代理逻辑 */
   proxyUrl?: string
+  /** 账号所属分组 ID；与 multiAccountSelectionMode='groups' + multiAccountGroupIds 配合做轮询分组过滤 */
+  groupId?: string
   // 运行时状态
   lastUsed?: number
   requestCount?: number

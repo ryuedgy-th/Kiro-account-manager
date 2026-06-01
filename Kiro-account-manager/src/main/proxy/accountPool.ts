@@ -164,24 +164,25 @@ export class AccountPool {
     return this.accounts.get(accountId) || null
   }
 
-  // 获取下一个可用账号（排除当前账号）
-  getNextAvailableAccount(excludeAccountId: string): ProxyAccount | null {
+  // 获取下一个可用账号（排除指定账号；支持单 ID 或 ID 集合）
+  // 集合形式用于「请求级累计已试账号」，避免重试时循环命中已经失败过的账号
+  getNextAvailableAccount(exclude: string | Set<string>): ProxyAccount | null {
+    const excludeSet = typeof exclude === 'string' ? new Set([exclude]) : exclude
     const accountList = Array.from(this.accounts.values())
-    if (accountList.length <= 1) {
-      return null
-    }
+    if (accountList.length === 0) return null
 
     const now = Date.now()
-    
-    // 尝试找到一个可用的账号（排除当前账号）
+
+    // 尝试找到一个可用的账号（排除指定账号）
     for (const account of accountList) {
-      if (account.id !== excludeAccountId && this.isAccountAvailable(account, now)) {
+      if (!excludeSet.has(account.id) && this.isAccountAvailable(account, now)) {
         return account
       }
     }
 
-    // 没有立即可用的账号，返回冷却时间最短的（排除当前账号）
-    const otherAccounts = accountList.filter(a => a.id !== excludeAccountId)
+    // 没有立即可用的账号，返回冷却时间最短的（排除指定账号）
+    const otherAccounts = accountList.filter(a => !excludeSet.has(a.id))
+    if (otherAccounts.length === 0) return null
     return this.getAccountWithShortestCooldown(otherAccounts, now)
   }
 

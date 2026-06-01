@@ -16,6 +16,13 @@ export interface RegistrationConfig {
 
   // 运行时
   proxy: string
+  /** 上游中转代理（可选，用于代理链）：让对 proxy(目标代理) 的连接经非大陆中转发起 */
+  upstreamProxy: string
+  /**
+   * 严格代理模式：开启后任何「代理缺失/代理链失败/回退环境变量」情况都立即抛错中止注册，
+   * 杜绝静默回退到本机真实 IP 直连。批量注册启用代理池时由前端强制开启。
+   */
+  strictProxy: boolean
 
   // MoEmail 配置
   moEmailBaseURL: string
@@ -30,6 +37,10 @@ export interface RegistrationConfig {
   tempMailPlusEmail: string  // tempmail.plus 用户名（不含 @mailto.plus）
   tempMailPlusEpin: string
   tempMailPlusDomain: string // 自建域名
+
+  // Proton 点号别名（webview 借壳官方网页取码，需先在应用内登录 Proton）
+  useProton: boolean
+  protonEmail: string // 本次注册使用的 Proton 邮箱地址（母邮箱或其点号变体，由前端生成）
 
   // 手动模式
   manualMode: boolean
@@ -67,6 +78,8 @@ export function newConfig(overrides?: Partial<RegistrationConfig>): Registration
     password: genPassword(),
     fullName: randomFullName(),
     proxy: '',
+    upstreamProxy: '',
+    strictProxy: false,
     moEmailBaseURL: '',
     moEmailAPIKey: '',
     useOutlook: false,
@@ -75,6 +88,8 @@ export function newConfig(overrides?: Partial<RegistrationConfig>): Registration
     tempMailPlusEmail: '',
     tempMailPlusEpin: '',
     tempMailPlusDomain: '',
+    useProton: false,
+    protonEmail: '',
     manualMode: false,
     ...overrides
   }

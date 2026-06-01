@@ -37,6 +37,34 @@ interface CACertInfo {
   validTo: string
 }
 
+// K-Proxy 请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
+type KProxyRecentRequest = {
+  timestamp: number
+  host: string
+  method: string
+  path: string
+  isMitm: boolean
+  deviceIdReplaced?: boolean
+}
+let _kproxyRecentRequests: KProxyRecentRequest[] = []
+let _refSetKproxyRecentRequests: ((v: KProxyRecentRequest[]) => void) | null = null
+let _kproxyRequestListenerRegistered = false
+function ensureKproxyRequestListenerRegistered(): void {
+  if (_kproxyRequestListenerRegistered) return
+  _kproxyRequestListenerRegistered = true
+  window.api.onKproxyRequest((info) => {
+    _kproxyRecentRequests = [{
+      timestamp: info.timestamp,
+      host: info.host,
+      method: info.method,
+      path: info.path,
+      isMitm: info.isMitm,
+      deviceIdReplaced: info.deviceIdReplaced
+    }, ..._kproxyRecentRequests].slice(0, 50)
+    _refSetKproxyRecentRequests?.(_kproxyRecentRequests)
+  })
+}
+
 export function KProxyPanel() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -57,14 +85,7 @@ export function KProxyPanel() {
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [deviceIdCopied, setDeviceIdCopied] = useState(false)
-  const [recentRequests, setRecentRequests] = useState<Array<{
-    timestamp: number
-    host: string
-    method: string
-    path: string
-    isMitm: boolean
-    deviceIdReplaced: boolean
-  }>>([])
+  const [recentRequests, setRecentRequests] = useState<KProxyRecentRequest[]>(_kproxyRecentRequests)
   const [caInstalled, setCaInstalled] = useState<boolean | null>(null)
 
   // 检查 CA 证书是否已安装
@@ -117,16 +138,9 @@ export function KProxyPanel() {
 
   // 监听事件
   useEffect(() => {
-    const unsubRequest = window.api.onKproxyRequest((info) => {
-      setRecentRequests(prev => [{
-        timestamp: info.timestamp,
-        host: info.host,
-        method: info.method,
-        path: info.path,
-        isMitm: info.isMitm,
-        deviceIdReplaced: info.deviceIdReplaced
-      }, ...prev].slice(0, 50))
-    })
+    // onKproxyRequest：模块级单次订阅；只在组件挂载期间挂 setter 通道
+    ensureKproxyRequestListenerRegistered()
+    _refSetKproxyRecentRequests = setRecentRequests
 
     const unsubStatus = window.api.onKproxyStatusChange((status) => {
       setIsRunning(status.running)
@@ -137,9 +151,9 @@ export function KProxyPanel() {
     })
 
     return () => {
-      unsubRequest()
       unsubStatus()
       unsubError()
+      _refSetKproxyRecentRequests = null
     }
   }, [])
 

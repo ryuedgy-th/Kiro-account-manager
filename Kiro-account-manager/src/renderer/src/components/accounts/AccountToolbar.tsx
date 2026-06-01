@@ -29,7 +29,8 @@ import {
   List as ListIcon,
   Users,
   Inbox,
-  ArrowRightLeft
+  ArrowRightLeft,
+  Zap
 } from 'lucide-react'
 
 export type AccountViewMode = 'grid' | 'list'
@@ -278,6 +279,12 @@ export function AccountToolbar({
     setIsChecking(true)
     await batchCheckStatus(Array.from(selectedIds))
     setIsChecking(false)
+  }
+
+  // 跳转到一键诊断页"账号测活"，对当前选中账号做批量测活（选中状态保存在 store，跳页后仍在）
+  const handleBatchLiveness = (): void => {
+    if (selectedCount === 0) return
+    window.dispatchEvent(new CustomEvent('navigate-page', { detail: 'diagnose' }))
   }
 
   const handleBatchDelete = (): void => {
@@ -813,6 +820,19 @@ export function AccountToolbar({
             }
           >
             {isChecking ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-emerald-600 hover:text-emerald-600 hover:bg-emerald-500/10"
+            onClick={handleBatchLiveness}
+            disabled={selectedCount === 0}
+            title={selectedCount > 0
+              ? (isEn ? `Liveness test ${selectedCount} accounts via reverse-proxy` : `走反代对选中 ${selectedCount} 个账号批量测活`)
+              : (isEn ? 'Liveness test (select first)' : '账号测活（请先选中账号）')
+            }
+          >
+            <Zap className="h-4 w-4" />
           </Button>
           <Button
             variant="ghost"

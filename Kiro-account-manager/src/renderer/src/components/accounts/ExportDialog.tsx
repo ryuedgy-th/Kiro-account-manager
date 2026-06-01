@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Button, Badge } from '../ui'
-import { X, FileJson, FileText, Table, Clipboard, Check, Download, Key } from 'lucide-react'
+import { X, FileJson, FileText, Table, Clipboard, Check, Download, Key, Braces } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account } from '@/types/account'
 
-type ExportFormat = 'json' | 'txt' | 'csv' | 'kami' | 'clipboard'
+type ExportFormat = 'json' | 'oidc' | 'txt' | 'csv' | 'kami' | 'clipboard'
 
 interface ExportDialogProps {
   open: boolean
@@ -28,6 +28,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
 
   const formats: { id: ExportFormat; name: string; icon: typeof FileJson; desc: string }[] = [
     { id: 'json', name: 'JSON', icon: FileJson, desc: isEn ? 'Full data, can be imported' : '完整数据，可用于导入' },
+    { id: 'oidc', name: 'OIDC JSON', icon: Braces, desc: isEn ? 'Minimal JSON, paste to OIDC batch import' : 'OIDC 精简 JSON，可粘贴到批量添加' },
     { id: 'kami', name: isEn ? 'Card Key' : '卡密', icon: Key, desc: isEn ? 'email----password----token----id----secret' : '卡密格式：邮箱----密码----Token----ID----Secret' },
     { id: 'txt', name: 'TXT', icon: FileText, desc: isEn ? 'Text format' : (includeCredentials ? '可导入格式：邮箱,Token,昵称,登录方式' : '纯文本格式，每行一个账号') },
     { id: 'csv', name: 'CSV', icon: Table, desc: isEn ? 'Excel compatible' : (includeCredentials ? '可导入格式，Excel 兼容' : 'Excel 兼容格式') },
@@ -53,6 +54,23 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           }))
         }
         return JSON.stringify(exportData, null, 2)
+
+      case 'oidc': {
+        // 精简 JSON：只含关键凭证（邮箱/密码/refreshToken/clientId/clientSecret/provider）
+        // 字段名与 OIDC 批量添加的 JSON 解析对齐，可直接复制粘贴导入
+        const minimal = accounts.map(acc => {
+          const item: Record<string, string> = {
+            email: acc.email,
+            refreshToken: acc.credentials?.refreshToken || '',
+            provider: acc.idp || 'BuilderId'
+          }
+          if (acc.password) item.password = acc.password
+          if (acc.credentials?.clientId) item.clientId = acc.credentials.clientId
+          if (acc.credentials?.clientSecret) item.clientSecret = acc.credentials.clientSecret
+          return item
+        })
+        return JSON.stringify(minimal, null, 2)
+      }
 
       case 'txt':
         if (includeCredentials) {
@@ -109,14 +127,17 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
         ).join('\n')
 
       case 'kami':
-        // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
+        // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret----登录方式
+        // 第6字段(登录方式/idp)用于导入时还原认证方式：GitHub/Google 是 social 登录、无 ClientId/Secret，
+        // 缺了它会被导入端误判为 BuilderId(IdC) 而验证失败
         return accounts.map(acc => 
           [
             acc.email,
             acc.password || 'no_password',
             acc.credentials?.refreshToken || '',
             acc.credentials?.clientId || '',
-            acc.credentials?.clientSecret || ''
+            acc.credentials?.clientSecret || '',
+            acc.idp || 'BuilderId'
           ].join('----')
         ).join('\n')
 
@@ -154,6 +175,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
 
     const extensions: Record<string, string> = {
       json: 'json',
+      oidc: 'json',
       txt: 'txt',
       csv: 'csv',
       kami: 'txt'
@@ -226,6 +248,15 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           </div>
 
           {/* 选项 */}
+          {selectedFormat === 'oidc' && (
+            <div className="p-3 bg-muted rounded-lg">
+              <p className="text-xs text-muted-foreground">
+                {isEn
+                  ? 'Minimal JSON array (email / password / refreshToken / clientId / clientSecret / provider). Paste directly into the OIDC batch import box.'
+                  : '精简 JSON 数组，含 邮箱 / 密码 / RefreshToken / ClientId / ClientSecret / provider，可直接粘贴到「OIDC 批量添加」输入框。'}
+              </p>
+            </div>
+          )}
           {selectedFormat === 'kami' && (
             <div className="p-3 bg-muted rounded-lg">
               <p className="text-xs text-muted-foreground">
@@ -256,9 +287,9 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           <Button variant="outline" onClick={onClose}>
             {isEn ? 'Cancel' : '取消'}
           </Button>
-          {selectedFormat === 'kami' && (
+          {(selectedFormat === 'kami' || selectedFormat === 'oidc') && (
             <Button variant="outline" disabled={copied} onClick={async () => {
-              const content = generateContent('kami')
+              const content = generateContent(selectedFormat)
               await navigator.clipboard.writeText(content)
               setCopied(true)
               setTimeout(() => {

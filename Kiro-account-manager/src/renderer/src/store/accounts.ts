@@ -43,8 +43,13 @@ const TOKEN_REFRESH_BEFORE_EXPIRY = 5 * 60 * 1000 // 过期前 5 分钟刷新
 
 // 持久化防抖：合并连续 mutation 为单次写盘，避免后台刷新风暴时 IPC + IO 风暴
 const SAVE_DEBOUNCE_MS = 500
+/** 防抖最大延迟：连续 mutation 时也最迟在此时间内落盘一次，防止风暴下数据长时间不入磁盘 */
+const SAVE_MAX_WAIT_MS = 5000
 let saveDebounceTimer: ReturnType<typeof setTimeout> | null = null
+let saveMaxWaitTimer: ReturnType<typeof setTimeout> | null = null
 let saveInFlight: Promise<void> | null = null
+/** 等待本轮防抖窗口落盘的所有调用方 resolver；批量唤醒，避免风暴时 Promise 永久挂起 */
+let savePendingResolvers: Array<() => void> = []
 
 // ============ getFilteredAccounts / getStats 引用缓存 ============
 // 大账号量场景下这两个 selector 每次 re-render 都跑 O(n) 计算（filter + sort）
@@ -1723,27 +1728,45 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
    * 调用方仍可 await 该 Promise；返回的 Promise 会在防抖窗口结束并完成实际落盘后 resolve。
    * 用于消除高频更新场景（如 1000 账号后台刷新风暴）下的 IPC/IO 抖动。
    */
+  /**
+   * 防抖触发持久化：连续 mutation 在 SAVE_DEBOUNCE_MS 内只写盘一次；
+   * 同时强制 SAVE_MAX_WAIT_MS 最大延迟，避免后台刷新风暴时一直被新调用 reset 导致永不落盘。
+   * 同窗口内的所有调用方共享一组 resolvers，实际落盘后批量唤醒。
+   */
   saveToStorage: async () => {
     return new Promise<void>((resolve) => {
-      if (saveDebounceTimer) clearTimeout(saveDebounceTimer)
-      saveDebounceTimer = setTimeout(async () => {
-        saveDebounceTimer = null
+      savePendingResolvers.push(resolve)
+      const flushNow = async (): Promise<void> => {
+        if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); saveDebounceTimer = null }
+        if (saveMaxWaitTimer) { clearTimeout(saveMaxWaitTimer); saveMaxWaitTimer = null }
+        const resolvers = savePendingResolvers
+        savePendingResolvers = []
         await get().flushSaveImmediately()
-        resolve()
-      }, SAVE_DEBOUNCE_MS)
+        for (const r of resolvers) r()
+      }
+      if (saveDebounceTimer) clearTimeout(saveDebounceTimer)
+      saveDebounceTimer = setTimeout(flushNow, SAVE_DEBOUNCE_MS)
+      if (!saveMaxWaitTimer) {
+        saveMaxWaitTimer = setTimeout(flushNow, SAVE_MAX_WAIT_MS)
+      }
     })
   },
 
   /**
    * 立即落盘（跳过防抖）。用于 beforeunload、关键操作前后强制持久化场景。
    * 并发调用会自动等待同一次 in-flight 保存，避免重入。
+   * 同时会唤醒所有走 saveToStorage 在等本次窗口落盘的调用方。
    */
   flushSaveImmediately: async () => {
-    if (saveDebounceTimer) {
-      clearTimeout(saveDebounceTimer)
-      saveDebounceTimer = null
+    if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); saveDebounceTimer = null }
+    if (saveMaxWaitTimer) { clearTimeout(saveMaxWaitTimer); saveMaxWaitTimer = null }
+    const pending = savePendingResolvers
+    savePendingResolvers = []
+    if (saveInFlight) {
+      const inflight = saveInFlight
+      void inflight.then(() => { for (const r of pending) r() })
+      return inflight
     }
-    if (saveInFlight) return saveInFlight
 
     const {
       accounts,
@@ -1811,6 +1834,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       } finally {
         set({ isSyncing: false })
         saveInFlight = null
+        for (const r of pending) r()
       }
     })()
 
@@ -2757,10 +2781,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const parsed = parseProxyUrl(url)
     if (!parsed) return null
 
-    // 去重：同 host:port 视为重复
+    // 去重：同 host:port:protocol:username 视为重复
+    // 含 username 以支持 bestproxy 等「单入口、靠用户名区分地区/会话」的轮换代理添加多条
     const existingPool = get().proxyPool
     for (const entry of existingPool.values()) {
-      if (entry.host === parsed.host && entry.port === parsed.port && entry.protocol === parsed.protocol) {
+      if (entry.host === parsed.host && entry.port === parsed.port && entry.protocol === parsed.protocol
+        && (entry.username || '') === (parsed.username || '')) {
         return null
       }
     }
@@ -2802,14 +2828,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const existingPool = get().proxyPool
     const existingKeys = new Set<string>()
     for (const entry of existingPool.values()) {
-      existingKeys.add(`${entry.protocol}://${entry.host}:${entry.port}`)
+      existingKeys.add(`${entry.protocol}://${entry.username || ''}@${entry.host}:${entry.port}`)
     }
     const newEntries: ProxyEntry[] = []
 
     for (const line of lines) {
       const parsed = parseProxyUrl(line)
       if (!parsed) { result.failed++; continue }
-      const key = `${parsed.protocol}://${parsed.host}:${parsed.port}`
+      const key = `${parsed.protocol}://${parsed.username || ''}@${parsed.host}:${parsed.port}`
       if (existingKeys.has(key)) { result.skipped++; continue }
       existingKeys.add(key)
       newEntries.push({
@@ -2926,7 +2952,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       result = await window.api.proxyPoolValidate({
         url: entry.url,
         testUrl: proxyPoolConfig.testUrl,
-        timeoutMs: proxyPoolConfig.testTimeoutMs
+        timeoutMs: proxyPoolConfig.testTimeoutMs,
+        upstreamProxy: proxyPoolConfig.upstreamProxy
       })
     } catch (err) {
       result = { success: false, error: err instanceof Error ? err.message : String(err) }
@@ -2948,10 +2975,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           lastError: result.success ? undefined : result.error,
           // 验活失败也累计到 failCount，但不计入 reportProxyResult 的注册失败
           failCount: result.success ? existing.failCount : existing.failCount + 1,
-          // 自动停用：累计失败超过阈值
+          // 自动停用：累计失败超过阈值；但池中可用代理 <= 1 时保护性保留（轮换代理避免变直连）
           enabled: result.success
             ? existing.enabled
-            : (state.proxyPoolConfig.autoDisableDead && existing.failCount + 1 >= state.proxyPoolConfig.failureThreshold
+            : (state.proxyPoolConfig.autoDisableDead
+              && existing.failCount + 1 >= state.proxyPoolConfig.failureThreshold
+              && Array.from(state.proxyPool.values()).filter((p) => p.enabled && p.status !== 'dead').length > 1
               ? false
               : existing.enabled)
         })
@@ -3046,16 +3075,22 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const next = new Map(state.proxyPool)
       const existing = next.get(id)
       if (!existing) return state
-      const failCount = success ? existing.failCount : existing.failCount + 1
-      const autoDisable = !success
+      // 仅「代理连接层错误」才累加 failCount；AWS 业务/风控失败（如 Portal/EOF/邮箱已注册）不计，
+      // 避免把好代理（尤其只配了一条的轮换代理）误判停用导致变直连暴露真实 IP。
+      const isProxyFail = !success && isProxyConnectionError(errorMsg)
+      const failCount = isProxyFail ? existing.failCount + 1 : existing.failCount
+      // 轮换代理保护：池中可用代理 <= 1 时不自动停用
+      const enabledCount = Array.from(state.proxyPool.values()).filter((p) => p.enabled && p.status !== 'dead').length
+      const autoDisable = isProxyFail
         && state.proxyPoolConfig.autoDisableDead
         && failCount >= state.proxyPoolConfig.failureThreshold
+        && enabledCount > 1
       autoDisabled = autoDisable
       next.set(id, {
         ...existing,
         failCount,
         lastBoundEmail: boundEmail || existing.lastBoundEmail,
-        lastError: success ? existing.lastError : errorMsg,
+        lastError: success ? existing.lastError : (errorMsg || existing.lastError),
         enabled: autoDisable ? false : existing.enabled,
         status: autoDisable ? 'dead' : existing.status
       })
@@ -3247,6 +3282,25 @@ interface ParsedProxy {
  *   - host:port:user:pass    （Stormproxies 等代理商常用格式）
  *   - user:pass@host:port    （省略 scheme）
  */
+// 判断错误是否为「代理连接层」问题（而非 AWS 业务/风控失败）。
+// 仅这类错误才累加代理 failCount / 触发自动停用，避免风控失败把好代理（尤其单条轮换代理）误杀成直连。
+function isProxyConnectionError(msg: string | undefined): boolean {
+  const m = (msg || '').toLowerCase()
+  if (!m) return false
+  return m.includes('proxy')
+    || m.includes('econnrefused')
+    || m.includes('econnreset')
+    || m.includes('etimedout')
+    || m.includes('ehostunreach')
+    || m.includes('enetunreach')
+    || m.includes('tunnel')
+    || m.includes('dial tcp')
+    || m.includes('connection refused')
+    || m.includes('connection reset')
+    || m.includes('407')
+    || m.includes('socks')
+}
+
 function parseProxyUrl(raw: string): ParsedProxy | null {
   const trimmed = (raw || '').trim()
   if (!trimmed) return null

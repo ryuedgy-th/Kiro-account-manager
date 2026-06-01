@@ -399,7 +399,32 @@ export function openaiToKiro(
     } else if (msg.role === 'tool') {
       // Tool result - 收集到待处理列表
       if (msg.tool_call_id) {
-        const rawText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+        let rawText = ''
+        let extractedImageCount = 0
+        // content 是数组时（部分客户端把图像/多模态结果挂在这里）：
+        // 提取所有 text 块拼接为文本；image_url 块提取到外层 images，避免被 JSON.stringify 序列化丢失
+        if (Array.isArray(msg.content)) {
+          const textParts: string[] = []
+          for (const part of msg.content) {
+            if (part.type === 'text' && typeof part.text === 'string') {
+              textParts.push(part.text)
+            } else if (part.type === 'image_url' && part.image_url?.url) {
+              const img = parseImageUrl(part.image_url.url)
+              if (img) { images.push(img); extractedImageCount++ }
+            }
+          }
+          rawText = textParts.join('')
+          if (!rawText && extractedImageCount === 0) {
+            // 退化：把不识别的结构 stringify 让模型至少看到原始结构
+            rawText = JSON.stringify(msg.content)
+          }
+          if (extractedImageCount > 0) {
+            rawText = (rawText ? rawText + '\n\n' : '') +
+              `[Tool returned ${extractedImageCount} image${extractedImageCount > 1 ? 's' : ''}, attached to this message]`
+          }
+        } else {
+          rawText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+        }
         toolResults.push({
           toolUseId: msg.tool_call_id,
           content: [{ text: rawText || '(no output)' }],
@@ -1027,18 +1052,41 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
         documents.push(parseClaudeDocumentSource(block.source, block.name))
       } else if (block.type === 'tool_result' && block.tool_use_id) {
         let resultContent = ''
+        // Kiro tool_result.content 只支持 text，但用户层 images 可以承载图片。
+        // 把内嵌 image block 提取到外层 images，避免「读取本地图片」这类场景图像内容被静默丢弃。
+        let extractedImageCount = 0
         if (typeof block.content === 'string') {
           resultContent = block.content || '(empty)'
         } else if (Array.isArray(block.content)) {
-          // 规范化 content blocks：提取所有 text，跳过非 text 类型
           const textParts: string[] = []
           for (const b of block.content) {
             if (b.type === 'text') {
               textParts.push(b.text || '')
+            } else if (b.type === 'image' && b.source?.type === 'base64' && b.source.data) {
+              const mediaTypeParts = (b.source.media_type || '').split('/')
+              const imageFormat = mediaTypeParts[1]
+              if (mediaTypeParts[0] === 'image' && imageFormat) {
+                try {
+                  images.push({
+                    format: normalizeImageFormat(imageFormat),
+                    source: { bytes: b.source.data }
+                  })
+                  extractedImageCount++
+                } catch {
+                  // 不支持的格式：跳过但不抛错（保留旧行为，避免整轮失败）
+                }
+              }
             }
-            // 非 text 类型（image 等）跳过，不抛错
           }
-          resultContent = textParts.join('') || '(no text output)'
+          resultContent = textParts.join('')
+          if (!resultContent) {
+            resultContent = extractedImageCount > 0
+              ? `(tool returned ${extractedImageCount} image${extractedImageCount > 1 ? 's' : ''}, attached to this message)`
+              : '(no text output)'
+          } else if (extractedImageCount > 0) {
+            // 既有文本又有图片：在文本末尾提示模型有附图
+            resultContent += `\n\n[Tool also returned ${extractedImageCount} image${extractedImageCount > 1 ? 's' : ''}, attached to this message]`
+          }
         } else if (block.content === undefined || block.content === null) {
           resultContent = '(no output)'
         } else {

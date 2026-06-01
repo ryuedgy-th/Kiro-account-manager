@@ -279,11 +279,31 @@ const MODEL_ID_MAP: Record<string, string> = {
   'default': 'claude-sonnet-4.5'
 }
 
+/**
+ * 归一化 Claude 版本号：把版本号里的短横线转成点号。
+ *
+ * 背景：部分客户端（如 Claude Code）不允许模型名里出现 "."，会把 "claude-opus-4.6"
+ * 写成 "claude-opus-4-6"，若原样透传给 Kiro 会被解析成 "claude-opus-4"（丢掉 minor），
+ * 导致 1M 上下文等特性设置失败。这里把 claude-{family}-{major}-{minor} 的最后一段
+ * 版本短横转成点号，兼容未来任意新版本（4.6 / 4.7 / 5.0 ...）。
+ *
+ * 仅当 minor 是 1~2 位数字且其后不是更多数字时才转换，避免误伤日期快照后缀
+ * （如 claude-sonnet-4-20250514 不会被改）。
+ */
+function normalizeClaudeVersion(modelId: string): string {
+  return modelId.replace(
+    /^(claude-(?:sonnet|haiku|opus))-(\d+)-(\d{1,2})(?=$|[^\d])/i,
+    '$1-$2.$3'
+  )
+}
+
 export function mapModelId(model: string): string {
   // 去掉 Claude Code 等客户端附加的能力后缀，如 "claude-opus-4-8[1m]" → "claude-opus-4-8"
-  const modelId = model.trim().replace(/\[[^\]]*\]\s*$/, '').trim()
+  let modelId = model.trim().replace(/\[[^\]]*\]\s*$/, '').trim()
   if (!modelId) return MODEL_ID_MAP.default
   if (isCodeWhispererModelId(modelId)) return modelId
+  // 0) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
+  modelId = normalizeClaudeVersion(modelId)
   const lower = modelId.toLowerCase()
   // 1) 显式 alias 映射优先
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]

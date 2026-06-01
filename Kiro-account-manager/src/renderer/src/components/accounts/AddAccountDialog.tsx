@@ -682,13 +682,20 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           parts = line.split(/\s{2,}/)
         }
         const rawPwd = parts[1]?.trim()
+        const clientId = parts[3]?.trim() || undefined
+        const clientSecret = parts[4]?.trim() || undefined
+        // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断——
+        // social(Github/Google) 只有 refreshToken，IdC(BuilderId/Enterprise) 才有 ClientId/Secret。
+        // provider 决定下方 verify 的 authMethod(social→只需 refreshToken / IdC→需 ClientId+Secret)
+        const rawIdp = parts[5]?.trim()
+        const provider = rawIdp || ((!clientId && !clientSecret) ? 'Google' : 'BuilderId')
         return {
           _email: parts[0]?.trim() || '',
           password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
           refreshToken: parts[2]?.trim() || '',
-          clientId: parts[3]?.trim() || undefined,
-          clientSecret: parts[4]?.trim() || undefined,
-          provider: 'BuilderId'
+          clientId,
+          clientSecret,
+          provider
         }
       }).filter(item => item.refreshToken) as typeof credentials
 

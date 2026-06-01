@@ -62,6 +62,28 @@ export type ProxyPoolStrategy =
   | 'least_used'   // 最少使用优先
   | 'fastest'      // 延迟最低优先
 
+/** 预设 IP 检测端点 */
+export interface IpDetectEndpoint {
+  id: string
+  label: string
+  url: string
+  /** 响应格式：json 从字段提取 IP，text 用正则匹配 */
+  format: 'json' | 'text'
+  /** JSON 响应中 IP 所在的字段路径（如 'ip' / 'query' / 'origin'）*/
+  ipField?: string
+}
+
+export const IP_DETECT_ENDPOINTS: IpDetectEndpoint[] = [
+  { id: 'ipify',       label: 'ipify',        url: 'https://api.ipify.org?format=json',  format: 'json', ipField: 'ip' },
+  { id: 'ip-api',      label: 'IP-API',        url: 'http://ip-api.com/json',             format: 'json', ipField: 'query' },
+  { id: 'ipinfo',      label: 'IPinfo',        url: 'https://ipinfo.io/json',             format: 'json', ipField: 'ip' },
+  { id: 'ip2location', label: 'IP2Location',   url: 'https://api.ip2location.io',         format: 'json', ipField: 'ip' },
+  { id: 'httpbin',     label: 'httpbin',       url: 'https://httpbin.org/ip',             format: 'json', ipField: 'origin' },
+  { id: 'ifconfig',    label: 'ifconfig.me',   url: 'https://ifconfig.me/ip',             format: 'text' },
+  { id: 'icanhazip',   label: 'icanhazip',     url: 'https://icanhazip.com',              format: 'text' },
+  { id: 'ipapi-co',    label: 'ipapi.co',      url: 'https://ipapi.co/json',              format: 'json', ipField: 'ip' },
+]
+
 /** 代理池配置 */
 export interface ProxyPoolConfig {
   enabled: boolean              // 是否启用代理池（注册时自动取用）
@@ -75,6 +97,8 @@ export interface ProxyPoolConfig {
   autoValidateIntervalMin: number
   /** 定时验活的并发数 */
   autoValidateConcurrency: number
+  /** 上游中转代理（可选）：配合"目标代理要求非大陆来源 IP"的场景串联代理链；支持 http/socks5 */
+  upstreamProxy?: string
 }
 
 export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
@@ -86,5 +110,6 @@ export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
   testUrl: 'https://api.ipify.org?format=json',
   testTimeoutMs: 8000,
   autoValidateIntervalMin: 0,
-  autoValidateConcurrency: 5
+  autoValidateConcurrency: 5,
+  upstreamProxy: ''
 }

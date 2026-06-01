@@ -33,13 +33,13 @@ export interface RateLimiterConfig {
 }
 
 export const DEFAULT_RATE_LIMITER_CONFIG: RateLimiterConfig = {
-  maxPerMinute: 20,
-  burst: 5,
+  maxPerMinute: 10,
+  burst: 3,
   windowSec: 120,
   successRateThreshold: 0.5,
   minSamples: 5,
-  consecutiveFailureThreshold: 5,
-  backoffBaseMs: 5_000,
+  consecutiveFailureThreshold: 3,
+  backoffBaseMs: 8_000,
   backoffMaxMs: 120_000
 }
 

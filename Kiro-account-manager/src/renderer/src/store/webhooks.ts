@@ -33,14 +33,14 @@ export type WebhookEvent =
   | 'register-failed'      // 单账号注册失败
   | 'token-expired'        // Token 过期/刷新失败
 
-export const ALL_WEBHOOK_EVENTS: { value: WebhookEvent; label: string }[] = [
-  { value: 'batch-completed', label: '批量任务完成' },
-  { value: 'batch-error', label: '批量任务严重错误' },
-  { value: 'risk-warning', label: '风控警告触发' },
-  { value: 'account-banned', label: '账号被封禁' },
-  { value: 'register-success', label: '注册成功（单账号）' },
-  { value: 'register-failed', label: '注册失败（单账号）' },
-  { value: 'token-expired', label: 'Token 过期/刷新失败' }
+export const ALL_WEBHOOK_EVENTS: { value: WebhookEvent; label: string; labelEn: string }[] = [
+  { value: 'batch-completed', label: '批量任务完成', labelEn: 'Batch completed' },
+  { value: 'batch-error', label: '批量任务严重错误', labelEn: 'Batch error' },
+  { value: 'risk-warning', label: '风控警告触发', labelEn: 'Risk warning' },
+  { value: 'account-banned', label: '账号被封禁', labelEn: 'Account banned' },
+  { value: 'register-success', label: '注册成功（单账号）', labelEn: 'Register success' },
+  { value: 'register-failed', label: '注册失败（单账号）', labelEn: 'Register failed' },
+  { value: 'token-expired', label: 'Token 过期/刷新失败', labelEn: 'Token expired' }
 ]
 
 export interface WebhookMessage {

@@ -3,13 +3,14 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   Network, Plus, Trash2, RefreshCw, Power, PowerOff, Upload, CheckCircle2,
   XCircle, Loader2, Globe, Clock, Activity, Settings2, Copy, FileText,
-  Link2, Users, Shuffle, Unlink
+  Link2, Users, Shuffle, Unlink, Stethoscope, Pencil
 } from 'lucide-react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Label, Switch, Badge } from '../ui'
 import { cn } from '@/lib/utils'
 import type { ProxyEntry, ProxyPoolStrategy } from '@/types/proxy'
+import { IP_DETECT_ENDPOINTS } from '@/types/proxy'
 
 const STRATEGY_OPTIONS: { value: ProxyPoolStrategy; label: string; labelEn: string; desc: string; descEn: string }[] = [
   { value: 'round_robin', label: '轮询', labelEn: 'Round Robin', desc: '依次使用每个代理', descEn: 'Use each proxy in sequence' },
@@ -17,6 +18,251 @@ const STRATEGY_OPTIONS: { value: ProxyPoolStrategy; label: string; labelEn: stri
   { value: 'least_used', label: '最少使用', labelEn: 'Least Used', desc: '使用次数少的优先', descEn: 'Prefer proxies used less' },
   { value: 'fastest', label: '最快优先', labelEn: 'Fastest', desc: '按延迟升序', descEn: 'Sort by latency asc' }
 ]
+
+interface ChainDiag {
+  upstreamReachable: boolean; upstreamError?: string; upstreamRtMs?: number
+  targetReachable: boolean; targetError?: string; targetRtMs?: number
+  targetStatus?: number; targetStatusText?: string; targetBodySnippet?: string
+  endToEndOk?: boolean; endToEndError?: string; endToEndRtMs?: number
+}
+
+function ChainDiagnosisCard({
+  diag,
+  isEn
+}: {
+  diag: { targetUrl: string; success: boolean; error?: string; diagnose?: ChainDiag }
+  isEn: boolean
+}): React.ReactNode {
+  if (!diag.success || !diag.diagnose) {
+    return (
+      <div className="mt-2 text-[11px] rounded-md bg-red-500/10 border border-red-500/30 text-red-700 dark:text-red-400 px-2 py-1.5">
+        {isEn ? 'Diagnose failed: ' : '诊断失败：'}{diag.error || 'unknown error'}
+      </div>
+    )
+  }
+  const d = diag.diagnose
+  const Row = ({ ok, label, rt, err }: { ok: boolean; label: string; rt?: number; err?: string }): React.ReactNode => (
+    <div className="flex items-start gap-2 text-[11px]">
+      <span className={cn('mt-0.5 inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] font-bold',
+        ok ? 'bg-green-500/20 text-green-600 dark:text-green-400' : 'bg-red-500/20 text-red-600 dark:text-red-400')}>
+        {ok ? '✓' : '✗'}
+      </span>
+      <span className="flex-1">
+        <span className="text-foreground">{label}</span>
+        {rt !== undefined && <span className="ml-1 text-muted-foreground font-mono">{rt}ms</span>}
+        {err && <div className="mt-0.5 text-red-600 dark:text-red-400 break-all">{err}</div>}
+      </span>
+    </div>
+  )
+  return (
+    <div className="mt-2 space-y-1.5 rounded-md border border-border bg-card/50 px-3 py-2">
+      <div className="text-[10px] text-muted-foreground font-mono truncate">
+        target: {diag.targetUrl.replace(/:([^:@/]+)@/, ':***@')}
+      </div>
+      <Row
+        ok={d.upstreamReachable}
+        label={isEn ? 'A) Upstream TCP reachable' : 'A) 上游中转 TCP 可达'}
+        rt={d.upstreamRtMs}
+        err={d.upstreamError}
+      />
+      <Row
+        ok={d.targetReachable}
+        label={isEn ? 'B) Via upstream → target proxy entry' : 'B) 经上游 → 目标代理入口'}
+        rt={d.targetRtMs}
+        err={d.targetError}
+      />
+      <Row
+        ok={d.endToEndOk === true}
+        label={isEn
+          ? `C) End-to-end CONNECT (status ${d.targetStatus ?? '?'} ${d.targetStatusText ?? ''})`.trim()
+          : `C) 端到端 CONNECT（状态 ${d.targetStatus ?? '?'} ${d.targetStatusText ?? ''}）`.trim()}
+        rt={d.endToEndRtMs}
+        err={d.endToEndError}
+      />
+      {d.targetBodySnippet && (
+        <div className="mt-1 text-[10px] text-muted-foreground font-mono break-all">
+          body: {d.targetBodySnippet.slice(0, 160)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface PoolHealthStats {
+  total: number
+  enabled: number
+  alive: number
+  slow: number
+  dead: number
+  untested: number
+  testing: number
+  totalUsed: number
+  totalFailed: number
+  totalSuccess: number
+  successRate: number | null
+  avgLatencyMs: number | null
+  topUsed: Array<{ id: string; label: string; used: number; failed: number; success: number; rate: number | null; status: ProxyEntry['status'] }>
+}
+
+/** 把代理池实时聚合成几个关键指标，给"健康看板"用 */
+function computePoolHealth(proxies: ProxyEntry[]): PoolHealthStats {
+  const stats: PoolHealthStats = {
+    total: proxies.length,
+    enabled: 0, alive: 0, slow: 0, dead: 0, untested: 0, testing: 0,
+    totalUsed: 0, totalFailed: 0, totalSuccess: 0,
+    successRate: null,
+    avgLatencyMs: null,
+    topUsed: []
+  }
+  let latencySum = 0
+  let latencyCount = 0
+  for (const p of proxies) {
+    if (p.enabled) stats.enabled++
+    if (p.status === 'alive') stats.alive++
+    else if (p.status === 'slow') stats.slow++
+    else if (p.status === 'dead') stats.dead++
+    else if (p.status === 'untested') stats.untested++
+    else if (p.status === 'testing') stats.testing++
+    stats.totalUsed += p.usedCount
+    stats.totalFailed += p.failCount
+    if (p.latencyMs && (p.status === 'alive' || p.status === 'slow')) {
+      latencySum += p.latencyMs
+      latencyCount++
+    }
+  }
+  stats.totalSuccess = Math.max(0, stats.totalUsed - stats.totalFailed)
+  stats.successRate = stats.totalUsed > 0 ? stats.totalSuccess / stats.totalUsed : null
+  stats.avgLatencyMs = latencyCount > 0 ? Math.round(latencySum / latencyCount) : null
+  stats.topUsed = proxies
+    .slice()
+    .filter((p) => p.usedCount > 0)
+    .sort((a, b) => b.usedCount - a.usedCount)
+    .slice(0, 5)
+    .map((p) => {
+      const success = Math.max(0, p.usedCount - p.failCount)
+      return {
+        id: p.id,
+        label: p.label || `${p.protocol}://${p.host}:${p.port}`,
+        used: p.usedCount,
+        failed: p.failCount,
+        success,
+        rate: p.usedCount > 0 ? success / p.usedCount : null,
+        status: p.status
+      }
+    })
+  return stats
+}
+
+function StatTile({
+  label, value, sub, tone
+}: {
+  label: string
+  value: React.ReactNode
+  sub?: React.ReactNode
+  tone?: 'default' | 'green' | 'amber' | 'red' | 'blue'
+}): React.ReactNode {
+  const toneCls = tone === 'green' ? 'text-green-600 dark:text-green-400'
+    : tone === 'amber' ? 'text-amber-600 dark:text-amber-400'
+    : tone === 'red' ? 'text-red-600 dark:text-red-400'
+    : tone === 'blue' ? 'text-blue-600 dark:text-blue-400'
+    : 'text-foreground'
+  return (
+    <div className="rounded-lg border border-border bg-card/50 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className={cn('mt-0.5 text-lg font-semibold tabular-nums', toneCls)}>{value}</div>
+      {sub !== undefined && <div className="text-[11px] text-muted-foreground">{sub}</div>}
+    </div>
+  )
+}
+
+function HealthDashboard({ stats, isEn }: { stats: PoolHealthStats; isEn: boolean }): React.ReactNode {
+  if (stats.total === 0) return null
+  const availabilityRate = stats.total > 0 ? (stats.alive + stats.slow) / stats.total : 0
+  const successPct = stats.successRate !== null ? Math.round(stats.successRate * 100) : null
+  const successTone: 'green' | 'amber' | 'red' | 'default' = successPct === null ? 'default'
+    : successPct >= 80 ? 'green' : successPct >= 50 ? 'amber' : 'red'
+  const availTone: 'green' | 'amber' | 'red' | 'default' = stats.total === 0 ? 'default'
+    : availabilityRate >= 0.7 ? 'green' : availabilityRate >= 0.3 ? 'amber' : 'red'
+  return (
+    <Card className="hover-lift">
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Activity className="h-4 w-4 text-primary" />
+          {isEn ? 'Pool Health Dashboard' : '代理池健康看板'}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+          <StatTile
+            label={isEn ? 'Total / Enabled' : '总数 / 已启用'}
+            value={<>{stats.total}<span className="text-muted-foreground text-base"> / {stats.enabled}</span></>}
+          />
+          <StatTile
+            label={isEn ? 'Availability' : '可用率'}
+            value={`${Math.round(availabilityRate * 100)}%`}
+            sub={`${stats.alive + stats.slow} ${isEn ? 'alive' : '可用'}`}
+            tone={availTone}
+          />
+          <StatTile
+            label={isEn ? 'Success Rate' : '成功率'}
+            value={successPct !== null ? `${successPct}%` : '—'}
+            sub={`${stats.totalSuccess} / ${stats.totalUsed}`}
+            tone={successTone}
+          />
+          <StatTile
+            label={isEn ? 'Avg Latency' : '平均延迟'}
+            value={stats.avgLatencyMs !== null ? `${stats.avgLatencyMs}ms` : '—'}
+            tone="blue"
+          />
+          <StatTile
+            label={isEn ? 'Dead' : '失效'}
+            value={stats.dead}
+            tone={stats.dead > 0 ? 'red' : 'default'}
+          />
+          <StatTile
+            label={isEn ? 'Untested' : '未测试'}
+            value={stats.untested + stats.testing}
+            tone={stats.untested > 0 ? 'amber' : 'default'}
+          />
+        </div>
+
+        {stats.topUsed.length > 0 && (
+          <div>
+            <div className="mb-2 text-xs text-muted-foreground">
+              {isEn ? `Top ${stats.topUsed.length} most used proxies` : `承担量 Top ${stats.topUsed.length}`}
+            </div>
+            <div className="space-y-1.5">
+              {stats.topUsed.map((p) => {
+                const rate = p.rate !== null ? Math.round(p.rate * 100) : null
+                const ratePct = p.rate !== null ? p.rate * 100 : 0
+                const barTone = rate === null ? 'bg-muted-foreground/30'
+                  : rate >= 80 ? 'bg-green-500'
+                  : rate >= 50 ? 'bg-amber-500' : 'bg-red-500'
+                return (
+                  <div key={p.id} className="space-y-0.5">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        <StatusBadge status={p.status} />
+                        <span className="font-mono text-[11px] truncate">{p.label}</span>
+                      </div>
+                      <div className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+                        {p.success}/{p.used}
+                        {rate !== null && <span className="ml-1.5 font-medium text-foreground">{rate}%</span>}
+                      </div>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                      <div className={cn('h-full transition-all', barTone)} style={{ width: `${ratePct}%` }} />
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
 
 function StatusBadge({ status, latency }: { status: ProxyEntry['status']; latency?: number }): React.ReactNode {
   const cfg = {
@@ -52,6 +298,7 @@ export function ProxyPoolPage(): React.ReactNode {
     removeProxy,
     removeProxies,
     toggleProxyEnabled,
+    updateProxy,
     validateProxy,
     validateProxiesBatch,
     clearProxyPool,
@@ -80,8 +327,48 @@ export function ProxyPoolPage(): React.ReactNode {
   // 反代分桶：每代理承载账号数（0 = 均分）
   const [accountsPerProxy, setAccountsPerProxy] = useState<number>(5)
   const [bindingPanelExpanded, setBindingPanelExpanded] = useState(false)
+  // 代理链诊断状态
+  const [chainDiagnosing, setChainDiagnosing] = useState(false)
+  const [chainDiagnose, setChainDiagnose] = useState<{
+    targetUrl: string
+    success: boolean
+    error?: string
+    diagnose?: {
+      upstreamReachable: boolean; upstreamError?: string; upstreamRtMs?: number
+      targetReachable: boolean; targetError?: string; targetRtMs?: number
+      targetStatus?: number; targetStatusText?: string; targetBodySnippet?: string
+      endToEndOk?: boolean; endToEndError?: string; endToEndRtMs?: number
+    }
+  } | null>(null)
+
+  // 用池里第一条 enabled 代理作为诊断目标；如果没有则用任意第一条
+  const runChainDiagnose = useCallback(async () => {
+    const upstream = proxyPoolConfig.upstreamProxy?.trim()
+    if (!upstream) return
+    const candidates = Array.from(proxyPool.values())
+    const target = candidates.find((p) => p.enabled) || candidates[0]
+    if (!target) return
+    setChainDiagnosing(true)
+    setChainDiagnose(null)
+    try {
+      const res = await window.api.proxyPoolDiagnoseChain({
+        targetUrl: target.url,
+        upstreamProxy: upstream
+      })
+      setChainDiagnose({ targetUrl: target.url, ...res })
+    } catch (err) {
+      setChainDiagnose({
+        targetUrl: target.url,
+        success: false,
+        error: err instanceof Error ? err.message : String(err)
+      })
+    } finally {
+      setChainDiagnosing(false)
+    }
+  }, [proxyPool, proxyPoolConfig.upstreamProxy])
 
   const proxies = useMemo(() => Array.from(proxyPool.values()), [proxyPool])
+  const poolHealth = useMemo(() => computePoolHealth(proxies), [proxies])
 
   // 反代分桶：当前账号-代理绑定关系
   const bindingStats = useMemo(() => {
@@ -343,6 +630,9 @@ export function ProxyPoolPage(): React.ReactNode {
         </div>
       </div>
 
+      {/* 健康看板：池总览 + Top 承担量 */}
+      <HealthDashboard stats={poolHealth} isEn={isEn} />
+
       {/* 池总开关 + 调度策略 */}
       <Card className="hover-lift">
         <CardHeader className="pb-3">
@@ -418,13 +708,28 @@ export function ProxyPoolPage(): React.ReactNode {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-xs">{isEn ? 'Test URL' : '验活 URL'}</Label>
-              <Input
-                value={proxyPoolConfig.testUrl}
-                onChange={(e) => setProxyPoolConfig({ testUrl: e.target.value })}
-                placeholder="https://api.ipify.org?format=json"
-                className="h-8 text-xs font-mono"
-              />
+              <Label className="text-xs">{isEn ? 'IP Detection Endpoint' : 'IP 检测端点'}</Label>
+              <div className="flex gap-1.5">
+                <select
+                  value={IP_DETECT_ENDPOINTS.find(e => e.url === proxyPoolConfig.testUrl)?.id || '_custom'}
+                  onChange={(e) => {
+                    const ep = IP_DETECT_ENDPOINTS.find(ep => ep.id === e.target.value)
+                    if (ep) setProxyPoolConfig({ testUrl: ep.url })
+                  }}
+                  className="h-8 text-xs rounded-lg border border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md px-2 flex-shrink-0"
+                >
+                  {IP_DETECT_ENDPOINTS.map(ep => (
+                    <option key={ep.id} value={ep.id}>{ep.label}</option>
+                  ))}
+                  <option value="_custom">{isEn ? 'Custom...' : '自定义...'}</option>
+                </select>
+                <Input
+                  value={proxyPoolConfig.testUrl}
+                  onChange={(e) => setProxyPoolConfig({ testUrl: e.target.value })}
+                  placeholder="https://api.ipify.org?format=json"
+                  className="h-8 text-xs font-mono flex-1"
+                />
+              </div>
             </div>
           </div>
 
@@ -458,6 +763,39 @@ export function ProxyPoolPage(): React.ReactNode {
                 className="h-8 text-xs"
               />
             </div>
+          </div>
+
+          {/* 上游中转代理（代理链）：用于目标代理要求非大陆来源 IP 的场景 */}
+          <div className="space-y-1">
+            <Label className="text-xs">
+              {isEn ? 'Upstream relay proxy (proxy chaining)' : '上游中转代理（代理链）'}
+            </Label>
+            <div className="flex items-center gap-2">
+              <Input
+                value={proxyPoolConfig.upstreamProxy || ''}
+                onChange={(e) => setProxyPoolConfig({ upstreamProxy: e.target.value })}
+                placeholder={isEn ? 'e.g. socks5://127.0.0.1:7890 (empty = off)' : '如 socks5://127.0.0.1:7890（留空=不启用）'}
+                className="h-8 text-xs font-mono flex-1"
+              />
+              <Button
+                size="sm" variant="outline"
+                className="h-8 px-3 text-xs whitespace-nowrap"
+                disabled={!proxyPoolConfig.upstreamProxy?.trim() || proxyPool.size === 0 || chainDiagnosing}
+                onClick={() => void runChainDiagnose()}
+                title={isEn ? 'Diagnose proxy chain (locates failure layer)' : '诊断代理链（定位失败在哪一层）'}
+              >
+                {chainDiagnosing
+                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  : <Stethoscope className="h-3.5 w-3.5" />}
+                <span className="ml-1">{isEn ? 'Diagnose' : '诊断'}</span>
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              {isEn
+                ? 'When set, traffic chains: local → relay → target proxy → site. Use when the target proxy requires a non-mainland source IP (e.g. bestproxy). Supports http/socks5; your VPN local port works.'
+                : '填写后链路为：本机 → 上游中转 → 目标代理 → 目标站点。用于目标代理要求非大陆来源 IP 的情况（如 bestproxy）。支持 http/socks5，可填你科学上网的本地端口。'}
+            </p>
+            {chainDiagnose && <ChainDiagnosisCard diag={chainDiagnose} isEn={isEn} />}
           </div>
         </CardContent>
       </Card>
@@ -934,6 +1272,7 @@ export function ProxyPoolPage(): React.ReactNode {
               onToggle={toggleProxyEnabled}
               onTest={validateProxy}
               onDelete={removeProxy}
+              onSaveLabel={(id, label) => updateProxy(id, { label })}
               isEn={isEn}
             />
           </CardContent>
@@ -962,10 +1301,11 @@ interface ProxyRowProps {
   onToggle: () => void
   onTest: () => Promise<unknown>
   onDelete: () => void
+  onSaveLabel: (label?: string) => void
   isEn: boolean
 }
 
-function ProxyRow({ proxy, selected, onSelect, onToggle, onTest, onDelete, isEn }: ProxyRowProps): React.ReactNode {
+function ProxyRow({ proxy, selected, onSelect, onToggle, onTest, onDelete, onSaveLabel, isEn }: ProxyRowProps): React.ReactNode {
   // 脱敏密码部分
   const displayUrl = useMemo(() => {
     if (!proxy.password) return proxy.url
@@ -974,6 +1314,19 @@ function ProxyRow({ proxy, selected, onSelect, onToggle, onTest, onDelete, isEn 
 
   const handleCopy = (): void => {
     void navigator.clipboard.writeText(proxy.url)
+  }
+
+  // 备注 inline 编辑：点击铅笔/徽章进入编辑，回车/失焦保存，ESC 取消
+  const [editingLabel, setEditingLabel] = useState(false)
+  const [labelDraft, setLabelDraft] = useState(proxy.label || '')
+  const startEditLabel = (): void => {
+    setLabelDraft(proxy.label || '')
+    setEditingLabel(true)
+  }
+  const saveLabel = (): void => {
+    const v = labelDraft.trim()
+    if (v !== (proxy.label || '')) onSaveLabel(v || undefined)
+    setEditingLabel(false)
   }
 
   return (
@@ -993,13 +1346,33 @@ function ProxyRow({ proxy, selected, onSelect, onToggle, onTest, onDelete, isEn 
           : <PowerOff className="h-4 w-4" />
         }
       </button>
-      <span className="flex-1 font-mono truncate" title={displayUrl}>
-        <span className="opacity-50 mr-1">{proxy.protocol}://</span>
-        {proxy.host}:{proxy.port}
-        {proxy.username && <span className="opacity-50 ml-1">@{proxy.username}</span>}
-        {proxy.label && (
-          <Badge variant="outline" className="ml-2 h-4 text-[9px]">{proxy.label}</Badge>
-        )}
+      <span className="flex-1 font-mono truncate flex items-center min-w-0" title={displayUrl}>
+        <span className="opacity-50 mr-1 flex-shrink-0">{proxy.protocol}://</span>
+        <span className="truncate">{proxy.host}:{proxy.port}{proxy.username && <span className="opacity-50 ml-1">@{proxy.username}</span>}</span>
+        {editingLabel ? (
+          <input
+            autoFocus
+            value={labelDraft}
+            onChange={(e) => setLabelDraft(e.target.value)}
+            onBlur={saveLabel}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') saveLabel()
+              else if (e.key === 'Escape') { setLabelDraft(proxy.label || ''); setEditingLabel(false) }
+            }}
+            placeholder={isEn ? 'Note' : '备注'}
+            className="ml-2 px-1.5 h-5 text-[10px] rounded border border-primary bg-background font-sans w-28 flex-shrink-0 focus:outline-none focus:ring-1 focus:ring-primary"
+          />
+        ) : proxy.label ? (
+          <Badge
+            variant="outline"
+            className="ml-2 h-4 text-[9px] cursor-pointer hover:bg-muted flex-shrink-0"
+            onClick={startEditLabel}
+            title={isEn ? 'Click to edit note' : '点击编辑备注'}
+          >
+            {proxy.label}
+          </Badge>
+        ) : null}
       </span>
       <span className="w-24 flex justify-center">
         <StatusBadge status={proxy.status} latency={proxy.latencyMs} />
@@ -1032,6 +1405,13 @@ function ProxyRow({ proxy, selected, onSelect, onToggle, onTest, onDelete, isEn 
             : <RefreshCw className="h-3.5 w-3.5" />
           }
         </button>
+        <button
+          onClick={startEditLabel}
+          className="p-1 rounded hover:bg-muted"
+          title={isEn ? 'Edit note' : '编辑备注'}
+        >
+          <Pencil className="h-3.5 w-3.5" />
+        </button>
         <button onClick={handleCopy} className="p-1 rounded hover:bg-muted" title={isEn ? 'Copy URL' : '复制 URL'}>
           <Copy className="h-3.5 w-3.5" />
         </button>
@@ -1058,10 +1438,11 @@ interface ProxyVirtualListProps {
   onToggle: (id: string) => void
   onTest: (id: string) => Promise<unknown>
   onDelete: (id: string) => void
+  onSaveLabel: (id: string, label?: string) => void
   isEn: boolean
 }
 
-function ProxyVirtualList({ filtered, selectedIds, onSelect, onToggle, onTest, onDelete, isEn }: ProxyVirtualListProps): React.ReactNode {
+function ProxyVirtualList({ filtered, selectedIds, onSelect, onToggle, onTest, onDelete, onSaveLabel, isEn }: ProxyVirtualListProps): React.ReactNode {
   const parentRef = useRef<HTMLDivElement>(null)
   const ROW_HEIGHT = 44
 
@@ -1085,6 +1466,7 @@ function ProxyVirtualList({ filtered, selectedIds, onSelect, onToggle, onTest, o
             onToggle={() => onToggle(p.id)}
             onTest={() => onTest(p.id)}
             onDelete={() => onDelete(p.id)}
+            onSaveLabel={(label) => onSaveLabel(p.id, label)}
             isEn={isEn}
           />
         ))}
@@ -1117,6 +1499,7 @@ function ProxyVirtualList({ filtered, selectedIds, onSelect, onToggle, onTest, o
                 onToggle={() => onToggle(p.id)}
                 onTest={() => onTest(p.id)}
                 onDelete={() => onDelete(p.id)}
+                onSaveLabel={(label) => onSaveLabel(p.id, label)}
                 isEn={isEn}
               />
             </div>

@@ -272,6 +272,30 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.1 (2026-6-1) — Proton OTP Stability / Speed + Social Login Card-Key Fix
+
+> This release focuses on Proton-based registration OTP auto-retrieval (accuracy + speed + log visibility), the Proton login-state & proxy experience, and card-key import/export fixes for GitHub/Google social-login accounts.
+
+#### 📧 Proton OTP Auto-Retrieval (Registration)
+
+- **Fix**: OTP retrieval mis-clicked the inline star button — symptom was "mail arrived but it kept toggling star / couldn't read the code". Now precisely clicks the subject text (avoiding button / checkbox) to open the mail
+- **Fix**: OTP interfered with by other mails — AWS's concurrent "Response Required: Your Kiro Account" (same recipient, no code) pushed the real OTP mail into second place. Now filters by sender `no-reply@signin.aws` and reads the top two candidates, avoiding the "opened current mail but no code" deadlock
+- **New**: Exact recipient match — uses the mail-header recipient (dots preserved) to distinguish stale OTPs from other dot-variants of the same base address, preventing old codes
+- **Optimize**: OTP speed — replaced the fixed 2.2s sleep after opening a mail with poll-until-ready (continues once a 6-digit code / recipient+body are present, typically ~0.5s); since Proton OTP is local DOM polling with no rate-limit concern, the polling interval was tightened from the inherited 3s to ≤1s. Code-arrival → read latency drops from ~4s to ~1.5s
+- **New**: Full OTP-retrieval logs piped into the registration page log panel — sender filtering, exact recipient match, "latest mail recipient mismatch, waiting" states now visible in real time
+
+#### 🔐 Proton Login State + Proxy
+
+- **Fix**: Proton login state reverted to "not logged in" after switching pages and back — now uses a module-level cache to persist the login display across component unmount/remount
+- **Optimize**: Proton OTP window now defaults to the "Settings global proxy" (`process.env.HTTPS_PROXY`) instead of the system proxy or the registration proxy pool; the session proxy is also refreshed on window reuse, so proxy changes take effect on the next retrieval
+
+#### 🎫 Card-Key Import / Export (Social Login Fix)
+
+- **Fix**: 🔥 **GitHub / Google social-login card-key batch import failed** — the old logic hardcoded `provider=BuilderId`(IdC) on import, but social accounts have no ClientId / Secret and were rejected by the verify endpoint's `authMethod !== 'social' && (!clientId || !clientSecret)` guard ("please fill in Client ID and Client Secret")
+- **New**: Card-key export adds a **6th field "login method (idp)"** — `email----password----RefreshToken----ClientId----ClientSecret----loginMethod`, so import can accurately restore social(Github/Google) / IdC(BuilderId/Enterprise)
+- **New**: Backward-compatible with legacy 5-field card keys — when the 6th field is absent, the provider is inferred from ClientId / Secret presence: both empty → social (default Google), present → IdC (BuilderId). Social refresh only needs the RefreshToken, so inference passes verification
+
+
 ### v1.7.0 (2026-5-28) — Security Hardening + Major Feature Expansion
 
 > This release packs 70+ improvements covering reverse-proxy security hardening, batch registration concurrency isolation, SOCKS proxy support, unified task center, webhook notifications, analytics reporting, one-click diagnostics, config import/export, and major performance optimizations.

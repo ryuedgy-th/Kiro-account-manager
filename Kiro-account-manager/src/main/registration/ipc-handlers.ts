@@ -1,5 +1,7 @@
 import { ipcMain, BrowserWindow } from 'electron'
 import { Registrar, newConfig, type RegistrationConfig } from './index'
+import type { RegStepEvent } from './registrar'
+import { openProtonLogin, getProtonLoginStatus, closeProtonWindow } from './proton-mail-window'
 
 // 注册池：支持多个并发注册任务
 const registrarPool = new Map<string, Registrar>()
@@ -13,6 +15,12 @@ export function registerIPCHandlers(getMainWindow: () => BrowserWindow | null): 
       win.webContents.send('registration-log', { message: msg, taskId })
     }
   }
+  const sendStep = (event: RegStepEvent, taskId?: string): void => {
+    const win = getMainWindow()
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('registration-step', { taskId, event })
+    }
+  }
 
   // 启动自动注册（支持并发：每个 taskId 独立运行）
   ipcMain.handle('registration-start-auto', async (_event, config: Partial<RegistrationConfig> & { taskId?: string }) => {
@@ -21,7 +29,11 @@ export function registerIPCHandlers(getMainWindow: () => BrowserWindow | null): 
 
     const cfg = newConfig(config)
     cfg.manualMode = false
-    const registrar = new Registrar(cfg, (msg) => sendLog(`${logPrefix}${msg}`, config.taskId))
+    const registrar = new Registrar(
+      cfg,
+      (msg) => sendLog(`${logPrefix}${msg}`, config.taskId),
+      (event) => sendStep(event, config.taskId)
+    )
     registrarPool.set(taskId, registrar)
 
     try {
@@ -52,7 +64,7 @@ export function registerIPCHandlers(getMainWindow: () => BrowserWindow | null): 
 
     const cfg = newConfig(config)
     cfg.manualMode = true
-    const registrar = new Registrar(cfg, sendLog)
+    const registrar = new Registrar(cfg, sendLog, (event) => sendStep(event))
     registrarPool.set(MANUAL_KEY, registrar)
 
     const result = await registrar.runManualPhase1()
@@ -114,5 +126,23 @@ export function registerIPCHandlers(getMainWindow: () => BrowserWindow | null): 
   // 获取注册状态
   ipcMain.handle('registration-status', async () => {
     return { inProgress: registrarPool.size > 0, count: registrarPool.size }
+  })
+
+  // ===== Proton 邮箱取码源 =====
+
+  // 打开 Proton 登录窗口（首次需用户手动登录，之后 session 持久化复用）
+  ipcMain.handle('proton-open-login', async (_event, proxy?: string) => {
+    return openProtonLogin(proxy)
+  })
+
+  // 查询 Proton 登录态（不弹窗）
+  ipcMain.handle('proton-login-status', async (_event, proxy?: string) => {
+    return getProtonLoginStatus(proxy)
+  })
+
+  // 关闭 Proton 窗口（保留登录态）
+  ipcMain.handle('proton-close', async () => {
+    closeProtonWindow()
+    return { success: true }
   })
 }

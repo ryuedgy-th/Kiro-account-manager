@@ -2,6 +2,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { app } from 'electron'
+import { redactString, redactValue } from '../utils/redact'
 
 export interface LogEntry {
   timestamp: string
@@ -106,7 +107,13 @@ class ProxyLogger {
   }
 
   private isWriting = false
-  private write(entry: LogEntry): void {
+  private write(rawEntry: LogEntry): void {
+    // 统一脱敏：message + data 里的代理账密 / token / password 等，避免明文落盘或上屏
+    const entry: LogEntry = {
+      ...rawEntry,
+      message: redactString(rawEntry.message),
+      data: rawEntry.data === undefined ? undefined : redactValue(rawEntry.data)
+    }
     const line = JSON.stringify(entry) + '\n'
 
     if (this.config.logToConsole) {

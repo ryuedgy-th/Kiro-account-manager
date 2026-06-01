@@ -2,27 +2,6 @@ import crypto from 'crypto'
 
 const LSUBID_PREFIXES = ['X10', 'X19', 'X42', 'X55', 'X73', 'X81', 'X96']
 
-const FIRST_NAMES = [
-  'James', 'Robert', 'John', 'Michael', 'David', 'William', 'Richard', 'Joseph', 'Thomas', 'Charles',
-  'Christopher', 'Daniel', 'Matthew', 'Anthony', 'Mark', 'Donald', 'Steven', 'Paul', 'Andrew', 'Joshua',
-  'Kenneth', 'Kevin', 'Brian', 'George', 'Timothy', 'Ronald', 'Edward', 'Jason', 'Jeffrey', 'Ryan',
-  'Jacob', 'Gary', 'Nicholas', 'Eric', 'Jonathan', 'Stephen', 'Larry', 'Justin', 'Scott', 'Brandon',
-  'Benjamin', 'Samuel', 'Raymond', 'Gregory', 'Frank', 'Alexander', 'Patrick', 'Jack', 'Dennis', 'Jerry',
-  'Mary', 'Patricia', 'Jennifer', 'Linda', 'Barbara', 'Elizabeth', 'Susan', 'Jessica', 'Sarah', 'Karen',
-  'Lisa', 'Nancy', 'Betty', 'Margaret', 'Sandra', 'Ashley', 'Dorothy', 'Kimberly', 'Emily', 'Donna',
-  'Michelle', 'Carol', 'Amanda', 'Melissa', 'Deborah', 'Stephanie', 'Rebecca', 'Sharon', 'Laura', 'Cynthia',
-  'Kathleen', 'Amy', 'Angela', 'Shirley', 'Anna', 'Brenda', 'Pamela', 'Emma', 'Nicole', 'Helen',
-  'Samantha', 'Katherine', 'Christine', 'Debra', 'Rachel', 'Carolyn', 'Janet', 'Catherine', 'Maria', 'Heather'
-]
-
-const LAST_NAMES = [
-  'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez',
-  'Hernandez', 'Lopez', 'Gonzalez', 'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin',
-  'Lee', 'Perez', 'Thompson', 'White', 'Harris', 'Sanchez', 'Clark', 'Ramirez', 'Lewis', 'Robinson',
-  'Walker', 'Young', 'Allen', 'King', 'Wright', 'Scott', 'Torres', 'Nguyen', 'Hill', 'Flores',
-  'Green', 'Adams', 'Nelson', 'Baker', 'Hall', 'Rivera', 'Campbell', 'Mitchell', 'Carter', 'Roberts'
-]
-
 const GPU_CONFIGS = [
   { vendor: 'Google Inc. (Intel)', model: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x000046A6) Direct3D11 vs_5_0 ps_5_0, D3D11)' },
   { vendor: 'Google Inc. (Intel)', model: 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)' },
@@ -172,7 +151,33 @@ function generateCanvasData(): { hash: number; histogram: number[] } {
   return { hash, histogram: bins }
 }
 
+/**
+ * 生成真实范围的 Chrome 详细版本号（major.minor.build.patch）
+ * Chrome 稳定版格式：主版本.0.buildNumber.patchNumber
+ * 随机从近几个主版本中选取，build/patch 在真实范围内随机
+ */
+function randomChromeVersion(): string {
+  // 近期稳定版主版本及其对应的 build 号范围 (从 Chromium release history)
+  const versions = [
+    { major: 137, buildMin: 7151, buildMax: 7160 },
+    { major: 138, buildMin: 7204, buildMax: 7213 },
+    { major: 139, buildMin: 7259, buildMax: 7268 },
+    { major: 140, buildMin: 7316, buildMax: 7325 },
+    { major: 141, buildMin: 7371, buildMax: 7380 },
+    { major: 142, buildMin: 7430, buildMax: 7439 },
+    { major: 143, buildMin: 7485, buildMax: 7494 },
+    { major: 144, buildMin: 7544, buildMax: 7553 },
+    { major: 145, buildMin: 7601, buildMax: 7610 },
+    { major: 146, buildMin: 7660, buildMax: 7669 },
+  ]
+  const v = versions[Math.floor(Math.random() * versions.length)]
+  const build = v.buildMin + Math.floor(Math.random() * (v.buildMax - v.buildMin + 1))
+  const patch = Math.floor(Math.random() * 150) // patch 通常 0-150
+  return `${v.major}.0.${build}.${patch}`
+}
+
 export function randomIdentity(): BrowserIdentity {
+  const chromeVer = randomChromeVersion()
   const gpu = pick(GPU_CONFIGS)
   const scr = pick(SCREEN_CONFIGS)
   const math = pick(MATH_POOL)
@@ -191,8 +196,8 @@ export function randomIdentity(): BrowserIdentity {
   const plugins = shuffle([...PLUGINS_POOL])
 
   return {
-    chromeVer: '137.0.0.0',
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+    chromeVer: chromeVer,
+    ua: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVer} Safari/537.36`,
     gpuVendor: gpu.vendor,
     gpuModel: gpu.model,
     webGLExts: exts,
@@ -213,6 +218,4 @@ export function randomIdentity(): BrowserIdentity {
   }
 }
 
-export function randomFullName(): string {
-  return `${pick(FIRST_NAMES)} ${pick(LAST_NAMES)}`
-}
+export { randomFullName } from './names'

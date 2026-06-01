@@ -837,6 +837,8 @@ interface KiroApi {
 
   registrationStartAuto: (config: {
     proxy?: string
+    upstreamProxy?: string
+    strictProxy?: boolean
     moEmailBaseURL?: string
     moEmailAPIKey?: string
     useOutlook?: boolean
@@ -845,6 +847,8 @@ interface KiroApi {
     tempMailPlusEmail?: string
     tempMailPlusEpin?: string
     tempMailPlusDomain?: string
+    useProton?: boolean
+    protonEmail?: string
     password?: string
     fullName?: string
     taskId?: string
@@ -864,12 +868,43 @@ interface KiroApi {
 
   registrationStatus: () => Promise<{ inProgress: boolean }>
 
+  protonOpenLogin: (proxy?: string) => Promise<{ success: boolean; loggedIn: boolean; error?: string }>
+
+  protonLoginStatus: (proxy?: string) => Promise<{ loggedIn: boolean }>
+
+  protonClose: () => Promise<{ success: boolean }>
+
   // 代理池验活
   proxyPoolValidate: (params: {
     url: string
     testUrl?: string
     timeoutMs?: number
+    upstreamProxy?: string
   }) => Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }>
+
+  proxyPoolDiagnoseChain: (params: {
+    targetUrl: string
+    upstreamProxy: string
+    testHost?: string
+    testPort?: number
+  }) => Promise<{
+    success: boolean
+    error?: string
+    diagnose?: {
+      upstreamReachable: boolean
+      upstreamError?: string
+      upstreamRtMs?: number
+      targetReachable: boolean
+      targetError?: string
+      targetRtMs?: number
+      targetStatus?: number
+      targetStatusText?: string
+      targetBodySnippet?: string
+      endToEndOk?: boolean
+      endToEndError?: string
+      endToEndRtMs?: number
+    }
+  }>
 
   // 诊断：通用 HTTP 探测
   diagnoseHttpProbe: (params: { url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }) => Promise<{
@@ -888,7 +923,44 @@ interface KiroApi {
     targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
   }) => Promise<{ results: Array<{ id: string; label: string; url: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }> }>
 
+  // 账号测活：指定账号 + 模型走反代逻辑发测试消息
+  diagnoseAccountLiveness: (params: {
+    account: {
+      id?: string; email?: string; accessToken?: string; refreshToken?: string
+      clientId?: string; clientSecret?: string; region?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
+    }
+    model?: string
+    message?: string
+    timeoutMs?: number
+  }) => Promise<{
+    success: boolean
+    latencyMs: number
+    model?: string
+    content?: string
+    usage?: { inputTokens: number; outputTokens: number; credits: number }
+    error?: string
+  }>
+
   onRegistrationLog: (callback: (msg: string) => void) => () => void
+
+  onRegistrationStep: (callback: (data: {
+    taskId?: string
+    event: {
+      name:
+        | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
+        | 'oidc' | 'device' | 'email-created'
+        | 'portal' | 'workflow-init' | 'submit-email'
+        | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
+        | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
+        | 'verify-alive' | 'done'
+      ts: number
+      email?: string
+      exitIp?: string
+      extra?: Record<string, unknown>
+    }
+  }) => void) => () => void
 
   onRegistrationComplete: (callback: (result: {
     status: 'success' | 'failed'

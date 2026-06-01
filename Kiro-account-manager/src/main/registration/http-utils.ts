@@ -1,9 +1,9 @@
 import crypto from 'crypto'
 
 export const DEFAULT_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
 export const DEFAULT_SEC_UA =
-  '"Chromium";v="137", "Not/A)Brand";v="24", "Google Chrome";v="137"'
+  '"Chromium";v="146", "Not/A)Brand";v="24", "Google Chrome";v="146"'
 
 /** 生成 4 位随机十六进制 */
 function hex4(): string {

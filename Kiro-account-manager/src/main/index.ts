@@ -16,10 +16,12 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi } from './proxy/kiroApi'
+import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
+import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
   createTray,
   destroyTray,
@@ -1425,7 +1427,6 @@ let lastSavedData: unknown = null
 async function initStore(): Promise<void> {
   if (store) return
   const Store = (await import('electron-store')).default
-  const fs = await import('fs/promises')
   const path = await import('path')
   
   const storeInstance = new Store({
@@ -1435,16 +1436,14 @@ async function initStore(): Promise<void> {
   
   store = storeInstance as unknown as typeof store
   
-  // 尝试从备份恢复数据（如果主数据损坏）
+  // 尝试从备份恢复数据（如果主数据损坏）。备份优先读加密 .enc，兼容旧明文 .json
   try {
-    const backupPath = path.join(path.dirname(storeInstance.path), 'kiro-accounts.backup.json')
     const mainData = storeInstance.get('accountData')
-    
+
     if (!mainData) {
-      // 主数据不存在或损坏，尝试从备份恢复
       try {
-        const backupContent = await fs.readFile(backupPath, 'utf-8')
-        const backupData = JSON.parse(backupContent)
+        const { readSecureBackup } = await import('./secureBackup')
+        const backupData = await readSecureBackup(path.dirname(storeInstance.path)) as { accounts?: unknown } | null
         if (backupData && backupData.accounts) {
           console.log('[Store] Restoring data from backup...')
           storeInstance.set('accountData', backupData)
@@ -1502,11 +1501,10 @@ async function writeBackupNow(): Promise<void> {
   pendingBackupData = null
   lastBackupTime = Date.now()
   try {
-    const fs = await import('fs/promises')
     const path = await import('path')
-    const backupPath = path.join(path.dirname(store.path), 'kiro-accounts.backup.json')
-    await fs.writeFile(backupPath, JSON.stringify(data, null, 2), 'utf-8')
-    console.log('[Backup] Data backup created')
+    const { writeSecureBackup, isSecureBackupAvailable } = await import('./secureBackup')
+    await writeSecureBackup(path.dirname(store.path), data)
+    console.log(`[Backup] Data backup created (${isSecureBackupAvailable() ? 'encrypted' : 'plaintext-fallback'})`)
   } catch (error) {
     console.error('[Backup] Failed to create backup:', error)
   }
@@ -2280,65 +2278,8 @@ app.whenReady().then(async () => {
    * 通过指定代理 URL 请求测试地址，返回延迟与出口 IP
    * 仅支持 http/https 协议代理（受 undici ProxyAgent 限制；socks 协议会被 safeCreateProxyAgent 静默跳过）
    */
-  ipcMain.handle('proxy-pool:validate', async (_event, params: {
-    url: string
-    testUrl?: string
-    timeoutMs?: number
-  }) => {
-    const { url, testUrl = 'https://api.ipify.org?format=json', timeoutMs = 8000 } = params || {}
-    if (!url) {
-      return { success: false, error: 'Missing proxy URL' }
-    }
-
-    const agent = safeCreateProxyAgent(url)
-    if (!agent) {
-      // SOCKS / 无效协议会走到这里
-      return {
-        success: false,
-        error: '代理协议不支持（仅支持 http/https）或 URL 无效'
-      }
-    }
-
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    const start = Date.now()
-    try {
-      const resp = await undiciFetch(testUrl, {
-        method: 'GET',
-        dispatcher: agent,
-        signal: controller.signal,
-        headers: { 'User-Agent': 'KiroAccountManager-ProxyValidator/1.0' }
-      } as UndiciRequestInit)
-      const latencyMs = Date.now() - start
-      if (resp.status >= 200 && resp.status < 400) {
-        // 尝试提取出口 IP
-        let externalIp: string | undefined
-        try {
-          const ct = resp.headers.get('content-type') || ''
-          if (ct.includes('json')) {
-            const body = await resp.json() as { ip?: string; query?: string }
-            externalIp = body.ip || body.query
-          } else {
-            const text = await resp.text()
-            const m = text.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/)
-            if (m) externalIp = m[0]
-          }
-        } catch { /* 出口 IP 提取失败不影响验活成功 */ }
-        return { success: true, latencyMs, externalIp }
-      }
-      return { success: false, latencyMs, error: `HTTP ${resp.status}` }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err)
-      const isAbort = controller.signal.aborted
-      return {
-        success: false,
-        latencyMs: Date.now() - start,
-        error: isAbort ? `请求超时 (${timeoutMs}ms)` : errMsg
-      }
-    } finally {
-      clearTimeout(timer)
-    }
-  })
+  // 代理池相关 IPC handler 已拆分到独立模块，便于后续维护
+  registerProxyPoolIpcHandlers()
 
   // ============ 账号-代理绑定（反代时 N 账号一个 IP）============
   /**
@@ -2393,6 +2334,112 @@ app.whenReady().then(async () => {
         success: false,
         latencyMs: Date.now() - start,
         error: isAbort ? `Timeout (${timeoutMs}ms)` : (err instanceof Error ? err.message : String(err))
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
+  // IPC: 账号测活 —— 指定账号走反代逻辑（callKiroApi，与反代服务器同一底层调用）
+  // 给指定模型发一条测试消息，验证账号是否能正常返回，用于一键诊断"账号测活"功能
+  ipcMain.handle('diagnose:account-liveness', async (_event, params: {
+    account: {
+      id?: string
+      email?: string
+      accessToken?: string
+      refreshToken?: string
+      clientId?: string
+      clientSecret?: string
+      region?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+      provider?: string
+      profileArn?: string
+      machineId?: string
+      expiresAt?: number
+      proxyUrl?: string
+    }
+    model?: string
+    message?: string
+    timeoutMs?: number
+  }) => {
+    const acc = params?.account
+    const model = (params?.model || 'claude-sonnet-4.5').trim()
+    const message = (params?.message || 'Hi, reply with "pong" only.').trim()
+    const timeoutMs = params?.timeoutMs ?? 45000
+    const start = Date.now()
+
+    if (!acc || !acc.accessToken) {
+      return { success: false, error: '账号缺少 accessToken', latencyMs: 0 }
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      // 1) Token 即将过期/已过期 → 先刷新（走账号绑定代理）
+      let accessToken = acc.accessToken
+      const needsRefresh = acc.expiresAt ? (acc.expiresAt - Date.now() < 60_000) : false
+      if (needsRefresh && acc.refreshToken) {
+        try {
+          const r = await refreshTokenByMethod(
+            acc.refreshToken,
+            acc.clientId || '',
+            acc.clientSecret || '',
+            acc.region || 'us-east-1',
+            acc.authMethod,
+            acc.proxyUrl
+          )
+          if (r.success && r.accessToken) accessToken = r.accessToken
+        } catch { /* 刷新失败则用原 token 尝试，让真实错误暴露出来 */ }
+      }
+
+      // 2) 构建 ProxyAccount（callKiroApi 需要的账号结构）
+      const proxyAccount: ProxyAccount = {
+        id: acc.id || 'diagnose',
+        email: acc.email,
+        accessToken,
+        refreshToken: acc.refreshToken,
+        clientId: acc.clientId,
+        clientSecret: acc.clientSecret,
+        region: acc.region || 'us-east-1',
+        authMethod: acc.authMethod,
+        provider: acc.provider,
+        profileArn: acc.profileArn,
+        machineId: acc.machineId,
+        proxyUrl: acc.proxyUrl,
+        expiresAt: acc.expiresAt
+      }
+
+      // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
+      const payload = openaiToKiro({
+        model,
+        messages: [{ role: 'user', content: message }],
+        stream: false,
+        max_tokens: 64
+      }, proxyAccount.profileArn)
+
+      // 4) 调用（与反代服务器内部完全相同的底层调用）
+      const result = await callKiroApi(proxyAccount, payload, controller.signal)
+      const latencyMs = Date.now() - start
+      const content = (result.content || '').trim()
+      return {
+        success: true,
+        latencyMs,
+        model,
+        content: content.slice(0, 500),
+        usage: {
+          inputTokens: result.usage?.inputTokens || 0,
+          outputTokens: result.usage?.outputTokens || 0,
+          credits: result.usage?.credits || 0
+        }
+      }
+    } catch (err) {
+      const isAbort = controller.signal.aborted
+      const rawMsg = err instanceof Error ? err.message : String(err)
+      return {
+        success: false,
+        latencyMs: Date.now() - start,
+        model,
+        error: isAbort ? `超时 (${timeoutMs}ms)` : rawMsg
       }
     } finally {
       clearTimeout(timer)
@@ -6590,6 +6637,13 @@ app.on('will-quit', async (event) => {
         await proxyLogStore.flushSaveNow()
       } catch (err) {
         console.error('[Exit] Failed to flush proxy logs:', err)
+      }
+      // 释放共享的 TLS ModuleClient（worker pool + DLL）
+      try {
+        const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
+        await shutdownTlsClientPool()
+      } catch (err) {
+        console.error('[Exit] Failed to shutdown TLS client pool:', err)
       }
       console.log('[Exit] Data saved successfully')
     } catch (error) {

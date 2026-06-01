@@ -1,6 +1,8 @@
 import * as tls from 'tls'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
+import { randomEmailPrefix } from './names'
+import { waitProtonOtp } from './proton-mail-window'
 
 function getRegistrationProxyUrl(): string | undefined {
   return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
@@ -28,8 +30,25 @@ export function extractCode(body: string): string {
 
 export interface TempEmailService {
   create(): Promise<string>
-  waitForCode(timeoutSec: number, intervalSec: number): Promise<string>
+  /** signal：注册被取消时中断轮询（停止/暂停后立即退出，而非等满 timeout） */
+  waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string>
   getAddress(): string
+}
+
+/** 可被 AbortSignal 中断的 sleep：停止注册时立刻 reject，不再傻等 */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error('注册已取消'))
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(new Error('注册已取消'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 // ============ MoEmail 临时邮箱 ============
@@ -91,12 +110,13 @@ export class MoEmailService implements TempEmailService {
     return addr
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number): Promise<string> {
+  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
     if (!this.address) throw new Error('邮箱地址为空')
 
     const maxRetries = Math.floor(timeoutSec / intervalSec)
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      await sleep(intervalSec * 1000)
+      if (signal?.aborted) throw new Error('注册已取消')
+      await abortableSleep(intervalSec * 1000, signal)
       try {
         const code = await this.fetchCode()
         if (code) return code
@@ -143,45 +163,26 @@ export class MoEmailService implements TempEmailService {
 
 // ============ TempMail.Plus + 自建域名 ============
 
-const FIRST_NAMES = [
-  'james', 'john', 'robert', 'michael', 'david', 'william', 'richard', 'joseph', 'thomas', 'charles',
-  'mary', 'patricia', 'jennifer', 'linda', 'elizabeth', 'barbara', 'susan', 'jessica', 'sarah', 'karen',
-  'daniel', 'matthew', 'anthony', 'mark', 'steven', 'paul', 'andrew', 'joshua', 'kenneth', 'christopher',
-  'nancy', 'betty', 'margaret', 'sandra', 'ashley', 'dorothy', 'kimberly', 'emily', 'donna', 'michelle',
-  'ryan', 'kevin', 'brian', 'jason', 'timothy', 'sean', 'nathan', 'brandon', 'adam', 'tyler',
-  'rachel', 'samantha', 'katherine', 'christine', 'stephanie', 'heather', 'lauren', 'rebecca', 'victoria', 'megan'
-]
-
-const LAST_NAMES = [
-  'smith', 'johnson', 'williams', 'brown', 'jones', 'garcia', 'miller', 'davis', 'rodriguez', 'martinez',
-  'hernandez', 'lopez', 'gonzalez', 'wilson', 'anderson', 'thomas', 'taylor', 'moore', 'jackson', 'martin',
-  'lee', 'perez', 'thompson', 'white', 'harris', 'sanchez', 'clark', 'ramirez', 'lewis', 'robinson',
-  'walker', 'young', 'allen', 'king', 'wright', 'scott', 'torres', 'nguyen', 'hill', 'flores',
-  'green', 'adams', 'nelson', 'baker', 'hall', 'rivera', 'campbell', 'mitchell', 'carter', 'roberts'
-]
-
-function randomEmailPrefix(): string {
-  const first = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)]
-  const last = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)]
-  const r = Math.random()
-  if (r < 0.5) return `${first}.${last}`
-  if (r < 0.75) return `${first}${last}`
-  const digits = String(Math.floor(Math.random() * 100)).padStart(2, '0')
-  return `${first}.${last}${digits}`
-}
-
 export class TempMailPlusService implements TempEmailService {
   private static readonly BASE_URL = 'https://tempmail.plus/api'
 
   private readonly tmEmail: string   // tempmail.plus 用户名（不含 @mailto.plus）
   private readonly epin: string
-  private readonly domain: string
+  /** 支持多域名（用户填多行/逗号/空格分隔），每次 create 随机挑一个，降低单域名被风控关联 */
+  private readonly domains: string[]
+  private domain = ''
   private address = ''
 
   constructor(tmEmail: string, epin: string, domain: string) {
     this.tmEmail = tmEmail
     this.epin = epin
-    this.domain = domain.replace(/^@/, '')
+    this.domains = domain
+      .split(/[\s,;]+/)
+      .map((d) => d.trim().replace(/^@/, ''))
+      .filter(Boolean)
+    if (this.domains.length === 0) {
+      throw new Error('TempMail.Plus 自建域名为空')
+    }
   }
 
   private get headers(): Record<string, string> {
@@ -197,8 +198,13 @@ export class TempMailPlusService implements TempEmailService {
 
   async create(): Promise<string> {
     const prefix = randomEmailPrefix()
+    this.domain = this.domains[Math.floor(Math.random() * this.domains.length)]
     this.address = `${prefix}@${this.domain}`
-    console.log(`[TempMailPlus] 生成邮箱: ${this.address}`)
+    if (this.domains.length > 1) {
+      console.log(`[TempMailPlus] 生成邮箱: ${this.address}  (域名池 ${this.domains.length} 个)`)
+    } else {
+      console.log(`[TempMailPlus] 生成邮箱: ${this.address}`)
+    }
     return this.address
   }
 
@@ -206,13 +212,14 @@ export class TempMailPlusService implements TempEmailService {
     return this.address
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number): Promise<string> {
+  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
     if (!this.address) throw new Error('邮箱地址为空')
     const maxRetries = Math.floor(timeoutSec / intervalSec)
     const checkedIds = new Set<number>()
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      await sleep(intervalSec * 1000)
+      if (signal?.aborted) throw new Error('注册已取消')
+      await abortableSleep(intervalSec * 1000, signal)
       try {
         const mails = await this.fetchMailList()
         if (attempt === 1 || attempt % 5 === 0) {
@@ -519,13 +526,15 @@ export async function waitForOTP(
   acc: OutlookAccount,
   beforeCount: number,
   timeout: number,
-  interval: number
+  interval: number,
+  signal?: AbortSignal
 ): Promise<string> {
   console.log(`[Outlook IMAP] 等待验证码, 邮箱=${acc.email}, 发送前邮件数=${beforeCount}`)
   let accessToken = await refreshOutlookToken(acc)
   const maxRetries = Math.floor(timeout / interval)
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) throw new Error('注册已取消')
     let client: IMAPClient | null = null
     try {
       client = new IMAPClient()
@@ -535,7 +544,7 @@ export async function waitForOTP(
 
       if (total <= beforeCount) {
         if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 暂无新邮件 (当前${total}封)...`)
-        await sleep(interval * 1000)
+        await abortableSleep(interval * 1000, signal)
         continue
       }
 
@@ -557,9 +566,50 @@ export async function waitForOTP(
     } finally {
       client?.close()
     }
-    await sleep(interval * 1000)
+    await abortableSleep(interval * 1000, signal)
   }
   throw new Error(`等待验证码超时 (${timeout}s)`)
+}
+
+// ============ Proton 邮箱（webview 借壳官方网页，轻量读 DOM 取码） ============
+
+/**
+ * Proton 点号别名取码源：用一个 Proton 母邮箱（如 evanbartellchae@protonmail.com），
+ * 前端用 dotVariants 生成点号变体（evanbar.tellcha.e@protonmail.com）作为每个账号的注册邮箱，
+ * 所有变体都进同一个 Proton 收件箱。读码经由主进程的隐藏 Proton 窗口（见 proton-mail-window.ts），
+ * 官方网页负责登录与 PGP 解密，本类只接收前端生成好的具体地址并等待取码。
+ */
+export class ProtonWebviewService implements TempEmailService {
+  /** 本次注册使用的具体邮箱地址（母邮箱或其点号变体，由前端生成传入） */
+  private readonly address: string
+  /** 日志回调：传入 registrar.this.log 时，取码日志会推送到注册页面日志面板；缺省回退 console */
+  private readonly log: (msg: string) => void
+
+  constructor(presetAddress: string, log?: (msg: string) => void) {
+    this.address = (presetAddress || '').trim()
+    if (!this.address) {
+      throw new Error('Proton 邮箱地址为空')
+    }
+    this.log = log || ((m) => console.log(m))
+  }
+
+  async create(): Promise<string> {
+    this.log(`[Proton] 使用邮箱: ${this.address}`)
+    return this.address
+  }
+
+  getAddress(): string {
+    return this.address
+  }
+
+  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+    return waitProtonOtp(this.address, {
+      timeoutSec,
+      intervalSec,
+      signal,
+      log: this.log
+    })
+  }
 }
 
 function sleep(ms: number): Promise<void> {

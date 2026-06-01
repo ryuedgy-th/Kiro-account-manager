@@ -780,7 +780,7 @@ export function SettingsPage() {
               <input
                 type="text"
                 className="flex-1 h-9 px-3 rounded-lg border bg-background text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
-                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                placeholder={isEn ? 'http://127.0.0.1:7890 or socks5://127.0.0.1:1080' : 'http://127.0.0.1:7890 或 socks5://127.0.0.1:1080'}
                 value={tempProxyUrl}
                 onChange={(e) => setTempProxyUrl(e.target.value)}
               />

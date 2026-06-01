@@ -130,6 +130,16 @@ function App(): React.JSX.Element {
     return () => { unsubscribe?.() }
   }, [])
 
+  // 应用内页面跳转（轻量 CustomEvent，供深层组件无需 prop 钻取即可切页）
+  useEffect(() => {
+    const handler = (e: Event): void => {
+      const detail = (e as CustomEvent<PageType>).detail
+      if (detail) setCurrentPage(detail)
+    }
+    window.addEventListener('navigate-page', handler)
+    return () => window.removeEventListener('navigate-page', handler)
+  }, [])
+
   // 关闭/刷新前强制 flush 防抖中的待保存数据，防止数据丢失
   useEffect(() => {
     const handleBeforeUnload = (): void => { void flushSaveImmediately() }
