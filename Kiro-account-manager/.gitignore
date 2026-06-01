@@ -4,3 +4,9 @@ out
 .DS_Store
 .eslintcache
 *.log*
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Local planning scratch files
+.kiro-webtools-plan.md
