@@ -595,6 +595,12 @@ export interface ProxyConfig {
   fallbackPort?: number
   /** 启用审计日志（管理 API 操作、config 变更） */
   enableAuditLog?: boolean
+  /**
+   * 可用账号数低于此阈值时触发 proxy-pool-low webhook 预警（提醒补充账号）。
+   * 0 或未设 = 关闭预警。用于"账号会被风控、需持续补充"的运营场景：
+   * 在池耗尽（503）之前就提前告警，给补号留出时间。
+   */
+  poolLowThreshold?: number
 }
 
 export interface TlsConfig {

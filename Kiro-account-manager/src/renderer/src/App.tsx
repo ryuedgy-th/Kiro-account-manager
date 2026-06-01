@@ -107,7 +107,8 @@ function App(): React.JSX.Element {
         // 映射反代事件名 → Webhook 事件类型
         const webhookEventMap: Record<string, 'risk-warning' | 'account-banned'> = {
           'proxy-account-suspended': 'account-banned',
-          'proxy-all-exhausted': 'risk-warning'
+          'proxy-all-exhausted': 'risk-warning',
+          'proxy-pool-low': 'risk-warning'
         }
         const targetEvent = webhookEventMap[event] || 'risk-warning'
         // 规范化 level（main 用 'error'/'info' 等字符串字面量，需要映射到 store 接受的类型）

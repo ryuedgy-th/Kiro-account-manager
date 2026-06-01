@@ -43,6 +43,12 @@ const DEFAULT_CONFIG: AccountPoolConfig = {
   probabilisticRetryChance: 0.1 // 10% 概率重试
 }
 
+// TEMPORARILY_SUSPENDED 自动解封时长：Kiro 的临时风控多数会在一段时间后自动解除，
+// 旧逻辑把所有 suspended 视为永久（需人工 clearSuspended），导致 pool 持续缩水。
+// 临时封禁超过此时长后，账号自动重新加入轮询（仍会再次试探，若仍被风控会再次标记）。
+// PERMANENTLY_SUSPENDED / ACCOUNT_SUSPENDED 不受此影响，保持永久跳过。
+const TEMPORARY_SUSPEND_AUTO_CLEAR_MS = 2 * 60 * 60 * 1000  // 2h
+
 export type AccountSelectionStrategy = 'round-robin' | 'sticky'
 
 export class AccountPool {
@@ -140,7 +146,7 @@ export class AccountPool {
 
       // 检查账号是否可用（含断路器状态）
       if (this.isAccountAvailable(account, now)) {
-        return account
+        return this.reviveExpiredSuspension(account)
       }
     }
 
@@ -176,7 +182,7 @@ export class AccountPool {
     // 尝试找到一个可用的账号（排除指定账号）
     for (const account of accountList) {
       if (!excludeSet.has(account.id) && this.isAccountAvailable(account, now)) {
-        return account
+        return this.reviveExpiredSuspension(account)
       }
     }
 
@@ -192,11 +198,18 @@ export class AccountPool {
   }
 
   // 检查账号是否可用（断路器 + 指数退避 + 概率重试）
+  // 纯读取，不产生任何副作用——getQuotaStatus / metrics 等只读路径会调用本函数，
+  // 临时封禁的"真正字段清理"由写路径（getNextAccount/getNextAvailableAccount 选中时）
+  // 调 reviveExpiredSuspension 完成，不能在这里 mutate。
   private isAccountAvailable(account: ProxyAccount, now: number): boolean {
     // 检查是否被 Kiro 后端封禁（需人工解封）
     if (this.isSuspended(account)) {
       return false
     }
+    // isSuspended 已返回 false 但仍残留 suspendedAt → 临时封禁已自动过期。
+    // 此时 markSuspended 设置的 isAvailable=false / 旧 errorCount 都应被视为已失效，
+    // 否则下面的检查会错误地把"已解封"的账号判为不可用。
+    const expiredTempSuspend = typeof account.suspendedAt === 'number' && account.suspendedAt > 0
 
     // 检查配额是否耗尽
     if (this.isQuotaExhausted(account, now)) {
@@ -207,17 +220,18 @@ export class AccountPool {
     // - 无 refreshToken 时直接判为不可用（无法刷新）
     // - 有 refreshToken 时让账号通过 —— proxyServer.getAvailableAccount 会检测
     //   isTokenExpiringSoon 并主动调用 refreshToken；若刷新失败会通过 markNeedsRefresh
-    //   设置 isAvailable=false，下次循环再被本函数 line 210 跳过，形成闭环
+    //   设置 isAvailable=false，下次循环再被本函数跳过，形成闭环
     if (account.expiresAt && account.expiresAt < now && !account.refreshToken) {
       return false
     }
 
-    if (account.isAvailable === false) {
+    if (account.isAvailable === false && !expiredTempSuspend) {
       return false
     }
 
     // 断路器检查：指数退避 + 概率重试
-    const failures = account.errorCount || 0
+    // 临时封禁过期的账号视为全新回归（errorCount 归零），给一次干净的探测机会
+    const failures = expiredTempSuspend ? 0 : (account.errorCount || 0)
     if (failures > 0 && account.lastUsed) {
       const timeSinceFailure = now - account.lastUsed
       // 指数退避：base * 2^(failures-1)，封顶为 maxBackoffMultiplier
@@ -239,16 +253,32 @@ export class AccountPool {
 
   // 检查账号是否被长期封禁（TEMPORARILY_SUSPENDED / AccountSuspendedException 等风控触发）
   // 不同于临时 errorCount 冷却，需要人工解封或调用 clearSuspended
+  //
+  // 例外：reason 为 TEMPORARILY_SUSPENDED 且距今已超过 TEMPORARY_SUSPEND_AUTO_CLEAR_MS（2h）时，
+  // 视为已自动解封（返回 false），账号重新参与轮询。这样无需人工干预即可让临时风控账号回归，
+  // 避免 pool 因临时封禁持续缩水。若账号实际仍被风控，下次请求会再次触发 markSuspended。
   isSuspended(account: ProxyAccount): boolean {
-    return typeof account.suspendedAt === 'number' && account.suspendedAt > 0
+    if (typeof account.suspendedAt !== 'number' || account.suspendedAt <= 0) return false
+    if (account.suspendReason === 'TEMPORARILY_SUSPENDED') {
+      const elapsed = Date.now() - account.suspendedAt
+      if (elapsed >= TEMPORARY_SUSPEND_AUTO_CLEAR_MS) {
+        return false  // 临时封禁已过期 → 自动解封
+      }
+    }
+    return true
   }
 
-  // 标记账号为被封禁状态，账号池会持续跳过该账号直到 clearSuspended
+  // 标记账号为被封禁状态，账号池会持续跳过该账号直到 clearSuspended（或临时封禁自动过期）
   markSuspended(accountId: string, reason: string, message?: string): boolean {
     const account = this.accounts.get(accountId)
     if (!account) return false
-    if (this.isSuspended(account) && account.suspendReason === reason) {
-      // 已标记过同样原因，不重复记录
+    // 用原始字段判断"是否已是同因封禁中"，而非 isSuspended()：
+    // isSuspended() 含 2h 自动过期逻辑，临界点附近会误判为"未封禁"从而丢弃这次新信号；
+    // 这里只要 suspendedAt 仍在且 reason 相同就视为已记录，但仍刷新时间戳以延长临时封禁窗口。
+    const alreadySuspended = typeof account.suspendedAt === 'number' && account.suspendedAt > 0
+    if (alreadySuspended && account.suspendReason === reason) {
+      // 同因再次触发：刷新 suspendedAt（重置 2h 窗口），但不算"新标记"
+      this.accounts.set(accountId, { ...account, suspendedAt: Date.now(), suspendMessage: message ?? account.suspendMessage })
       return false
     }
     this.accounts.set(accountId, {
@@ -262,10 +292,12 @@ export class AccountPool {
     return true
   }
 
-  // 解除账号封禁标记（供手动重置或检测到被解封后调用）
+  // 解除账号封禁标记（供手动重置、检测到被解封，或临时封禁自动过期后调用）
   clearSuspended(accountId: string): void {
     const account = this.accounts.get(accountId)
-    if (!account || !this.isSuspended(account)) return
+    // 用原始字段判断而非 isSuspended()：临时封禁自动过期后 isSuspended() 已返回 false，
+    // 但 suspendedAt/isAvailable 等字段仍残留，需要在此真正清除
+    if (!account || typeof account.suspendedAt !== 'number' || account.suspendedAt <= 0) return
     this.accounts.set(accountId, {
       ...account,
       suspendedAt: undefined,
@@ -275,6 +307,17 @@ export class AccountPool {
       errorCount: 0
     })
     console.log(`[AccountPool] Account ${account.email || accountId} unsuspended`)
+  }
+
+  // 写路径专用：若账号的临时封禁已过期（isSuspended=false 但字段残留），真正清除残留字段。
+  // 仅在选中账号准备使用时调用（getNextAccount/getNextAvailableAccount），保持 isAccountAvailable 纯读。
+  private reviveExpiredSuspension(account: ProxyAccount | null): ProxyAccount | null {
+    if (!account) return account
+    if (typeof account.suspendedAt === 'number' && account.suspendedAt > 0 && !this.isSuspended(account)) {
+      this.clearSuspended(account.id)
+      return this.accounts.get(account.id) || account
+    }
+    return account
   }
 
   // 检查账号配额是否耗尽

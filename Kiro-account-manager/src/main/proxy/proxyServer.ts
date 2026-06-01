@@ -1383,6 +1383,11 @@ export class ProxyServer {
     let lastError: Error | null = null
     let currentAccount = account
     let endpointIndex = 0
+    // 绝对迭代上限：防御性兜底，避免任何意外导致死循环。
+    // quota 分支每个账号最多消耗 2 次迭代（两个端点各试一次），因此按 池大小 × 2 计；
+    // 再加同账号重试预算与余量，确保正常 failover 永远不会被本上限误截断。
+    let iterations = 0
+    const maxIterations = maxRetries + this.accountPool.getAllAccounts().length * 2 + 5
     // 切换账号时用于排除白名单外的账号
     const isAllowed = (acc: ProxyAccount | null): boolean => !acc || !allowedIds || allowedIds.has(acc.id)
     const excludeOutOfWhitelist = this.excludeSetForAllowed(allowedIds)
@@ -1406,6 +1411,13 @@ export class ProxyServer {
     }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      // 切换账号不应消耗"同账号重试预算"(maxRetries)：否则账号多于 maxRetries 时，
+      // 遇到连续 suspend/quota 会在试完整个池之前就耗尽预算，导致仍有可用账号却返回错误。
+      // 账号切换由 triedIds（池大小）自然封顶；这里加绝对迭代上限做防御性兜底，杜绝死循环。
+      if (++iterations > maxIterations) {
+        console.warn(`[ProxyServer] callWithRetry hit absolute iteration cap (${maxIterations}), giving up`)
+        break
+      }
       this.throwIfAborted(signal)
       try {
         const result = await apiCall(currentAccount, endpointIndex)
@@ -1448,11 +1460,14 @@ export class ProxyServer {
             })
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
+          // 账号被封 → 池容量下降，检查是否需要预警补号
+          this.checkPoolLow()
           // 切到下个可用账号（跳过被 suspended 的 + 白名单外 + 本请求已试过的）
           const nextAccount = switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id) && isAllowed(nextAccount)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
+            attempt--  // 切号不消耗同账号重试预算（由 triedIds/maxIterations 兜底）
             // 绑定白名单按 API Key 维度，不改写全局 selectedAccountIds
             if (!this.config.enableMultiAccount && !allowedIds) {
               this.config.selectedAccountIds = [nextAccount.id]
@@ -1477,6 +1492,7 @@ export class ProxyServer {
           if (nextAccount && !triedIds.has(nextAccount.id) && isAllowed(nextAccount)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
+            attempt--  // 切号不消耗同账号重试预算
             continue
           }
         }
@@ -1485,22 +1501,32 @@ export class ProxyServer {
         if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
           console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
           this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          // 配额耗尽 → 可用账号可能下降，检查是否需要预警补号
+          this.checkPoolLow()
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
-          if (endpointIndex === 0) {
-            // 已尝试所有端点，切换到没试过的下个账号（受 API Key 白名单约束）
-            const nextAccount = switchToNextAccount()
-            if (nextAccount && !triedIds.has(nextAccount.id) && isAllowed(nextAccount)) {
-              console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
-              currentAccount = nextAccount
-              triedIds.add(nextAccount.id)
-              // 绑定白名单按 API Key 维度，不改写全局 selectedAccountIds
-              if (!this.config.enableMultiAccount && !allowedIds) {
-                this.config.selectedAccountIds = [nextAccount.id]
-                this.events.onAccountUpdate?.(nextAccount)
-              }
-            }
+          if (endpointIndex !== 0) {
+            // 切到备用端点重试同一账号：端点数固定为 2，天然有界，
+            // 不应消耗"跨账号遍历预算"，否则账号多于 maxRetries 时会在试完整个池前耗尽。
+            attempt--
+            continue
           }
-          continue
+          // endpointIndex 回到 0：两个端点都已试过 → 切换到没试过的下个账号
+          const nextAccount = switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id) && isAllowed(nextAccount)) {
+            console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            attempt--  // 切号不消耗同账号重试预算（由 triedIds/maxIterations 兜底）
+            // 绑定白名单按 API Key 维度，不改写全局 selectedAccountIds
+            if (!this.config.enableMultiAccount && !allowedIds) {
+              this.config.selectedAccountIds = [nextAccount.id]
+              this.events.onAccountUpdate?.(nextAccount)
+            }
+            continue
+          }
+          // 两端点皆试过且无可切换账号 → 停止（与 suspend/auth 分支一致地 break，
+          // 避免无脑 continue 把剩余 maxIterations 全部空耗）
+          break
         }
 
         // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
@@ -1513,6 +1539,7 @@ export class ProxyServer {
               console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
               currentAccount = nextAccount
               triedIds.add(nextAccount.id)
+              attempt--  // 切号不消耗同账号重试预算
               continue
             }
           }
@@ -2102,7 +2129,7 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -3681,6 +3708,27 @@ export class ProxyServer {
       level: 'error',
       fields: { 端点: path, 模型: model || '-', 总账号: quota.total, 配额耗尽: quota.exhausted, 冷却中: quota.cooldown, 可用: quota.available }
     })
+  }
+
+  /**
+   * 池容量预警：可用账号数跌破 poolLowThreshold 时推送 webhook，提醒及早补充账号。
+   * 在"全员耗尽（503）"之前就告警，给补号留时间。triggerWebhook 自带 5 分钟去重，
+   * 不会刷屏。available 回升到阈值以上后，下次跌破会重新告警（中间的去重窗口过期即可）。
+   */
+  private checkPoolLow(): void {
+    const threshold = this.config.poolLowThreshold || 0
+    if (threshold <= 0) return
+    const quota = this.accountPool.getQuotaStatus()
+    // total=0（还没加账号）不算预警场景；available 为 0 已由 all-exhausted 覆盖，这里仍推以防漏报
+    if (quota.total === 0) return
+    if (quota.available <= threshold) {
+      this.triggerWebhook('proxy-pool-low', {
+        title: '反代可用账号偏低',
+        message: `可用账号仅剩 ${quota.available} 个（阈值 ${threshold}，总 ${quota.total}），建议尽快补充账号`,
+        level: 'warn',
+        fields: { 可用: quota.available, 阈值: threshold, 总账号: quota.total, 配额耗尽: quota.exhausted, 冷却中: quota.cooldown }
+      })
+    }
   }
 
   /** P2-16 Prometheus metrics 文本 */
