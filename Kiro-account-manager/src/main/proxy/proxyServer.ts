@@ -35,6 +35,8 @@ import {
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { isServerWebTool, type WebToolConfig } from './webTools'
+import * as portal from './portal'
+import type { Customer } from './types'
 
 
 // 把代理侧执行的 web 工具记录，转换为 Anthropic 原生 content block 序列：
@@ -297,6 +299,10 @@ export class ProxyServer {
   private sockets: Set<Socket> = new Set()
   /** P1-7 按 API Key/IP 的滑动窗口限流（每分钟桶） */
   private rateLimitBuckets: Map<string, { count: number; windowStart: number }> = new Map()
+  /** 门户登录按 IP 的失败限流桶（每分钟），独立于业务限流，防暴力破解 */
+  private portalLoginBuckets: Map<string, { count: number; windowStart: number }> = new Map()
+  /** 客户在途请求计数（信用预留），防并发请求穿透预付余额造成超额消费 */
+  private customerInFlight: Map<string, number> = new Map()
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   /** P2-17 审计日志（最近 200 条） */
@@ -390,6 +396,11 @@ export class ProxyServer {
       startTime: 0
     }
     this.events = events
+    // 门户已启用但缺签名密钥（如从旧配置恢复）→ 立即生成，避免 /portal/login 503
+    if (this.config.portalEnabled && !this.config.portalSessionSecret) {
+      this.config.portalSessionSecret = crypto.randomBytes(32).toString('hex')
+      this.events.onConfigChanged?.(this.config)
+    }
   }
 
   /**
@@ -658,6 +669,12 @@ export class ProxyServer {
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
     this.config = { ...this.config, ...config }
+    // 门户启用时若未设签名密钥，自动生成一份（持久化靠 onConfigChanged）。
+    // 缺少密钥会导致 /portal/login 返回 503，故在此兜底初始化。
+    if (this.config.portalEnabled && !this.config.portalSessionSecret) {
+      this.config.portalSessionSecret = crypto.randomBytes(32).toString('hex')
+      this.events.onConfigChanged?.(this.config)
+    }
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -1613,6 +1630,16 @@ export class ProxyServer {
         if (matched.creditsLimit && matched.usage.totalCredits >= matched.creditsLimit) {
           return { valid: false, reason: 'Credits limit exceeded' }
         }
+        // 客户门户预付余额校验：Key 归属某客户时，余额 <= 0 或客户被禁用则拒绝
+        if (matched.customerId) {
+          const customer = (this.config.customers || []).find(c => c.id === matched!.customerId)
+          if (!customer || !customer.enabled) {
+            return { valid: false, reason: 'Credits limit exceeded' }
+          }
+          if (customer.creditBalance <= 0) {
+            return { valid: false, reason: 'Credits limit exceeded' }
+          }
+        }
         return { valid: true, apiKey: matched }
       }
     }
@@ -1623,6 +1650,46 @@ export class ProxyServer {
     }
 
     return { valid: false }
+  }
+
+  /**
+   * 管理员鉴权（独立于业务 validateApiKey）。
+   * 放行条件（任一）：
+   *   - 提供的 Key 等于 legacy config.apiKey（运营方主 Key）
+   *   - 提供的 Key 命中 config.apiKeys 中某个【未绑定 customerId】的启用 Key
+   * 明确拒绝：客户在门户自助创建的 Key（带 customerId）—— 防提权。
+   * 若两种管理员凭证都没配置（hasApiKeys=false 且无 legacy），保持与原 validateApiKey 一致：
+   *   无任何 Key 配置时视为开放（本地默认场景），交由上层 IP 白名单等控制。
+   */
+  private validateAdminApiKey(req: http.IncomingMessage): boolean {
+    const hasApiKeys = !!(this.config.apiKeys && this.config.apiKeys.length > 0)
+    const hasLegacyKey = !!this.config.apiKey
+    if (!hasApiKeys && !hasLegacyKey) return true // 未配置任何 Key：沿用旧行为（开放）
+
+    const authHeader = req.headers['authorization'] || ''
+    const apiKeyHeader = (req.headers['x-api-key'] as string) || ''
+    let providedKey = ''
+    if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) providedKey = authHeader.slice(7)
+    if (!providedKey && apiKeyHeader) providedKey = apiKeyHeader
+    if (!providedKey) return false
+
+    // legacy 主 Key = 管理员
+    if (hasLegacyKey && this.safeStringEq(this.config.apiKey!, providedKey)) return true
+
+    // config.apiKeys 中【未绑定 customerId】的启用 Key = 运营方 Key = 管理员
+    // 常数时间遍历，且必须 customerId 为空才放行
+    if (hasApiKeys) {
+      let isAdmin = false
+      for (const k of this.config.apiKeys!) {
+        if (!k.enabled || !k.key) continue
+        if (this.safeStringEq(k.key, providedKey) && !k.customerId) {
+          isAdmin = true
+          // 不 break，保持时序一致
+        }
+      }
+      return isAdmin
+    }
+    return false
   }
 
   /**
@@ -1789,8 +1856,38 @@ export class ProxyServer {
       apiKey.usageHistory = apiKey.usageHistory.slice(0, 100)
     }
 
+    // 客户门户预付扣费：Key 归属某客户时，从其 creditBalance 扣减本次消耗的 credit。
+    // 允许扣成负数（最后一次请求可能略微超额），下次请求 validateApiKey 会因 <=0 拒绝。
+    if (apiKey.customerId && credits > 0 && this.config.customers) {
+      const customer = this.config.customers.find(c => c.id === apiKey.customerId)
+      if (customer) {
+        customer.creditBalance -= credits
+      }
+    }
+
     // 触发配置保存事件
     this.events.onConfigChanged?.(this.config)
+  }
+
+  /**
+   * 客户端中途断开时的用量结算：AWS 已经实际消耗了 token/credit，
+   * 即便我们不再向已关闭的连接写响应，也必须把这笔用量记到客户账上，
+   * 否则客户可借"发起请求→立即断开"白嫖额度。仅在有 matchedApiKey 且有正向用量时计费。
+   * 账号侧统计也补记 success（请求确实成功了，只是客户没收完）。
+   */
+  private settleAbortedUsage(
+    matchedApiKey: import('./types').ApiKey | undefined,
+    accountId: string,
+    usage: { credits?: number; inputTokens: number; outputTokens: number },
+    model: string | undefined,
+    path: string
+  ): void {
+    const credits = usage.credits || 0
+    if (credits <= 0 && usage.inputTokens <= 0 && usage.outputTokens <= 0) return
+    this.accountPool.recordSuccess(accountId, usage.inputTokens + usage.outputTokens)
+    if (matchedApiKey) {
+      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path)
+    }
   }
 
   // 返回可用的 web 工具配置（启用且有 apiKey 时），否则 null
@@ -1868,6 +1965,8 @@ export class ProxyServer {
     const path = req.url || '/'
     const method = req.method || 'GET'
     const clientIP = this.getClientIP(req)
+    // 客户信用预留：在 finally 中释放（仅当成功 acquire 时）
+    let reservedCustomerId: string | null = null
     const controller = new AbortController()
     const abortRequest = () => {
       if (!this.isStopping && res.writableEnded) return
@@ -1903,7 +2002,7 @@ export class ProxyServer {
       }
 
       // API Key 验证（健康检查端点除外）
-      if (path !== '/health' && path !== '/') {
+      if (path !== '/health' && path !== '/' && !path.startsWith('/portal')) {
         const authResult = this.validateApiKey(req)
         if (!authResult.valid) {
           const errorMsg = authResult.reason || 'Invalid or missing API key'
@@ -1926,6 +2025,18 @@ export class ProxyServer {
           this.sendError(res, 429, 'Rate limit exceeded',
             this.isAnthropicPath(path) ? 'anthropic' : 'openai')
           return
+        }
+
+        // 客户信用预留：限制单客户并发在途请求，防止并发穿透接近耗尽的预付余额
+        const ownerId = authResult.apiKey?.customerId
+        if (ownerId) {
+          if (!this.acquireCustomerSlot(ownerId)) {
+            res.setHeader('Retry-After', '5')
+            this.sendError(res, 429, 'Too many concurrent requests',
+              this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+            return
+          }
+          reservedCustomerId = ownerId
         }
       }
 
@@ -1967,6 +2078,20 @@ export class ProxyServer {
       } else if (pathWithoutQuery.startsWith('/admin/')) {
         // 管理 API 端点
         await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
+      } else if (pathWithoutQuery === '/portal' || pathWithoutQuery === '/portal/') {
+        // 客户门户页面（静态 HTML）
+        if (!this.config.portalEnabled) {
+          this.sendError(res, 404, `Not Found: ${pathWithoutQuery}`)
+        } else {
+          this.handlePortalPage(res)
+        }
+      } else if (pathWithoutQuery.startsWith('/portal/')) {
+        // 客户门户 API
+        if (!this.config.portalEnabled) {
+          this.sendError(res, 404, `Not Found: ${pathWithoutQuery}`)
+        } else {
+          await this.handlePortalApi(req, res, pathWithoutQuery, controller.signal)
+        }
       } else {
         // 记录未知路径以便调试
         console.log(`[ProxyServer] Unknown path: ${path} (method: ${method})`)
@@ -1992,6 +2117,7 @@ export class ProxyServer {
       req.off('aborted', abortRequest)
       res.off('close', abortRequest)
       this.activeRequests.delete(controller)
+      if (reservedCustomerId) this.releaseCustomerSlot(reservedCustomerId)
     }
   }
 
@@ -1999,9 +2125,11 @@ export class ProxyServer {
   private async handleAdminApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
     const method = req.method || 'GET'
 
-    // 管理 API 需要 API Key 验证
-    const authResult = this.validateApiKey(req)
-    if (!authResult.valid) {
+    // 管理 API 需要"管理员"凭证：不能用客户在门户里自助创建的 Key。
+    // 否则付费客户可凭自己的 Key 调 /admin/customers/:id/credit 给自己充值、
+    // 枚举所有客户、改配置 —— 提权漏洞。validateAdminApiKey 仅放行
+    // legacy apiKey 或未绑定 customerId 的 Key（运营方自己的 Key）。
+    if (!this.validateAdminApiKey(req)) {
       this.sendError(res, 401, 'Admin API requires authentication')
       return
     }
@@ -2042,9 +2170,294 @@ export class ProxyServer {
       const promptCacheCleared = promptCacheTracker.clear()
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
+    } else if (path === '/admin/customers' && method === 'GET') {
+      // 客户列表（脱敏：不返回密码哈希）
+      this.handleAdminListCustomers(res)
+    } else if (path === '/admin/customers' && method === 'POST') {
+      // 创建客户（email + password [+ 初始 credit]）
+      await this.handleAdminCreateCustomer(req, res, signal)
+    } else if (/^\/admin\/customers\/[^/]+\/credit$/.test(path) && method === 'POST') {
+      // 人工充值/扣减 credit
+      let customerId: string
+      try { customerId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'Customer not found')
+        return
+      }
+      await this.handleAdminTopupCustomer(req, res, customerId, signal)
     } else {
       this.sendError(res, 404, 'Admin endpoint not found')
     }
+  }
+
+  // ============ 管理 API - 客户管理 ============
+
+  /** 客户列表脱敏视图（不含密码哈希/salt，附带名下 Key 数量） */
+  private handleAdminListCustomers(res: http.ServerResponse): void {
+    const customers = (this.config.customers || []).map(c => ({
+      id: c.id,
+      email: c.email,
+      name: c.name,
+      enabled: c.enabled,
+      createdAt: c.createdAt,
+      lastLoginAt: c.lastLoginAt,
+      creditBalance: c.creditBalance,
+      totalToppedUp: c.totalToppedUp || 0,
+      keyCount: portal.customerKeys(this.config, c.id).length,
+      maxKeys: portal.maxKeysFor(this.config, c)
+    }))
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ customers }))
+  }
+
+  private async handleAdminCreateCustomer(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    let parsed: { email?: string; password?: string; name?: string; creditBalance?: number; maxKeys?: number }
+    try { parsed = JSON.parse(body) } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    const email = portal.normalizeEmail(parsed.email || '')
+    if (!portal.isValidEmail(email)) {
+      this.sendError(res, 400, 'Invalid email')
+      return
+    }
+    if (!portal.isStrongEnoughPassword(parsed.password || '')) {
+      this.sendError(res, 400, 'Password too short (min 8 chars)')
+      return
+    }
+    if (portal.findCustomerByEmail(this.config, email)) {
+      this.sendError(res, 409, 'Email already exists')
+      return
+    }
+    const now = Date.now()
+    const customer = await portal.buildCustomer(email, parsed.password!, {
+      name: parsed.name,
+      creditBalance: typeof parsed.creditBalance === 'number' ? parsed.creditBalance : 0,
+      maxKeys: parsed.maxKeys
+    }, now)
+    if (!this.config.customers) this.config.customers = []
+    this.config.customers.push(customer)
+    this.appendAuditLog('customer_created', { id: customer.id, email: customer.email })
+    this.events.onConfigChanged?.(this.config)
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ success: true, customer: { id: customer.id, email: customer.email, creditBalance: customer.creditBalance } }))
+  }
+
+  private async handleAdminTopupCustomer(req: http.IncomingMessage, res: http.ServerResponse, customerId: string, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    let parsed: { amount?: number; note?: string }
+    try { parsed = JSON.parse(body) } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    const amount = Number(parsed.amount)
+    if (!Number.isFinite(amount) || amount === 0) {
+      this.sendError(res, 400, 'amount must be a non-zero number')
+      return
+    }
+    const customer = portal.findCustomerById(this.config, customerId)
+    if (!customer) {
+      this.sendError(res, 404, 'Customer not found')
+      return
+    }
+    customer.creditBalance += amount
+    if (amount > 0) customer.totalToppedUp = (customer.totalToppedUp || 0) + amount
+    if (!customer.topupHistory) customer.topupHistory = []
+    customer.topupHistory.unshift({ timestamp: Date.now(), amount, note: parsed.note, by: 'admin' })
+    if (customer.topupHistory.length > 100) customer.topupHistory = customer.topupHistory.slice(0, 100)
+    this.appendAuditLog('customer_topup', { id: customer.id, amount })
+    this.events.onConfigChanged?.(this.config)
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ success: true, creditBalance: customer.creditBalance }))
+  }
+
+  // ============ 客户门户 API ============
+
+  /** 小工具：发送 JSON 响应 */
+  private sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+    res.writeHead(status, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(payload))
+  }
+
+  /** 取并校验门户会话，返回当前登录客户或 null */
+  private getPortalCustomer(req: http.IncomingMessage): Customer | null {
+    const secret = this.config.portalSessionSecret
+    if (!secret) return null
+    const auth = req.headers['authorization'] || ''
+    let token = ''
+    if (typeof auth === 'string' && auth.startsWith('Bearer ')) token = auth.slice(7)
+    if (!token) return null
+    const cid = portal.verifySession(secret, token, Date.now())
+    if (!cid) return null
+    const customer = portal.findCustomerById(this.config, cid)
+    if (!customer || !customer.enabled) return null
+    return customer
+  }
+
+  private async handlePortalApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
+    const method = req.method || 'GET'
+
+    // 登录：不需要会话，但按 IP 限流防暴力破解
+    if (path === '/portal/login' && method === 'POST') {
+      const loginRl = this.checkPortalLoginRate(this.getClientIP(req))
+      if (!loginRl.allowed) {
+        res.setHeader('Retry-After', String(Math.ceil(loginRl.retryAfterMs / 1000)))
+        this.sendJson(res, 429, { error: 'Too many login attempts, try again later' })
+        return
+      }
+      await this.handlePortalLogin(req, res, signal)
+      return
+    }
+
+    // 其余端点需要有效会话
+    const customer = this.getPortalCustomer(req)
+    if (!customer) {
+      this.sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
+
+    if (path === '/portal/me' && method === 'GET') {
+      this.sendJson(res, 200, {
+        id: customer.id,
+        email: customer.email,
+        name: customer.name,
+        creditBalance: customer.creditBalance,
+        totalToppedUp: customer.totalToppedUp || 0,
+        maxKeys: portal.maxKeysFor(this.config, customer),
+        keyCount: portal.customerKeys(this.config, customer.id).length
+      })
+    } else if (path === '/portal/keys' && method === 'GET') {
+      this.handlePortalListKeys(res, customer)
+    } else if (path === '/portal/keys' && method === 'POST') {
+      await this.handlePortalCreateKey(req, res, customer, signal)
+    } else if (/^\/portal\/keys\/[^/]+$/.test(path) && method === 'DELETE') {
+      let keyId: string
+      try { keyId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendJson(res, 404, { error: 'Key not found' })
+        return
+      }
+      this.handlePortalDeleteKey(res, customer, keyId)
+    } else if (path === '/portal/usage' && method === 'GET') {
+      this.handlePortalUsage(res, customer)
+    } else {
+      this.sendJson(res, 404, { error: 'Not found' })
+    }
+  }
+
+  private async handlePortalLogin(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const secret = this.config.portalSessionSecret
+    if (!secret) {
+      this.sendJson(res, 503, { error: 'Portal not initialized' })
+      return
+    }
+    const body = await this.readBody(req, signal)
+    let parsed: { email?: string; password?: string }
+    try { parsed = JSON.parse(body) } catch {
+      this.sendJson(res, 400, { error: 'Invalid JSON body' })
+      return
+    }
+    const customer = portal.findCustomerByEmail(this.config, parsed.email || '')
+    // 不区分"用户不存在"与"密码错误"，统一返回 401，防止枚举邮箱
+    const ok = !!customer && customer.enabled &&
+      await portal.verifyPassword(parsed.password || '', customer.passwordSalt, customer.passwordHash)
+    if (!ok || !customer) {
+      this.sendJson(res, 401, { error: 'Invalid email or password' })
+      return
+    }
+    customer.lastLoginAt = Date.now()
+    this.events.onConfigChanged?.(this.config)
+    const token = portal.signSession(secret, customer.id, portal.sessionTtlHours(this.config), Date.now())
+    this.sendJson(res, 200, {
+      token,
+      customer: { id: customer.id, email: customer.email, name: customer.name, creditBalance: customer.creditBalance }
+    })
+  }
+
+  private handlePortalListKeys(res: http.ServerResponse, customer: Customer): void {
+    const keys = portal.customerKeys(this.config, customer.id).map(k => ({
+      id: k.id,
+      name: k.name,
+      keyMasked: portal.maskKey(k.key),
+      enabled: k.enabled,
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt,
+      totalCredits: k.usage.totalCredits,
+      totalRequests: k.usage.totalRequests
+    }))
+    this.sendJson(res, 200, { keys })
+  }
+
+  private async handlePortalCreateKey(req: http.IncomingMessage, res: http.ServerResponse, customer: Customer, signal?: AbortSignal): Promise<void> {
+    const max = portal.maxKeysFor(this.config, customer)
+    // 先粗筛（早拒，省去读 body）
+    if (portal.customerKeys(this.config, customer.id).length >= max) {
+      this.sendJson(res, 403, { error: `Key limit reached (max ${max})` })
+      return
+    }
+    const body = await this.readBody(req, signal)
+    let parsed: { name?: string } = {}
+    try { parsed = body ? JSON.parse(body) : {} } catch {
+      this.sendJson(res, 400, { error: 'Invalid JSON body' })
+      return
+    }
+    // 读 body 后、push 前再次校验（readBody 是 await，期间可能有并发创建）——闭合竞态
+    const existing = portal.customerKeys(this.config, customer.id)
+    if (existing.length >= max) {
+      this.sendJson(res, 403, { error: `Key limit reached (max ${max})` })
+      return
+    }
+    const name = (parsed.name || '').trim().slice(0, 64) || `key-${existing.length + 1}`
+    const newKey = portal.buildApiKey(name, customer.id, Date.now())
+    if (!this.config.apiKeys) this.config.apiKeys = []
+    this.config.apiKeys.push(newKey)
+    this.appendAuditLog('portal_key_created', { customerId: customer.id, keyId: newKey.id })
+    this.events.onConfigChanged?.(this.config)
+    // 创建时返回一次完整 key（仅此一次），之后列表只给脱敏值
+    this.sendJson(res, 200, { id: newKey.id, name: newKey.name, key: newKey.key })
+  }
+
+  private handlePortalDeleteKey(res: http.ServerResponse, customer: Customer, keyId: string): void {
+    const key = (this.config.apiKeys || []).find(k => k.id === keyId)
+    // 严格校验归属：只能删自己的 Key
+    if (!key || key.customerId !== customer.id) {
+      this.sendJson(res, 404, { error: 'Key not found' })
+      return
+    }
+    this.config.apiKeys = (this.config.apiKeys || []).filter(k => k.id !== keyId)
+    this.appendAuditLog('portal_key_deleted', { customerId: customer.id, keyId })
+    this.events.onConfigChanged?.(this.config)
+    this.sendJson(res, 200, { success: true })
+  }
+
+  private handlePortalUsage(res: http.ServerResponse, customer: Customer): void {
+    const keys = portal.customerKeys(this.config, customer.id)
+    // 汇总名下所有 Key 的按日用量
+    const dailyAgg: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
+    let totalCredits = 0
+    let totalRequests = 0
+    for (const k of keys) {
+      totalCredits += k.usage.totalCredits
+      totalRequests += k.usage.totalRequests
+      for (const [day, d] of Object.entries(k.usage.daily || {})) {
+        if (!dailyAgg[day]) dailyAgg[day] = { requests: 0, credits: 0, inputTokens: 0, outputTokens: 0 }
+        dailyAgg[day].requests += d.requests
+        dailyAgg[day].credits += d.credits
+        dailyAgg[day].inputTokens += d.inputTokens
+        dailyAgg[day].outputTokens += d.outputTokens
+      }
+    }
+    this.sendJson(res, 200, {
+      creditBalance: customer.creditBalance,
+      totalCredits,
+      totalRequests,
+      daily: dailyAgg
+    })
+  }
+
+  /** 客户门户静态页面（自包含 HTML，无外部依赖） */
+  private handlePortalPage(res: http.ServerResponse): void {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end(PORTAL_HTML)
   }
 
   // 管理 API - 详细统计
@@ -2104,7 +2517,20 @@ export class ProxyServer {
       ...config,
       apiKey: maskKey(config.apiKey),
       apiKeys: config.apiKeys?.map(k => ({ ...k, key: maskKey(k.key) || '***' })),
-      tls: config.tls ? { enabled: config.tls.enabled, hasCert: !!(config.tls.cert || config.tls.certPath), hasKey: !!(config.tls.key || config.tls.keyPath) } : undefined
+      tls: config.tls ? { enabled: config.tls.enabled, hasCert: !!(config.tls.cert || config.tls.certPath), hasKey: !!(config.tls.key || config.tls.keyPath) } : undefined,
+      // 绝不外泄门户签名密钥（泄露即可伪造任意客户会话）
+      portalSessionSecret: config.portalSessionSecret ? '***' : undefined,
+      // 客户列表脱敏：移除密码 salt/hash，仅保留运营可见的非敏感字段
+      customers: config.customers?.map(c => ({
+        id: c.id,
+        email: c.email,
+        name: c.name,
+        enabled: c.enabled,
+        createdAt: c.createdAt,
+        lastLoginAt: c.lastLoginAt,
+        creditBalance: c.creditBalance,
+        totalToppedUp: c.totalToppedUp || 0
+      }))
     }
   }
 
@@ -2129,9 +2555,10 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold',
+      'portalEnabled', 'portalSessionTtlHours', 'portalDefaultMaxKeys'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
-      // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
+      // 也排除：customers / portalSessionSecret —— 含密码哈希与签名密钥，仅本地 IPC / 专用 admin 端点改
     ]
     const out: Partial<ProxyConfig> = {}
     for (const key of allowed) {
@@ -2342,6 +2769,8 @@ export class ProxyServer {
             },
             (usage) => {
               if (signal?.aborted || this.isResponseClosed(res)) {
+                // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
+                this.settleAbortedUsage(matchedApiKey, account.id, usage, modelId, '/v1beta/models')
                 resolve()
                 return
               }
@@ -2848,10 +3277,12 @@ export class ProxyServer {
         },
         async (usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
+            // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
+            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/chat/completions')
             resolve()
             return
           }
-          
+
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
           this.stats.inputTokens += usage.inputTokens
@@ -3372,6 +3803,8 @@ export class ProxyServer {
         },
         async (usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
+            // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
+            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/messages')
             resolve()
             return
           }
@@ -3624,6 +4057,48 @@ export class ProxyServer {
     return { allowed: true, retryAfterMs: 0 }
   }
 
+  /**
+   * 门户登录限流（按 IP，固定每分钟 10 次尝试）。
+   * 与业务 rateLimitPerKeyPerMinute 独立，且无论是否配置都生效，
+   * 因为 /portal/* 走的是会话鉴权、绕过了 validateApiKey 那条限流路径。
+   */
+  private checkPortalLoginRate(clientIP: string): { allowed: boolean; retryAfterMs: number } {
+    const LIMIT = 10
+    const id = `login:${clientIP || 'unknown'}`
+    const now = Date.now()
+    const bucket = this.portalLoginBuckets.get(id)
+    if (!bucket || now - bucket.windowStart >= 60_000) {
+      this.portalLoginBuckets.set(id, { count: 1, windowStart: now })
+      return { allowed: true, retryAfterMs: 0 }
+    }
+    if (bucket.count >= LIMIT) {
+      return { allowed: false, retryAfterMs: 60_000 - (now - bucket.windowStart) }
+    }
+    bucket.count++
+    return { allowed: true, retryAfterMs: 0 }
+  }
+
+  /**
+   * 尝试为某客户占用一个在途请求槽位（信用预留）。
+   * 返回 false 表示已达并发上限，调用方应拒绝（429），不要忘记仅在返回 true 时 release。
+   * cap=0 表示不限制（始终返回 true 且不计数，release 也安全）。
+   */
+  private acquireCustomerSlot(customerId: string): boolean {
+    const cap = this.config.portalMaxConcurrentPerCustomer ?? 6
+    if (cap <= 0) return true
+    const cur = this.customerInFlight.get(customerId) || 0
+    if (cur >= cap) return false
+    this.customerInFlight.set(customerId, cur + 1)
+    return true
+  }
+
+  /** 释放某客户的在途请求槽位（与 acquireCustomerSlot 成对，放在 finally）。 */
+  private releaseCustomerSlot(customerId: string): void {
+    const cur = this.customerInFlight.get(customerId) || 0
+    if (cur <= 1) this.customerInFlight.delete(customerId)
+    else this.customerInFlight.set(customerId, cur - 1)
+  }
+
   /** 定期清理过期的限流桶 / 会话粘性条目（避免内存泄漏） */
   private cleanupExpiredCaches(): void {
     const now = Date.now()
@@ -3799,3 +4274,223 @@ export class ProxyServer {
     }
   }
 }
+
+// ============ 客户门户静态页面 ============
+// 自包含单页（vanilla JS，无外部依赖）：登录 → 查看余额 → 管理 API Key → 查看用量。
+// 通过 fetch 调用 /portal/* JSON API；会话 token 存 localStorage。
+const PORTAL_HTML = `<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Portal</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#3b82f6; --danger:#ef4444; --ok:#22c55e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  .wrap { max-width:760px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:20px; margin:0 0 16px; }
+  h2 { font-size:15px; margin:24px 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:16px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:#0b1220; color:var(--txt); font-size:14px; }
+  button { padding:9px 16px; border:none; border-radius:8px; background:var(--accent); color:#fff; font-size:14px; cursor:pointer; }
+  button:hover { opacity:.9; }
+  button.secondary { background:#475569; }
+  button.danger { background:var(--danger); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .balance { font-size:32px; font-weight:700; }
+  .balance.low { color:var(--danger); }
+  .muted { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:500; }
+  code { background:#0b1220; padding:2px 6px; border-radius:5px; font-size:12px; word-break:break-all; }
+  .hide { display:none; }
+  .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
+  .keybox { background:#0b1220; border:1px solid var(--ok); border-radius:8px; padding:12px; margin-top:10px; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- Login view -->
+  <div id="loginView">
+    <h1>เข้าสู่ระบบ</h1>
+    <div class="card">
+      <label>อีเมล</label>
+      <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
+      <label>รหัสผ่าน</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
+      <div style="margin-top:14px"><button id="loginBtn">เข้าสู่ระบบ</button></div>
+      <div class="err" id="loginErr"></div>
+    </div>
+  </div>
+
+  <!-- Dashboard view -->
+  <div id="dashView" class="hide">
+    <div class="topbar">
+      <h1>แดชบอร์ด</h1>
+      <button class="secondary" id="logoutBtn">ออกจากระบบ</button>
+    </div>
+    <div class="muted" id="whoami"></div>
+
+    <h2>เครดิตคงเหลือ</h2>
+    <div class="card">
+      <div class="balance" id="balance">–</div>
+      <div class="muted" id="balanceNote">เติมเครดิตติดต่อแอดมิน</div>
+    </div>
+
+    <h2>API Keys</h2>
+    <div class="card">
+      <div class="row">
+        <input id="keyName" placeholder="ชื่อ key (เช่น my-app)" style="flex:1; min-width:160px">
+        <button id="createKeyBtn">สร้าง Key</button>
+      </div>
+      <div class="err" id="keyErr"></div>
+      <div id="newKeyBox"></div>
+      <table style="margin-top:12px">
+        <thead><tr><th>ชื่อ</th><th>Key</th><th>credits</th><th></th></tr></thead>
+        <tbody id="keyRows"></tbody>
+      </table>
+    </div>
+
+    <h2>การใช้งาน</h2>
+    <div class="card">
+      <div class="muted">รวมทั้งหมด: <span id="usageTotal">–</span></div>
+      <table style="margin-top:10px">
+        <thead><tr><th>วันที่</th><th>requests</th><th>credits</th></tr></thead>
+        <tbody id="usageRows"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var TOKEN_KEY = 'portal_token';
+  var token = localStorage.getItem(TOKEN_KEY) || '';
+  var $ = function(id){ return document.getElementById(id); };
+
+  function api(path, opts){
+    opts = opts || {};
+    var headers = { 'Content-Type':'application/json' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    return fetch(path, { method: opts.method || 'GET', headers: headers, body: opts.body ? JSON.stringify(opts.body) : undefined })
+      .then(function(r){
+        return r.json().catch(function(){ return {}; }).then(function(j){
+          return { ok: r.ok, status: r.status, data: j };
+        });
+      });
+  }
+
+  function show(view){
+    $('loginView').classList.toggle('hide', view !== 'login');
+    $('dashView').classList.toggle('hide', view !== 'dash');
+  }
+
+  function doLogin(){
+    $('loginErr').textContent = '';
+    var email = $('email').value.trim();
+    var password = $('password').value;
+    if (!email || !password){ $('loginErr').textContent = 'กรอกอีเมลและรหัสผ่าน'; return; }
+    $('loginBtn').disabled = true;
+    api('/portal/login', { method:'POST', body:{ email:email, password:password } }).then(function(r){
+      $('loginBtn').disabled = false;
+      if (!r.ok){ $('loginErr').textContent = (r.data && r.data.error) || 'เข้าสู่ระบบไม่สำเร็จ'; return; }
+      token = r.data.token;
+      localStorage.setItem(TOKEN_KEY, token);
+      loadDash();
+    });
+  }
+
+  function logout(){
+    token = '';
+    localStorage.removeItem(TOKEN_KEY);
+    show('login');
+  }
+
+  function fmt(n){ return (Math.round((n||0)*1000)/1000).toLocaleString(); }
+
+  function loadDash(){
+    api('/portal/me').then(function(r){
+      if (!r.ok){ logout(); return; }
+      show('dash');
+      var c = r.data;
+      $('whoami').textContent = c.email + (c.name ? ' ('+c.name+')' : '');
+      var bal = $('balance');
+      bal.textContent = fmt(c.creditBalance) + ' credits';
+      bal.classList.toggle('low', c.creditBalance <= 0);
+      $('balanceNote').textContent = c.creditBalance <= 0
+        ? 'เครดิตหมด — ติดต่อแอดมินเพื่อเติม'
+        : 'เติมเครดิตติดต่อแอดมิน';
+      loadKeys();
+      loadUsage();
+    });
+  }
+
+  function loadKeys(){
+    api('/portal/keys').then(function(r){
+      if (!r.ok) return;
+      var rows = $('keyRows'); rows.innerHTML = '';
+      (r.data.keys || []).forEach(function(k){
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>'+esc(k.name)+'</td><td><code>'+esc(k.keyMasked)+'</code></td><td>'+fmt(k.totalCredits)+'</td>'
+          + '<td><button class="danger" data-id="'+esc(k.id)+'">ลบ</button></td>';
+        rows.appendChild(tr);
+      });
+      Array.prototype.forEach.call(rows.querySelectorAll('button[data-id]'), function(btn){
+        btn.addEventListener('click', function(){ delKey(btn.getAttribute('data-id')); });
+      });
+    });
+  }
+
+  function createKey(){
+    $('keyErr').textContent = '';
+    var name = $('keyName').value.trim();
+    $('createKeyBtn').disabled = true;
+    api('/portal/keys', { method:'POST', body:{ name:name } }).then(function(r){
+      $('createKeyBtn').disabled = false;
+      if (!r.ok){ $('keyErr').textContent = (r.data && r.data.error) || 'สร้างไม่สำเร็จ'; return; }
+      $('keyName').value = '';
+      $('newKeyBox').innerHTML = '<div class="keybox">คัดลอก key นี้เก็บไว้ (แสดงครั้งเดียว):<br><code>'+esc(r.data.key)+'</code></div>';
+      loadKeys();
+    });
+  }
+
+  function delKey(id){
+    if (!confirm('ลบ key นี้?')) return;
+    api('/portal/keys/' + encodeURIComponent(id), { method:'DELETE' }).then(function(r){
+      if (r.ok){ loadKeys(); }
+    });
+  }
+
+  function loadUsage(){
+    api('/portal/usage').then(function(r){
+      if (!r.ok) return;
+      $('usageTotal').textContent = fmt(r.data.totalCredits) + ' credits / ' + (r.data.totalRequests||0) + ' requests';
+      var rows = $('usageRows'); rows.innerHTML = '';
+      var days = Object.keys(r.data.daily || {}).sort().reverse().slice(0, 14);
+      days.forEach(function(day){
+        var d = r.data.daily[day];
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>'+esc(day)+'</td><td>'+d.requests+'</td><td>'+fmt(d.credits)+'</td>';
+        rows.appendChild(tr);
+      });
+    });
+  }
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  $('loginBtn').addEventListener('click', doLogin);
+  $('password').addEventListener('keydown', function(e){ if (e.key==='Enter') doLogin(); });
+  $('logoutBtn').addEventListener('click', logout);
+  $('createKeyBtn').addEventListener('click', createKey);
+
+  if (token) loadDash(); else show('login');
+})();
+</script>
+</body>
+</html>`
+

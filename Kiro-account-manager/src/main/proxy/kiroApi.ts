@@ -307,6 +307,15 @@ export function mapModelId(model: string): string {
   const lower = modelId.toLowerCase()
   // 1) 显式 alias 映射优先
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
+  // 1b) 带日期快照后缀的 Claude 模型（如 claude-haiku-4.5-20251001）：
+  //     Kiro 只认不带日期的规范名（claude-haiku-4.5），原样透传会被后端拒为 INVALID_MODEL_ID。
+  //     先剥掉 -YYYYMMDD 再查一次映射 / 透传规范名。这同时修复 Claude Code 子代理
+  //     默认携带日期后缀模型（claude-haiku-4-5-20251001）导致的 400。
+  const dateStripped = lower.replace(/-\d{8}$/, '')
+  if (dateStripped !== lower) {
+    if (MODEL_ID_MAP[dateStripped]) return MODEL_ID_MAP[dateStripped]
+    if (/^claude-(sonnet|haiku|opus)-/.test(dateStripped)) return dateStripped
+  }
   // 2) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
   //    用于向前兼容尚未加入 MODEL_ID_MAP 的新发布模型
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId

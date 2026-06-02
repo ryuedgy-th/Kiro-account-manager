@@ -424,6 +424,12 @@ function initProxyServer(): ProxyServer {
       onCreditsUpdate: (totalCredits) => {
         debouncedStoreSet('proxyTotalCredits', totalCredits)
       },
+      // 配置变更回调 - API Key 用量 / 客户余额变化时持久化整个 proxyConfig。
+      // 关键：API Key 的 usage.totalCredits 与 Customer.creditBalance 都靠这里落盘，
+      // 否则进程重启后客户已消耗的 credit 归零，计费/预付余额全部错乱。
+      onConfigChanged: (config) => {
+        debouncedStoreSet('proxyConfig', config)
+      },
       // Tokens 更新回调 - 使用防抖持久化
       onTokensUpdate: (inputTokens, outputTokens) => {
         debouncedStoreSet('proxyInputTokens', inputTokens)
@@ -1628,6 +1634,9 @@ function initTray(): void {
       }
     },
     onQuit: () => {
+      // 显式退出会先置 isQuitting=true，导致 will-quit 的 `if (isQuitting) return` 提前返回、
+      // 跳过 flushStoreWrites()。这里先同步刷新待写入（含门户客户/credit/key），防数据丢失。
+      flushStoreWrites()
       isQuitting = true
       app.quit()
     },
@@ -1848,6 +1857,10 @@ function createWindow(): void {
     }
 
     // 窗口关闭前保存数据（同步保存，不等待备份）
+    // 先无条件 flush 待写入的防抖数据（门户客户/credit/key），即使本会话没有 accountData
+    if (store) {
+      flushStoreWrites()
+    }
     if (lastSavedData && store) {
       try {
         console.log('[Window] Saving data before close...')
@@ -2085,6 +2098,8 @@ app.whenReady().then(async () => {
         traySettings.closeAction = 'quit'
         saveTraySettings()
       }
+      // 同上：先 flush 待写入再置 isQuitting，避免 will-quit 提前返回丢失门户数据
+      flushStoreWrites()
       isQuitting = true
       app.quit()
     }
@@ -6610,27 +6625,31 @@ app.on('window-all-closed', () => {
 app.on('will-quit', async (event) => {
   // 防止重复处理
   if (isQuitting) return
-  
-  // 防止应用立即退出，先保存数据
-  if (lastSavedData && store) {
+
+  // 只要 store 存在就要落盘：pending 防抖写入（含 proxyConfig：客户/credit/key）必须刷新，
+  // 即便本次会话从未保存过 accountData（lastSavedData 为空），否则门户数据会丢失。
+  if (store) {
     event.preventDefault()
     isQuitting = true
-    
+
     // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
     const forceQuitTimer = setTimeout(() => {
       console.log('[Exit] Force quit due to timeout')
       unregisterProtocol()
       app.exit(0)
     }, 3000)
-    
+
     try {
       console.log('[Exit] Saving data before quit...')
-      // 刷新待写入的防抖数据
+      // 刷新待写入的防抖数据（proxyConfig 等）—— 无条件执行，防止门户/计费数据丢失
       flushStoreWrites()
-      store.set('accountData', lastSavedData)
-      // 退出场景跳过节流，确保备份立即落盘
-      await createBackup(lastSavedData)
-      await flushBackupNow()
+      // accountData / 备份仅在本会话确有账号数据时处理
+      if (lastSavedData) {
+        store.set('accountData', lastSavedData)
+        // 退出场景跳过节流，确保备份立即落盘
+        await createBackup(lastSavedData)
+        await flushBackupNow()
+      }
       // 强制落盘代理日志（异步节流中的尾巴数据）
       try {
         const { proxyLogStore } = await import('./proxy/logger')
@@ -6649,7 +6668,7 @@ app.on('will-quit', async (event) => {
     } catch (error) {
       console.error('[Exit] Failed to save data:', error)
     }
-    
+
     clearTimeout(forceQuitTimer)
     unregisterProtocol()
     app.exit(0)

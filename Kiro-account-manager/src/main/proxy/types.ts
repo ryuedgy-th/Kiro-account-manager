@@ -457,6 +457,12 @@ export interface ApiKey {
   enabled: boolean
   createdAt: number
   lastUsedAt?: number
+  /**
+   * 所属客户 ID（客户门户场景）。
+   * 设置后该 Key 的扣费会从对应 Customer.creditBalance 预付余额中扣减，
+   * 余额 <= 0 时拒绝请求。未设置 = 旧式独立 Key，仅受 creditsLimit 约束。
+   */
+  customerId?: string
   // 额度限制
   creditsLimit?: number  // Credits 上限（undefined 表示无限制）
   // 用量统计
@@ -482,6 +488,28 @@ export interface ApiKey {
   }
   // 用量历史记录（最近 100 条）
   usageHistory?: ApiKeyUsageRecord[]
+}
+
+// 客户（门户登录用户）。每个客户可自助创建多个 API Key，
+// 共用一份预付 credit 余额（creditBalance），按 Kiro 实际计费的 credit 扣减。
+export interface Customer {
+  id: string
+  email: string             // 登录账号（唯一，比较时小写）
+  name?: string             // 显示名
+  // 密码使用 scrypt 派生，存 salt + hash（均为 hex），不存明文
+  passwordSalt: string
+  passwordHash: string
+  enabled: boolean
+  createdAt: number
+  lastLoginAt?: number
+  /** 预付 credit 余额；每次请求按 Kiro 实际计费扣减，<= 0 时该客户所有 Key 被拒 */
+  creditBalance: number
+  /** 累计已充值 credit（仅统计用，便于对账） */
+  totalToppedUp?: number
+  /** 客户自助创建 Key 的数量上限（undefined = 用全局默认） */
+  maxKeys?: number
+  /** 充值流水（人工充值/扣减记录），便于对账 */
+  topupHistory?: Array<{ timestamp: number; amount: number; note?: string; by?: string }>
 }
 
 // 模型映射规则
@@ -601,6 +629,27 @@ export interface ProxyConfig {
    * 在池耗尽（503）之前就提前告警，给补号留出时间。
    */
   poolLowThreshold?: number
+
+  // ============ 客户门户（v1.9 新增） ============
+  /** 客户列表（门户登录账号 + 预付 credit 余额） */
+  customers?: Customer[]
+  /** 启用 /portal/* 客户门户端点（登录、自助管理 Key、查看用量/余额） */
+  portalEnabled?: boolean
+  /**
+   * 门户会话签名密钥（HMAC）。首次启用门户时由主进程自动生成并持久化；
+   * 轮换此值会使所有已签发的登录会话立即失效。
+   */
+  portalSessionSecret?: string
+  /** 门户会话有效期（小时），默认 24 */
+  portalSessionTtlHours?: number
+  /** 客户默认可创建的 API Key 数量上限（默认 5），可被 Customer.maxKeys 覆盖 */
+  portalDefaultMaxKeys?: number
+  /**
+   * 单客户并发在途请求上限（默认 6，0 = 不限制）。
+   * 预付 credit 在请求结束后才扣减，并发请求会同时通过"余额>0"校验；
+   * 此上限把"接近耗尽时的超额消费"约束在 N 个请求以内，而不会无上限透支。
+   */
+  portalMaxConcurrentPerCustomer?: number
 }
 
 export interface TlsConfig {
