@@ -297,6 +297,16 @@ function normalizeClaudeVersion(modelId: string): string {
   )
 }
 
+/**
+ * 规范化模型 ID，用于白名单/费率表比对：剥离客户端能力后缀（如 [1m]）+ 版本短横转点号 + 转小写。
+ * 与 mapModelId 不同：不做 alias 映射、也不 fallback 到 default，仅把「同一模型的不同写法」归一，
+ * 这样 Claude Code 发来的 "claude-opus-4-8[1m]" 能匹配白名单里的规范名 "claude-opus-4.8"。
+ */
+export function canonicalizeModelId(model: string): string {
+  const stripped = (model || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
+  return normalizeClaudeVersion(stripped).toLowerCase()
+}
+
 export function mapModelId(model: string): string {
   // 去掉 Claude Code 等客户端附加的能力后缀，如 "claude-opus-4-8[1m]" → "claude-opus-4-8"
   let modelId = model.trim().replace(/\[[^\]]*\]\s*$/, '').trim()

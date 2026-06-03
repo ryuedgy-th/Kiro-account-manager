@@ -19,7 +19,7 @@ import type {
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, type KiroModel, type WebToolSearchRecord } from './kiroApi'
+import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, canonicalizeModelId, type KiroModel, type WebToolSearchRecord } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -2023,9 +2023,11 @@ export class ProxyServer {
   private isModelAllowed(modelId: string): boolean {
     const allow = this.config.allowedModels
     if (!allow || allow.length === 0) return true
-    const target = (modelId || '').trim().toLowerCase()
+    // 规范化两侧再比对：剥离客户端能力后缀（[1m]）+ 版本短横转点号 + 小写，
+    // 避免 Claude Code 发来的 "claude-opus-4-8[1m]" 匹配不上白名单里的 "claude-opus-4.8" 而误拦 403。
+    const target = canonicalizeModelId(modelId)
     if (!target) return false
-    return allow.some(m => m.trim().toLowerCase() === target)
+    return allow.some(m => canonicalizeModelId(m) === target)
   }
 
   private applyModelMapping(requestedModel: string, apiKeyId?: string): string {

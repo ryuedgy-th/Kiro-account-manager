@@ -42,3 +42,8 @@ test
 Kiro-account-manager/test
 Kiro-account-manager/.kiro
 Kiro register
+# OS / editor junk
+.DS_Store
+**/.DS_Store
+.claude/
+**/.claude/
