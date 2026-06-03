@@ -453,6 +453,13 @@ export interface ApiKeyUsageRecord {
    * 旧持久化记录无此字段 → 视为 undefined（前端显示 '–'）。
    */
   effort?: string
+  /**
+   * input 明细：inputTokens 是三者之和（uncached + cacheRead + cacheWrite）。
+   * 拆出来便于客户理解「为何 input 很大但扣费很少」——cacheRead 计费远低于普通 input。
+   * 旧记录无此字段 → 前端按 uncached = inputTokens 兜底。
+   */
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
 }
 
 // API Key 类型
@@ -478,6 +485,9 @@ export interface ApiKey {
     totalCredits: number
     totalInputTokens: number
     totalOutputTokens: number
+    // input 明细累计（totalInputTokens 含这两部分）；旧 key 缺省 → 前端按 0 兜底
+    totalCacheReadTokens?: number
+    totalCacheWriteTokens?: number
     // 按日期统计（YYYY-MM-DD -> usage）
     daily: Record<string, {
       requests: number

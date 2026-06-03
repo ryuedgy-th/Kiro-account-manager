@@ -11,6 +11,8 @@ interface UsageRecord {
   credits: number
   path: string
   effort?: string
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
 }
 
 interface ModelStats {
@@ -180,22 +182,29 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
                       <th className="text-left p-2 font-medium">{isEn ? 'Effort' : 'Effort'}</th>
                       <th className="text-left p-2 font-medium">{isEn ? 'Path' : '路径'}</th>
                       <th className="text-right p-2 font-medium">{isEn ? 'In' : '输入'}</th>
+                      <th className="text-right p-2 font-medium" title={isEn ? 'Cache read / write tokens' : '缓存 读取 / 写入'}>{isEn ? 'Cache R/W' : '缓存 读/写'}</th>
                       <th className="text-right p-2 font-medium">{isEn ? 'Out' : '输出'}</th>
                       <th className="text-right p-2 font-medium">Credits</th>
                     </tr>
                   </thead>
                   <tbody className="font-mono">
-                    {apiKey.usageHistory.map((record, idx) => (
+                    {apiKey.usageHistory.map((record, idx) => {
+                      const cacheRead = record.cacheReadTokens ?? 0
+                      const cacheWrite = record.cacheWriteTokens ?? 0
+                      const uncached = Math.max(0, record.inputTokens - cacheRead - cacheWrite)
+                      return (
                       <tr key={idx} className="border-b border-muted/30 hover:bg-muted/30">
                         <td className="p-2 text-muted-foreground whitespace-nowrap text-xs">{formatTime(record.timestamp)}</td>
                         <td className="p-2 truncate max-w-[150px]" title={record.model}>{formatModel(record.model)}</td>
                         <td className="p-2 text-muted-foreground">{formatEffort(record.effort)}</td>
                         <td className="p-2 truncate max-w-[120px] text-muted-foreground" title={record.path}>{record.path}</td>
-                        <td className="p-2 text-right text-muted-foreground">{record.inputTokens.toLocaleString()}</td>
+                        <td className="p-2 text-right text-muted-foreground" title={`${isEn ? 'Total input' : '输入合计'}: ${record.inputTokens.toLocaleString()}`}>{uncached.toLocaleString()}</td>
+                        <td className="p-2 text-right text-muted-foreground">{cacheRead.toLocaleString()} / {cacheWrite.toLocaleString()}</td>
                         <td className="p-2 text-right text-muted-foreground">{record.outputTokens.toLocaleString()}</td>
                         <td className="p-2 text-right text-muted-foreground">{record.credits.toFixed(6)}</td>
                       </tr>
-                    ))}
+                      )
+                    })}
                   </tbody>
                 </table>
               ) : (

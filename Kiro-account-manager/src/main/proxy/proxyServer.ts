@@ -1944,7 +1944,7 @@ export class ProxyServer {
     }
   }
 
-  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string, effort?: string): void {
+  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string, effort?: string, cacheReadTokens?: number, cacheWriteTokens?: number): void {
     if (!this.config.apiKeys) return
     const apiKey = this.config.apiKeys.find(k => k.id === apiKeyId)
     if (!apiKey) return
@@ -1957,6 +1957,10 @@ export class ProxyServer {
     apiKey.usage.totalCredits += credits
     apiKey.usage.totalInputTokens += inputTokens
     apiKey.usage.totalOutputTokens += outputTokens
+    const cacheRead = cacheReadTokens || 0
+    const cacheWrite = cacheWriteTokens || 0
+    apiKey.usage.totalCacheReadTokens = (apiKey.usage.totalCacheReadTokens || 0) + cacheRead
+    apiKey.usage.totalCacheWriteTokens = (apiKey.usage.totalCacheWriteTokens || 0) + cacheWrite
     apiKey.lastUsedAt = now
 
     // 更新日统计
@@ -2006,7 +2010,9 @@ export class ProxyServer {
       outputTokens,
       credits,
       path: path || 'unknown',
-      effort: effortKey
+      effort: effortKey,
+      cacheReadTokens: cacheRead,
+      cacheWriteTokens: cacheWrite
     })
     if (apiKey.usageHistory.length > 100) {
       apiKey.usageHistory = apiKey.usageHistory.slice(0, 100)
@@ -2035,7 +2041,7 @@ export class ProxyServer {
   private settleAbortedUsage(
     matchedApiKey: import('./types').ApiKey | undefined,
     accountId: string,
-    usage: { credits?: number; inputTokens: number; outputTokens: number },
+    usage: { credits?: number; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number },
     model: string | undefined,
     path: string,
     effort?: string
@@ -2044,7 +2050,7 @@ export class ProxyServer {
     if (credits <= 0 && usage.inputTokens <= 0 && usage.outputTokens <= 0) return
     this.accountPool.recordSuccess(accountId, usage.inputTokens + usage.outputTokens)
     if (matchedApiKey) {
-      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path, effort)
+      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path, effort, usage.cacheReadTokens, usage.cacheWriteTokens)
     }
   }
 
@@ -2801,12 +2807,16 @@ export class ProxyServer {
     let totalRequests = 0
     let totalInputTokens = 0
     let totalOutputTokens = 0
+    let totalCacheReadTokens = 0
+    let totalCacheWriteTokens = 0
     for (const k of keys) {
       totalRequests += k.usage.totalRequests
       // ?? 0 兜底：token 字段是后加的，旧持久化的 key 可能缺这两个字段，
       // 直接相加会得到 NaN 并污染整份用量响应。
       totalInputTokens += k.usage.totalInputTokens ?? 0
       totalOutputTokens += k.usage.totalOutputTokens ?? 0
+      totalCacheReadTokens += k.usage.totalCacheReadTokens ?? 0
+      totalCacheWriteTokens += k.usage.totalCacheWriteTokens ?? 0
       for (const [day, d] of Object.entries(k.usage.daily || {})) {
         if (!dailyAgg[day]) dailyAgg[day] = { requests: 0, credits: 0, inputTokens: 0, outputTokens: 0 }
         dailyAgg[day].requests += d.requests ?? 0
@@ -2856,17 +2866,27 @@ export class ProxyServer {
     const totalCredits = effModelSum
 
     // 最近 50 条请求明细（按时间倒序）；credits 换算成实扣值（× 模型倍率）。
+    // input 拆成 uncached / cacheRead / cacheWrite，让客户看懂"input 很大但扣费少"——
+    // 大头通常是 cacheRead，其计费远低于普通 input。uncached 兜底不为负。
     const recentHistory = historyAll
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, 50)
-      .map(r => ({
-        timestamp: r.timestamp,
-        model: r.model,
-        effort: r.effort || 'none',
-        inputTokens: r.inputTokens,
-        outputTokens: r.outputTokens,
-        credits: r.credits * this.modelMarkupFor(r.model)
-      }))
+      .map(r => {
+        const cacheRead = r.cacheReadTokens ?? 0
+        const cacheWrite = r.cacheWriteTokens ?? 0
+        const uncached = Math.max(0, r.inputTokens - cacheRead - cacheWrite)
+        return {
+          timestamp: r.timestamp,
+          model: r.model,
+          effort: r.effort || 'none',
+          inputTokens: r.inputTokens,
+          uncachedInputTokens: uncached,
+          cacheReadTokens: cacheRead,
+          cacheWriteTokens: cacheWrite,
+          outputTokens: r.outputTokens,
+          credits: r.credits * this.modelMarkupFor(r.model)
+        }
+      })
 
     this.sendJson(res, 200, {
       creditBalance: customer.creditBalance,
@@ -2874,6 +2894,8 @@ export class ProxyServer {
       totalRequests,
       totalInputTokens,
       totalOutputTokens,
+      totalCacheReadTokens,
+      totalCacheWriteTokens,
       daily,
       byModel,
       byEffort,
@@ -3530,7 +3552,7 @@ export class ProxyServer {
         this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         // 记录 API Key 用量
         if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions', ProxyServer.deriveEffortLevel(request))
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions', ProxyServer.deriveEffortLevel(request), result.usage.cacheReadTokens, result.usage.cacheWriteTokens)
         }
       }
     } catch (error) {
@@ -3657,7 +3679,7 @@ export class ProxyServer {
         this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
         this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest))
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest), result.usage.cacheReadTokens, result.usage.cacheWriteTokens)
         }
         return
       }
@@ -3688,7 +3710,7 @@ export class ProxyServer {
       this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
       this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
       if (matchedApiKey) {
-        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest))
+        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest), result.usage.cacheReadTokens, result.usage.cacheWriteTokens)
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
@@ -3792,7 +3814,7 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions', effort)
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions', effort, usage.cacheReadTokens, usage.cacheWriteTokens)
           }
 
           // 发送结束 chunk（包含完整 usage 信息）
@@ -4067,7 +4089,7 @@ export class ProxyServer {
     this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: loop.usage.inputTokens + loop.usage.outputTokens, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime })
     this.recordRequest({ path: '/v1/messages', model: request.model, accountId: account.id, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime, success: true })
     if (matchedApiKey) {
-      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages', ProxyServer.deriveEffortLevel(request))
+      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages', ProxyServer.deriveEffortLevel(request), loop.usage.cacheReadTokens, loop.usage.cacheWriteTokens)
     }
 
     if (!request.stream) {
@@ -4375,7 +4397,7 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort)
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort, usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens)
           }
 
           // 成功后更新 prompt cache tracker
@@ -5067,10 +5089,10 @@ const PORTAL_HTML = `<!doctype html>
 
       <h2>ประวัติการใช้งานล่าสุด</h2>
       <div class="card">
-        <div class="muted" style="margin-bottom:8px">50 รายการล่าสุด · credits คือยอดที่หักจริง (รวมเรตของแต่ละโมเดลแล้ว)</div>
+        <div class="muted" style="margin-bottom:8px">50 รายการล่าสุด · credits คือยอดที่หักจริง · input แยกเป็น ปกติ / cache-read / cache-write (cache-read คิดถูกกว่ามาก)</div>
         <div style="overflow-x:auto">
           <table>
-            <thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">tokens (in/out)</th><th class="num">credits</th></tr></thead>
+            <thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">input (ปกติ/cache-r/cache-w)</th><th class="num">output</th><th class="num">credits</th></tr></thead>
             <tbody id="historyRows"></tbody>
           </table>
         </div>
@@ -5586,11 +5608,18 @@ const PORTAL_HTML = `<!doctype html>
     }
     $('historyEmpty').textContent = '';
     hist.forEach(function(rec){
+      // input 三段：ปกติ(uncached) / cache-read / cache-write；旧记录无拆分字段时 uncached 兜底为 inputTokens
+      var uncached = (rec.uncachedInputTokens != null) ? rec.uncachedInputTokens : rec.inputTokens;
+      var cr = rec.cacheReadTokens || 0;
+      var cw = rec.cacheWriteTokens || 0;
+      var inputCell = fmtTokens(uncached) + ' / ' + fmtTokens(cr) + ' / ' + fmtTokens(cw);
+      var inputTitle = 'input ปกติ: ' + fmtInt(uncached) + '\\ncache-read: ' + fmtInt(cr) + '\\ncache-write: ' + fmtInt(cw) + '\\nรวม input: ' + fmtInt(rec.inputTokens);
       var tr = document.createElement('tr');
       tr.innerHTML = '<td class="muted">'+esc(fmtTime(rec.timestamp))+'</td>'
         + '<td>'+esc(displayModelName(rec.model))+'</td>'
         + '<td>'+esc(effortLabel(rec.effort||'none'))+'</td>'
-        + '<td class="num">'+fmtTokens(rec.inputTokens)+' / '+fmtTokens(rec.outputTokens)+'</td>'
+        + '<td class="num" title="'+esc(inputTitle)+'">'+inputCell+'</td>'
+        + '<td class="num">'+fmtTokens(rec.outputTokens)+'</td>'
         + '<td class="num">'+fmt(rec.credits)+'</td>';
       rows.appendChild(tr);
     });
