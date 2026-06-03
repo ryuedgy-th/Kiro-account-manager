@@ -713,9 +713,9 @@ export interface ProxyConfig {
 export interface PricingConfig {
   /** 计费层总开关。未开启（默认）= 完全沿用旧逻辑：扣减原始 credit、门户按 credit 显示。 */
   enabled?: boolean
-  /** 对客户的售价：每 credit 多少泰铢（用于充值换算与门户金额显示）。默认 0.42。 */
+  /** 对客户的售价：每 credit 多少泰铢（用于充值换算与门户金额显示）。默认 0.47。 */
   bahtPerCredit?: number
-  /** 你的成本：每 credit 多少泰铢（仅用于后台毛利显示，不影响扣费）。默认 0.16。 */
+  /** 你的成本：每 credit 多少泰铢（仅用于后台毛利显示，不影响扣费）。默认 0.11（1100฿/10000 credits, Kiro Power）。 */
   costPerCredit?: number
   /** 美元兑泰铢汇率（用于把 Kiro 官方美元价换算成泰铢做对比）。默认 36。 */
   usdToBaht?: number

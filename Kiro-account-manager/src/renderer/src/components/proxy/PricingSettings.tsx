@@ -19,8 +19,8 @@ interface PricingConfig {
 
 const DEFAULTS: Required<Omit<PricingConfig, 'modelMarkup'>> = {
   enabled: false,
-  bahtPerCredit: 0.42,
-  costPerCredit: 0.16,
+  bahtPerCredit: 0.47,
+  costPerCredit: 0.11,
   usdToBaht: 36,
   gatewayFeePct: 0,
   kiroRetailUsdPerCredit: 0.02
@@ -164,8 +164,8 @@ export function PricingSettings() {
         ) : (
           <>
             <div className="grid grid-cols-2 gap-3">
-              {numField('bahtPerCredit', t('Sell price (฿/credit)', '售价（฿/credit）'), '0.01', '0.42')}
-              {numField('costPerCredit', t('Your cost (฿/credit)', '成本（฿/credit）'), '0.01', '0.16')}
+              {numField('bahtPerCredit', t('Sell price (฿/credit)', '售价（฿/credit）'), '0.01', '0.47')}
+              {numField('costPerCredit', t('Your cost (฿/credit)', '成本（฿/credit）'), '0.01', '0.11')}
               {numField('gatewayFeePct', t('Payment gateway fee (%)', '支付网关费（%）'), '0.1', '0')}
               {numField('usdToBaht', t('USD → THB rate', '美元兑泰铢汇率'), '0.1', '36')}
             </div>

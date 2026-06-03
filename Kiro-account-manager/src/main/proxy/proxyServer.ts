@@ -1937,7 +1937,7 @@ export class ProxyServer {
     if (!p || p.enabled !== true) return { enabled: false }
     return {
       enabled: true,
-      bahtPerCredit: typeof p.bahtPerCredit === 'number' && p.bahtPerCredit > 0 ? p.bahtPerCredit : 0.42,
+      bahtPerCredit: typeof p.bahtPerCredit === 'number' && p.bahtPerCredit > 0 ? p.bahtPerCredit : 0.47,
       usdToBaht: typeof p.usdToBaht === 'number' && p.usdToBaht > 0 ? p.usdToBaht : 36,
       kiroRetailUsdPerCredit: typeof p.kiroRetailUsdPerCredit === 'number' && p.kiroRetailUsdPerCredit > 0 ? p.kiroRetailUsdPerCredit : 0.02,
       modelMarkup: p.modelMarkup || {}
@@ -4846,38 +4846,55 @@ const PORTAL_HTML = `<!doctype html>
 <title>API Portal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg:#070b16; --bg2:#0f172a; --card:#121a2e; --card2:#16203a;
-    --border:#202b45; --border2:#2c3a5c; --txt:#f1f5fb; --txt2:#c4cee0; --muted:#7e8aa6;
-    --accent:#10b981; --accent2:#34d399; --accent3:#6ee7b7; --accent-dim:rgba(16,185,129,.10);
-    --blue:#60a5fa; --danger:#fb7185; --ok:#10b981; --warn:#fbbf24;
-    --radius:18px; --shadow:0 10px 40px -12px rgba(0,0,0,.55);
+    --bg:#eef2f1; --bg2:#e7edec; --shell:#ffffff; --card:#ffffff; --card-soft:#f5f8f7;
+    --border:#e7ecf1; --border2:#dde4ea; --txt:#0f1b2d; --txt2:#46566b; --muted:#5a6675;
+    --accent:#10b981; --accent2:#34d399; --accent3:#6ee7b7; --accent-d:#059669; --accent-dd:#047857;
+    --accent-ink:#04231a; --accent-dim:rgba(16,185,129,.10);
+    --blue:#3b82f6; --danger:#e11d48; --ok:#10b981; --warn:#f59e0b;
+    --radius:22px; --shadow:0 1px 3px rgba(15,27,45,.06);
   }
   * { box-sizing:border-box; }
   html { scroll-behavior:smooth; }
   body {
     margin:0; color:var(--txt);
-    font-family:"Inter","IBM Plex Sans Thai",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    background:
-      radial-gradient(900px 500px at 85% -5%, rgba(52,211,153,.10), transparent 60%),
-      radial-gradient(900px 500px at 10% 0%, rgba(96,165,250,.08), transparent 55%),
-      var(--bg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","IBM Plex Sans Thai",Roboto,sans-serif;
+    background:var(--bg);
     min-height:100vh; -webkit-font-smoothing:antialiased; line-height:1.5;
   }
-  .wrap { max-width:1080px; margin:0 auto; padding:26px 22px 70px; }
-  .grid2 { display:grid; grid-template-columns:1.5fr 1fr; gap:18px; align-items:start; }
-  @media (max-width:780px){ .grid2 { grid-template-columns:1fr; } }
 
-  /* ===== sticky top nav ===== */
-  .nav { position:sticky; top:0; z-index:50; backdrop-filter:saturate(180%) blur(14px); background:rgba(7,11,22,.72); border-bottom:1px solid var(--border); }
-  .nav-inner { max-width:1080px; margin:0 auto; padding:13px 22px; display:flex; align-items:center; justify-content:space-between; gap:12px; }
-  .brand-row { display:flex; align-items:center; gap:11px; font-weight:700; font-size:16px; letter-spacing:-.01em; }
-  .nav-user { display:flex; align-items:center; gap:12px; }
-  .nav-user .meta { text-align:right; line-height:1.25; }
-  .nav-user .meta .nm { font-size:13px; font-weight:600; }
-  .nav-user .meta .sb { font-size:11px; color:var(--muted); }
+  /* ===== app shell (sidebar + main), big rounded container ===== */
+  .shell {
+    max-width:1240px; margin:22px auto; min-height:calc(100vh - 44px);
+    display:grid; grid-template-columns:248px 1fr;
+    background:var(--shell); border:1px solid var(--border); border-radius:28px;
+    box-shadow:var(--shadow); overflow:hidden;
+  }
+  .sidebar { border-right:1px solid var(--border); padding:24px 18px; display:flex; flex-direction:column; gap:6px; background:#fbfdfc; }
+  .brand-row { display:flex; align-items:center; gap:11px; font-weight:800; font-size:17px; letter-spacing:-.01em; padding:2px 6px 18px; }
+  .profile { display:flex; flex-direction:column; align-items:center; text-align:center; gap:8px; padding:14px 8px 18px; border-bottom:1px solid var(--border); margin-bottom:10px; }
+  .profile .avatar { width:62px; height:62px; font-size:24px; border-radius:50%; }
+  .profile .pname { font-weight:700; font-size:15px; margin-top:4px; }
+  .profile .pmail { font-size:12px; color:var(--muted); word-break:break-all; }
+  .nav { display:flex; flex-direction:column; gap:4px; flex:1; }
+  .nav-item {
+    display:flex; align-items:center; gap:12px; width:100%; text-align:left;
+    padding:11px 14px; border:none; border-radius:13px; background:transparent;
+    color:var(--txt2); font-size:14px; font-weight:600; cursor:pointer; transition:background .15s,color .15s;
+  }
+  .nav-item svg { width:19px; height:19px; flex-shrink:0; opacity:.85; }
+  .nav-item:hover { background:var(--card-soft); color:var(--txt); }
+  .nav-item.on { background:var(--accent-dim); color:var(--accent-d); }
+  .nav-item.on svg { opacity:1; }
+  .logout { margin-top:10px; }
+
+  .main { padding:30px 34px 48px; min-width:0; }
+  .topgreet { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:24px; flex-wrap:wrap; }
+  .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:18px; align-items:start; }
+  @media (max-width:1080px){ .shell { grid-template-columns:1fr; margin:0; border-radius:0; min-height:100vh; } .sidebar { flex-direction:row; flex-wrap:wrap; border-right:none; border-bottom:1px solid var(--border); align-items:center; gap:10px; } .profile { flex-direction:row; border:none; padding:0; margin:0; gap:10px; text-align:left; } .profile .avatar { width:40px; height:40px; font-size:16px; } .nav { flex-direction:row; flex-wrap:wrap; flex:1 1 100%; } .nav-item { width:auto; } .main { padding:22px 18px 60px; } }
+  @media (max-width:720px){ .grid2 { grid-template-columns:1fr; } }
 
   /* ===== per-model price compare (MaxPlus line items) ===== */
   .price-row { display:grid; grid-template-columns:84px 1fr auto; align-items:center; gap:12px; padding:13px 4px; border-bottom:1px solid var(--border); }
@@ -4885,96 +4902,97 @@ const PORTAL_HTML = `<!doctype html>
   .price-row .pk { font-weight:600; font-size:14px; color:var(--txt2); }
   .price-row .pv .from { color:var(--muted); text-decoration:line-through; font-size:13px; font-variant-numeric:tabular-nums; }
   .price-row .pv .arrow { color:var(--muted); margin:0 7px; }
-  .price-row .pv .to { font-weight:700; font-size:15px; color:var(--accent2); font-variant-numeric:tabular-nums; }
+  .price-row .pv .to { font-weight:700; font-size:15px; color:var(--accent-d); font-variant-numeric:tabular-nums; }
   .price-row .pv .subc { display:block; font-size:11px; color:var(--muted); margin-top:2px; }
-  .price-row .badge { font-size:12px; font-weight:700; color:var(--accent2); background:var(--accent-dim); padding:4px 9px; border-radius:8px; white-space:nowrap; }
+  .price-row .badge { font-size:12px; font-weight:700; color:var(--accent-d); background:var(--accent-dim); padding:4px 9px; border-radius:8px; white-space:nowrap; }
   .price-foot { font-size:11px; color:var(--muted); margin-top:12px; }
-  .seg { display:inline-flex; gap:2px; padding:3px; background:rgba(0,0,0,.25); border:1px solid var(--border); border-radius:11px; }
+  .seg { display:inline-flex; gap:2px; padding:3px; background:var(--card-soft); border:1px solid var(--border); border-radius:11px; }
   .seg button { padding:7px 14px; border-radius:8px; font-size:13px; font-weight:600; background:transparent; color:var(--muted); box-shadow:none; }
-  .seg button.on { background:var(--accent); color:#04231a; box-shadow:0 2px 8px -2px rgba(16,185,129,.5); }
-  .est-tag { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:6px; background:rgba(251,191,36,.15); color:var(--warn); margin-left:8px; vertical-align:middle; }
-  .act-tag { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:6px; background:rgba(16,185,129,.15); color:var(--accent2); margin-left:8px; vertical-align:middle; }
+  .seg button.on { background:var(--accent); color:var(--accent-ink); box-shadow:0 2px 8px -3px rgba(16,185,129,.6); }
+  .est-tag { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:6px; background:rgba(245,158,11,.14); color:var(--warn); margin-left:8px; vertical-align:middle; }
+  .act-tag { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:6px; background:var(--accent-dim); color:var(--accent-d); margin-left:8px; vertical-align:middle; }
   .empty { color:var(--muted); font-size:13px; padding:6px 0; }
-  h1 { font-size:24px; font-weight:800; margin:0; letter-spacing:-.02em; }
-  h2 { font-size:12px; margin:28px 0 12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+  h1 { font-size:26px; font-weight:800; margin:0; letter-spacing:-.02em; }
+  h2 { font-size:12px; margin:26px 0 12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-weight:700; }
   .card {
-    background:linear-gradient(180deg, var(--card2), var(--card));
-    border:1px solid var(--border); border-radius:16px; padding:20px; margin-bottom:16px;
-    box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.25);
+    background:var(--card);
+    border:1px solid var(--border); border-radius:18px; padding:20px; margin-bottom:16px;
   }
   label { display:block; font-size:13px; color:var(--muted); margin:12px 0 5px; font-weight:500; }
   input {
-    width:100%; padding:12px 14px; border:1px solid var(--border2); border-radius:10px;
-    background:#0a1120; color:var(--txt); font-size:15px; transition:border-color .15s, box-shadow .15s;
+    width:100%; padding:12px 14px; border:1px solid var(--border2); border-radius:11px;
+    background:#fbfdfc; color:var(--txt); font-size:15px; transition:border-color .15s, box-shadow .15s;
   }
-  input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+  input::placeholder { color:#aab4c2; }
+  input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); background:#fff; }
   button {
-    padding:11px 18px; border:none; border-radius:10px;
-    background:linear-gradient(180deg, var(--accent2), var(--accent)); color:#04231a;
-    font-size:14px; font-weight:600; cursor:pointer; transition:transform .08s, opacity .15s;
+    padding:11px 18px; border:none; border-radius:11px;
+    background:var(--accent-dd); color:#fff;
+    font-size:14px; font-weight:700; cursor:pointer; transition:opacity .15s, transform .08s;
   }
-  button:hover { opacity:.92; } button:active { transform:translateY(1px); }
-  button.secondary { background:rgba(255,255,255,.06); color:var(--txt); border:1px solid var(--border2); }
-  button.danger { background:rgba(244,63,94,.12); color:var(--danger); border:1px solid rgba(244,63,94,.3); }
+  button:hover { opacity:.94; } button:active { transform:translateY(1px); }
+  button.secondary { background:#fff; color:var(--txt2); border:1px solid var(--border2); box-shadow:none; }
+  button.secondary:hover { background:var(--card-soft); }
+  button.danger { background:rgba(225,29,72,.08); color:var(--danger); border:1px solid rgba(225,29,72,.22); box-shadow:none; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 
-  /* hero balance */
+  /* hero balance — flat white card, color only on the number (10% rule) */
   .hero {
-    background:
-      radial-gradient(600px 200px at 100% 0%, rgba(16,185,129,.10), transparent 70%),
-      linear-gradient(180deg, var(--card2), var(--card));
-    border:1px solid var(--border); border-radius:20px; padding:26px;
+    background:var(--card);
+    border:1px solid var(--border); border-radius:18px; padding:28px; color:var(--txt);
     position:relative; overflow:hidden;
   }
-  .hero .lbl { font-size:13px; color:var(--muted); margin-bottom:6px; }
-  .balance { font-size:46px; font-weight:800; line-height:1; letter-spacing:-.02em; }
+  .hero .lbl { font-size:13px; color:var(--muted); margin-bottom:8px; position:relative; }
+  .balance { font-size:48px; font-weight:800; line-height:1; letter-spacing:-.02em; color:var(--accent-d); position:relative; }
   .balance.low { color:var(--danger); }
   .balance .unit { font-size:18px; font-weight:600; color:var(--muted); margin-left:6px; }
-  .balance-baht { font-size:17px; color:var(--accent2); margin-top:10px; font-weight:600; }
+  .balance-baht { font-size:17px; color:var(--txt); margin-top:12px; font-weight:700; position:relative; }
+  .hero .note { font-size:13px; color:var(--muted); margin-top:10px; position:relative; }
 
   .muted { color:var(--muted); font-size:13px; }
   .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; }
   .stat {
-    background:rgba(255,255,255,.025); border:1px solid var(--border); border-radius:12px; padding:14px 16px;
+    background:var(--card-soft); border:1px solid var(--border); border-radius:14px; padding:15px 16px;
   }
-  .stat .v { font-size:22px; font-weight:700; letter-spacing:-.01em; }
+  .stat .v { font-size:23px; font-weight:800; letter-spacing:-.01em; }
   .stat .k { font-size:12px; color:var(--muted); margin-top:3px; }
-  .stat.accent { background:var(--accent-dim); border-color:rgba(16,185,129,.25); }
-  .stat.accent .v { color:var(--accent2); }
+  .stat.accent { background:var(--accent-dim); border-color:rgba(16,185,129,.22); }
+  .stat.accent .v { color:var(--accent-d); }
 
   /* savings bar (MaxPlus-style) */
   .savings { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-  .savings .pct { font-size:34px; font-weight:800; color:var(--accent2); line-height:1; }
+  .savings .pct { font-size:34px; font-weight:800; color:var(--accent-d); line-height:1; }
   .savings .old { color:var(--muted); text-decoration:line-through; font-size:15px; }
   .savings .new { font-size:26px; font-weight:800; }
-  .savings-track { height:8px; border-radius:999px; background:rgba(255,255,255,.07); margin-top:14px; overflow:hidden; }
-  .savings-fill { height:100%; background:linear-gradient(90deg, var(--accent), var(--accent2)); border-radius:999px; }
-  .chip { display:inline-block; font-size:12px; font-weight:700; padding:3px 10px; border-radius:999px; background:var(--accent); color:#04231a; }
+  .savings-track { height:8px; border-radius:999px; background:rgba(15,27,45,.07); margin-top:14px; overflow:hidden; }
+  .savings-fill { height:100%; background:linear-gradient(90deg, var(--accent-d), var(--accent2)); border-radius:999px; }
+  .chip { display:inline-block; font-size:12px; font-weight:700; padding:3px 10px; border-radius:999px; background:var(--accent-dim); color:var(--accent-d); }
 
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:11px 8px; border-bottom:1px solid var(--border); }
-  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  th { color:var(--muted); font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
   tr:last-child td { border-bottom:none; }
   td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
-  code { background:#0a1120; padding:3px 7px; border-radius:6px; font-size:12px; word-break:break-all; border:1px solid var(--border); }
+  code { background:var(--card-soft); padding:3px 7px; border-radius:6px; font-size:12px; word-break:break-all; border:1px solid var(--border); color:var(--txt2); }
   .hide { display:none; }
   .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
-  .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.35); border-radius:10px; padding:14px; margin-top:12px; }
+  .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.3); border-radius:12px; padding:14px; margin-top:12px; color:var(--accent-d); font-weight:600; }
+  .keybox code { background:#fff; color:var(--txt); }
   .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
-  .logo { width:36px; height:36px; border-radius:11px; flex-shrink:0; background:linear-gradient(135deg,var(--accent3),var(--accent),var(--blue)); display:inline-flex; align-items:center; justify-content:center; font-size:19px; color:#04231a; box-shadow:0 4px 14px rgba(16,185,129,.4); }
-  .avatar { width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg,var(--accent2),var(--blue)); display:inline-flex; align-items:center; justify-content:center; font-weight:700; color:#04231a; font-size:15px; flex-shrink:0; }
-  .who { display:flex; align-items:center; gap:10px; margin-top:14px; }
+  .logo { width:34px; height:34px; border-radius:11px; flex-shrink:0; background:var(--accent-dim); display:inline-flex; align-items:center; justify-content:center; font-size:18px; color:var(--accent-d); }
+  .avatar { width:36px; height:36px; border-radius:50%; background:var(--accent-dim); display:inline-flex; align-items:center; justify-content:center; font-weight:800; color:var(--accent-d); font-size:15px; flex-shrink:0; }
   .pill { display:inline-block; font-size:11px; padding:2px 9px; border-radius:999px; font-weight:600; }
-  .pill.ok { background:rgba(16,185,129,.15); color:var(--accent2); }
+  .pill.ok { background:var(--accent-dim); color:var(--accent-d); }
   .pill.warn { background:rgba(245,158,11,.15); color:var(--warn); }
   .chart { width:100%; height:130px; display:block; }
   .chart-empty { color:var(--muted); font-size:13px; padding:30px 0; text-align:center; }
   .legend { font-size:12px; color:var(--muted); margin-top:8px; }
   .login-center { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; }
   .login-card { width:100%; max-width:400px; }
+  .login-card .card { box-shadow:var(--shadow); border-radius:20px; padding:24px; }
   .brand { text-align:center; margin-bottom:24px; }
-  .brand .logo { width:58px; height:58px; border-radius:16px; margin:0 auto 14px; font-size:28px; }
+  .brand .logo { width:58px; height:58px; border-radius:18px; margin:0 auto 14px; font-size:28px; }
   .brand .bt { font-size:22px; font-weight:800; letter-spacing:-.02em; }
   .brand .bd { font-size:13px; color:var(--muted); margin-top:5px; }
 </style>
@@ -5004,64 +5022,167 @@ const PORTAL_HTML = `<!doctype html>
 
   <!-- Dashboard view -->
   <div id="dashView" class="hide">
-    <div class="nav">
-      <div class="nav-inner">
+    <div class="shell">
+      <!-- sidebar -->
+      <aside class="sidebar">
         <div class="brand-row"><span class="logo">⚡</span> API Portal</div>
-        <div class="nav-user">
-          <div class="meta">
-            <div class="nm" id="whoami"></div>
-            <div class="sb">บัญชีลูกค้า</div>
-          </div>
+        <div class="profile">
           <span class="avatar" id="avatar">–</span>
-          <button class="secondary" id="logoutBtn">ออกจากระบบ</button>
+          <div class="pname" id="whoName">–</div>
+          <div class="pmail" id="whoami"></div>
         </div>
-      </div>
-    </div>
+        <nav class="nav">
+          <button class="nav-item on" data-tab="overview">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+            ภาพรวม
+          </button>
+          <button class="nav-item" data-tab="keys">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 19 4"/><path d="M16 7l3 3"/><path d="M14 9l3 3"/></svg>
+            API Keys
+          </button>
+          <button class="nav-item" data-tab="usage">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 3 4-5"/></svg>
+            การใช้งาน
+          </button>
+          <button class="nav-item" data-tab="pricing">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+            ราคา
+          </button>
+        </nav>
+        <button class="secondary logout" id="logoutBtn">ออกจากระบบ</button>
+      </aside>
 
-    <div class="wrap">
-      <div class="grid2">
-        <!-- left column -->
-        <div>
-          <div class="hero">
-            <div class="lbl">เครดิตคงเหลือ</div>
-            <div class="balance" id="balance">–</div>
-            <div class="balance-baht" id="balanceValue"></div>
-            <div class="muted" id="balanceNote" style="margin-top:10px">เติมเครดิตติดต่อแอดมิน</div>
+      <!-- main -->
+      <main class="main">
+        <div class="topgreet">
+          <div>
+            <h1 id="greetTitle">สวัสดี 👋</h1>
+            <div class="muted" id="greetSub">ภาพรวมบัญชีและการใช้งานของคุณ</div>
           </div>
-
-          <div class="stats" style="margin-bottom:18px">
-            <div class="stat"><div class="v" id="sumRequests">–</div><div class="k">requests รวม</div></div>
-            <div class="stat accent"><div class="v" id="sumCredits">–</div><div class="k">credits ที่ใช้</div></div>
-            <div class="stat" id="spentStat" style="display:none"><div class="v" id="priceSpent">–</div><div class="k">ใช้ไปแล้ว (฿)</div></div>
-            <div class="stat"><div class="v" id="sumInput">–</div><div class="k">input tokens</div></div>
-            <div class="stat"><div class="v" id="sumOutput">–</div><div class="k">output tokens</div></div>
-          </div>
-
-          <div class="card">
-            <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">แนวโน้มการใช้ credit</strong><span class="muted">14 วันล่าสุด</span></div>
-            <div id="trendWrap"><svg class="chart" id="trendChart" preserveAspectRatio="none"></svg></div>
-            <div class="legend" id="trendLegend"></div>
-          </div>
+          <span class="pill ok" id="balancePill" style="font-size:13px; padding:7px 14px">–</span>
         </div>
 
-        <!-- right column -->
-        <div>
-          <div id="savingsCard" class="card hide" style="background:linear-gradient(160deg, rgba(16,185,129,.16), rgba(16,185,129,.04)); border-color:rgba(16,185,129,.30)">
-            <div class="savings">
-              <div>
-                <div class="muted" style="font-size:12px">ประหยัด · เทียบราคาทางการ</div>
-                <div style="margin-top:4px"><span class="pct" id="savePct">–</span></div>
-                <div style="margin-top:6px"><span class="chip" id="saveX"></span></div>
+        <!-- ===== TAB: Overview ===== -->
+        <section class="tab" data-panel="overview">
+          <div class="grid2">
+            <div>
+              <div class="hero">
+                <div class="lbl">เครดิตคงเหลือ</div>
+                <div class="balance" id="balance">–</div>
+                <div class="balance-baht" id="balanceValue"></div>
+                <div class="note" id="balanceNote">เติมเครดิตติดต่อแอดมิน</div>
               </div>
-              <div style="text-align:right">
-                <div class="old" id="saveOld"></div>
-                <div class="new" id="saveNew"></div>
+
+              <div class="stats" style="margin:18px 0">
+                <div class="stat"><div class="v" id="sumRequests">–</div><div class="k">requests รวม</div></div>
+                <div class="stat accent"><div class="v" id="sumCredits">–</div><div class="k">credits ที่ใช้</div></div>
+                <div class="stat" id="spentStat" style="display:none"><div class="v" id="priceSpent">–</div><div class="k">ใช้ไปแล้ว (฿)</div></div>
+                <div class="stat"><div class="v" id="sumInput">–</div><div class="k">input tokens</div></div>
+                <div class="stat"><div class="v" id="sumOutput">–</div><div class="k">output tokens</div></div>
+              </div>
+
+              <div class="card">
+                <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">แนวโน้มการใช้ credit</strong><span class="muted">14 วันล่าสุด</span></div>
+                <div id="trendWrap"><svg class="chart" id="trendChart" preserveAspectRatio="none"></svg></div>
+                <div class="legend" id="trendLegend"></div>
               </div>
             </div>
-            <div class="savings-track"><div class="savings-fill" id="saveFill" style="width:0%"></div></div>
-            <div class="muted" id="priceNote" style="margin-top:12px"></div>
+
+            <div>
+              <div id="savingsCard" class="card hide" style="background:var(--accent-dim); border-color:rgba(16,185,129,.20)">
+                <div class="savings">
+                  <div>
+                    <div class="muted" style="font-size:12px">ประหยัด · เทียบราคาทางการ</div>
+                    <div style="margin-top:4px"><span class="pct" id="savePct">–</span></div>
+                    <div style="margin-top:6px"><span class="chip" id="saveX"></span></div>
+                  </div>
+                  <div style="text-align:right">
+                    <div class="old" id="saveOld"></div>
+                    <div class="new" id="saveNew"></div>
+                  </div>
+                </div>
+                <div class="savings-track"><div class="savings-fill" id="saveFill" style="width:0%"></div></div>
+                <div class="muted" id="priceNote" style="margin-top:12px"></div>
+              </div>
+
+              <div class="card">
+                <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">API Keys ของคุณ</strong><button class="secondary" id="goKeysBtn" style="padding:7px 12px; font-size:12px">จัดการ</button></div>
+                <div class="empty" id="overviewKeysEmpty" style="display:none">ยังไม่มี API Key</div>
+                <table><tbody id="overviewKeyRows"></tbody></table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== TAB: Keys ===== -->
+        <section class="tab hide" data-panel="keys">
+          <div class="card">
+            <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">สร้าง API Key ใหม่</strong></div>
+            <div class="row">
+              <input id="keyName" placeholder="ชื่อ key (เช่น my-app)" style="flex:1; min-width:140px">
+              <input id="keyLimit" type="number" min="0" step="any" placeholder="ลิมิต credit (เว้นว่าง = ไม่จำกัด)" style="flex:1; min-width:140px">
+              <button id="createKeyBtn">สร้าง</button>
+            </div>
+            <div class="err" id="keyErr"></div>
+            <div id="newKeyBox"></div>
+          </div>
+          <div class="card">
+            <div class="topbar" style="margin-bottom:8px"><strong style="font-size:15px">รายการ Key</strong></div>
+            <div style="overflow-x:auto">
+              <table>
+                <thead><tr><th>ชื่อ</th><th>Key</th><th class="num">credits / ลิมิต</th><th></th></tr></thead>
+                <tbody id="keyRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== TAB: Usage ===== -->
+        <section class="tab hide" data-panel="usage">
+          <h2>ประวัติการใช้งานล่าสุด</h2>
+          <div class="card">
+            <div class="muted" style="margin-bottom:8px">50 รายการล่าสุด · credits คือยอดที่หักจริง · input แยกเป็น ปกติ / cache-read / cache-write (cache-read คิดถูกกว่ามาก)</div>
+            <div style="overflow-x:auto">
+              <table>
+                <thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">input (ปกติ/cache-r/cache-w)</th><th class="num">output</th><th class="num">credits</th></tr></thead>
+                <tbody id="historyRows"></tbody>
+              </table>
+            </div>
+            <div class="empty" id="historyEmpty"></div>
           </div>
 
+          <h2>การใช้งานต่อโมเดล</h2>
+          <div class="card">
+            <div style="overflow-x:auto">
+              <table>
+                <thead><tr><th>โมเดล</th><th class="num">requests</th><th class="num">credits</th><th class="num">tokens (in/out)</th></tr></thead>
+                <tbody id="modelRows"></tbody>
+              </table>
+            </div>
+            <div class="empty" id="modelEmpty"></div>
+          </div>
+
+          <h2>การใช้งานตามระดับ Effort</h2>
+          <div class="card">
+            <div class="muted" style="margin-bottom:8px">ระดับการคิด (reasoning) ที่ใช้ — ยิ่งสูงยิ่งใช้ credit มากขึ้นต่อคำขอ</div>
+            <table>
+              <thead><tr><th>effort</th><th class="num">requests</th><th class="num">credits</th><th class="num">เฉลี่ย/req</th></tr></thead>
+              <tbody id="effortRows"></tbody>
+            </table>
+            <div class="empty" id="effortEmpty"></div>
+          </div>
+
+          <h2>การใช้งานรายวัน</h2>
+          <div class="card">
+            <table>
+              <thead><tr><th>วันที่</th><th class="num">requests</th><th class="num">credits</th></tr></thead>
+              <tbody id="usageRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ===== TAB: Pricing ===== -->
+        <section class="tab hide" data-panel="pricing">
           <div id="priceCompareCard" class="card hide">
             <div class="topbar" style="margin-bottom:10px"><strong style="font-size:15px">ราคาต่อ 1M tokens</strong><span class="muted" id="priceCompareModel">Anthropic → เรา</span></div>
             <div class="seg" id="modelTabs"></div>
@@ -5070,71 +5191,19 @@ const PORTAL_HTML = `<!doctype html>
             <div class="price-foot" id="priceFoot"></div>
           </div>
 
+          <h2>อัตราค่าบริการ (ต่อโมเดล)</h2>
           <div class="card">
-            <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">API Keys</strong></div>
-            <div class="row">
-              <input id="keyName" placeholder="ชื่อ key (เช่น my-app)" style="flex:1; min-width:140px">
-              <input id="keyLimit" type="number" min="0" step="any" placeholder="ลิมิต credit (เว้นว่าง = ไม่จำกัด)" style="flex:1; min-width:140px">
-              <button id="createKeyBtn">สร้าง</button>
+            <div class="muted" style="margin-bottom:8px">อัตราที่ระบบใช้คิดเครดิต — โปร่งใส ตรงตามที่หักจริง</div>
+            <div style="overflow-x:auto">
+              <table>
+                <thead><tr><th>โมเดล</th><th class="num">official</th><th class="num">เฉลี่ย/req</th><th class="num">context</th></tr></thead>
+                <tbody id="rateRows"></tbody>
+              </table>
             </div>
-            <div class="err" id="keyErr"></div>
-            <div id="newKeyBox"></div>
-            <table style="margin-top:12px">
-              <thead><tr><th>ชื่อ</th><th>Key</th><th class="num">credits / ลิมิต</th><th></th></tr></thead>
-              <tbody id="keyRows"></tbody>
-            </table>
+            <div class="empty" id="rateEmpty"></div>
           </div>
-        </div>
-      </div>
-
-      <h2>ประวัติการใช้งานล่าสุด</h2>
-      <div class="card">
-        <div class="muted" style="margin-bottom:8px">50 รายการล่าสุด · credits คือยอดที่หักจริง · input แยกเป็น ปกติ / cache-read / cache-write (cache-read คิดถูกกว่ามาก)</div>
-        <div style="overflow-x:auto">
-          <table>
-            <thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">input (ปกติ/cache-r/cache-w)</th><th class="num">output</th><th class="num">credits</th></tr></thead>
-            <tbody id="historyRows"></tbody>
-          </table>
-        </div>
-        <div class="empty" id="historyEmpty"></div>
-      </div>
-
-      <h2>การใช้งานต่อโมเดล</h2>
-      <div class="card">
-        <table>
-          <thead><tr><th>โมเดล</th><th class="num">requests</th><th class="num">credits</th><th class="num">tokens (in/out)</th></tr></thead>
-          <tbody id="modelRows"></tbody>
-        </table>
-        <div class="empty" id="modelEmpty"></div>
-      </div>
-
-      <h2>การใช้งานตามระดับ Effort</h2>
-      <div class="card">
-        <div class="muted" style="margin-bottom:8px">ระดับการคิด (reasoning) ที่ใช้ — ยิ่งสูงยิ่งใช้ credit มากขึ้นต่อคำขอ</div>
-        <table>
-          <thead><tr><th>effort</th><th class="num">requests</th><th class="num">credits</th><th class="num">เฉลี่ย/req</th></tr></thead>
-          <tbody id="effortRows"></tbody>
-        </table>
-        <div class="empty" id="effortEmpty"></div>
-      </div>
-
-      <h2>อัตราค่าบริการ (ต่อโมเดล)</h2>
-      <div class="card">
-        <div class="muted" style="margin-bottom:8px">อัตราที่ระบบใช้คิดเครดิต — โปร่งใส ตรงตามที่หักจริง</div>
-        <table>
-          <thead><tr><th>โมเดล</th><th class="num">official</th><th class="num">เฉลี่ย/req</th><th class="num">context</th></tr></thead>
-          <tbody id="rateRows"></tbody>
-        </table>
-        <div class="empty" id="rateEmpty"></div>
-      </div>
-
-      <h2>การใช้งานรายวัน</h2>
-      <div class="card">
-        <table>
-          <thead><tr><th>วันที่</th><th class="num">requests</th><th class="num">credits</th></tr></thead>
-          <tbody id="usageRows"></tbody>
-        </table>
-      </div>
+        </section>
+      </main>
     </div>
   </div>
 </div>
@@ -5165,6 +5234,14 @@ const PORTAL_HTML = `<!doctype html>
   function show(view){
     $('loginView').classList.toggle('hide', view !== 'login');
     $('dashView').classList.toggle('hide', view !== 'dash');
+  }
+
+  // สลับแท็บใน dashboard (overview / keys / usage / pricing)
+  function selectTab(name){
+    var items = document.querySelectorAll('.nav-item[data-tab]');
+    Array.prototype.forEach.call(items, function(b){ b.classList.toggle('on', b.getAttribute('data-tab') === name); });
+    var panels = document.querySelectorAll('.tab[data-panel]');
+    Array.prototype.forEach.call(panels, function(p){ p.classList.toggle('hide', p.getAttribute('data-panel') !== name); });
   }
 
   function doLogin(){
@@ -5206,14 +5283,26 @@ const PORTAL_HTML = `<!doctype html>
     api('/portal/me').then(function(r){
       if (!r.ok){ logout(); return; }
       show('dash');
+      selectTab('overview');
       var c = r.data;
       pricing = (c && c.pricing) || { enabled: false };
-      $('whoami').textContent = c.email + (c.name ? ' ('+c.name+')' : '');
+      $('whoami').textContent = c.email || '';
+      var who = $('whoName');
+      if (who) who.textContent = c.name || (c.email ? c.email.split('@')[0] : 'ลูกค้า');
+      var gt = $('greetTitle');
+      if (gt) gt.textContent = 'สวัสดี ' + (c.name || (c.email ? c.email.split('@')[0] : '')) + ' 👋';
       var av = $('avatar');
       if (av) av.textContent = ((c.name || c.email || '?').trim()[0] || '?').toUpperCase();
       var bal = $('balance');
       bal.innerHTML = fmt(c.creditBalance) + '<span class="unit">credits</span>';
       bal.classList.toggle('low', c.creditBalance <= 0);
+      // pill ยอดคงเหลือมุมขวาบน
+      var pill = $('balancePill');
+      if (pill){
+        pill.textContent = fmt(c.creditBalance) + ' credits';
+        pill.className = 'pill ' + (c.creditBalance <= 0 ? 'warn' : 'ok');
+        pill.style.fontSize = '13px'; pill.style.padding = '7px 14px';
+      }
       // 启用计费时，把余额换算成泰铢显示在下方
       if (pricing.enabled && pricing.bahtPerCredit > 0){
         $('balanceValue').textContent = '≈ ฿' + fmtBaht(c.creditBalance * pricing.bahtPerCredit);
@@ -5232,8 +5321,9 @@ const PORTAL_HTML = `<!doctype html>
   function loadKeys(){
     api('/portal/keys').then(function(r){
       if (!r.ok) return;
+      var keys = r.data.keys || [];
       var rows = $('keyRows'); rows.innerHTML = '';
-      (r.data.keys || []).forEach(function(k){
+      keys.forEach(function(k){
         // credits ที่ใช้ / ลิมิต (ถ้ามี) — เกินลิมิตจะถูกระบบปฏิเสธ request อัตโนมัติ
         var used = fmt(k.totalCredits);
         var limitLabel = (k.creditsLimit != null && k.creditsLimit > 0)
@@ -5242,7 +5332,7 @@ const PORTAL_HTML = `<!doctype html>
         var tr = document.createElement('tr');
         tr.innerHTML = '<td>'+esc(k.name)+'</td><td><code>'+esc(k.keyMasked)+'</code></td>'
           + '<td class="num">'+esc(limitLabel)+'</td>'
-          + '<td style="white-space:nowrap">'
+          + '<td style="white-space:nowrap; text-align:right">'
           +   '<button class="secondary" data-edit="'+esc(k.id)+'" data-limit="'+(k.creditsLimit != null ? esc(k.creditsLimit) : '')+'">ลิมิต</button> '
           +   '<button class="danger" data-id="'+esc(k.id)+'">ลบ</button></td>';
         rows.appendChild(tr);
@@ -5253,6 +5343,28 @@ const PORTAL_HTML = `<!doctype html>
       Array.prototype.forEach.call(rows.querySelectorAll('button[data-edit]'), function(btn){
         btn.addEventListener('click', function(){ editKeyLimit(btn.getAttribute('data-edit'), btn.getAttribute('data-limit')); });
       });
+      renderOverviewKeys(keys);
+    });
+  }
+
+  // มินิลิสต์ key ในแท็บภาพรวม (อ่านอย่างเดียว — ปุ่มจัดการอยู่ในแท็บ Keys)
+  function renderOverviewKeys(keys){
+    var rows = $('overviewKeyRows'); if (!rows) return;
+    rows.innerHTML = '';
+    var empty = $('overviewKeysEmpty');
+    if (!keys.length){
+      if (empty) empty.style.display = '';
+      return;
+    }
+    if (empty) empty.style.display = 'none';
+    keys.slice(0, 5).forEach(function(k){
+      var used = fmt(k.totalCredits);
+      var limitLabel = (k.creditsLimit != null && k.creditsLimit > 0) ? used + ' / ' + fmt(k.creditsLimit) : used;
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>'+esc(k.name)+'</td>'
+        + '<td><code>'+esc(k.keyMasked)+'</code></td>'
+        + '<td class="num">'+esc(limitLabel)+'</td>';
+      rows.appendChild(tr);
     });
   }
 
@@ -5365,14 +5477,19 @@ const PORTAL_HTML = `<!doctype html>
 
   // ราคาทางการต่อ 1M tokens (USD) ของผู้ให้บริการต้นทาง — ใช้เป็น "ราคาก่อนลด" เทียบให้เห็นความคุ้ม
   // จัดกลุ่มตาม family ของชื่อโมเดล (opus/sonnet/haiku) ค่าที่ไม่เข้าเกณฑ์ใช้ default opus
+  // ราคาอ้างอิง Anthropic (ยืนยัน platform.claude.com มิ.ย. 2026):
+  //   Opus 4.5–4.8 = $5/$25 (cache write 1.25x=6.25, cache read 0.1x=0.50)
+  //   Sonnet 4.5/4.6 = $3/$15 ; Haiku 4.5 = $1/$5
+  //   (Opus 4.1 รุ่นเก่า $15/$75 ถูกปลดแล้ว — อย่าใช้ ไม่งั้น % ประหยัดจะสูงเกินจริง)
   var OFFICIAL_USD_1M = {
-    opus:   { Input:15, Output:75, 'Cache write':18.75, 'Cache read':1.5 },
+    opus:   { Input:5,  Output:25, 'Cache write':6.25,  'Cache read':0.5 },
     sonnet: { Input:3,  Output:15, 'Cache write':3.75,  'Cache read':0.3 },
     haiku:  { Input:1,  Output:5,  'Cache write':1.25,  'Cache read':0.1 }
   };
   // ประมาณการ credit ที่กินต่อ 1M input tokens (ใช้ตอนยังไม่มีข้อมูลใช้งานจริง)
-  // อิงข้อมูลจริง: Opus ~6.4 cr/1M input; family อื่น scale ตามสัดส่วนราคา Anthropic
-  var DEFAULT_CR_PER_1M_INPUT = { opus:6.4, sonnet:1.28, haiku:0.43 };
+  // อิงข้อมูลจริง: Opus ~9.3 cr/1M input (multiplier 2.2x); family อื่น scale ตาม Kiro multiplier
+  // (Sonnet 1.3x, Haiku 0.4x เทียบ Opus 2.2x)
+  var DEFAULT_CR_PER_1M_INPUT = { opus:9.3, sonnet:5.49, haiku:1.69 };
   function familyOf(name){
     var s = String(name||'').toLowerCase();
     if (s.indexOf('haiku') >= 0) return 'haiku';
@@ -5530,7 +5647,7 @@ const PORTAL_HTML = `<!doctype html>
       var x = pad + i*bw + bw*0.15;
       var y = H - pad - h;
       var w = bw*0.7;
-      bars += '<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+w.toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="#3b82f6"><title>'+esc(day)+': '+fmt(v)+' credits</title></rect>';
+      bars += '<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+w.toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="#10b981"><title>'+esc(day)+': '+fmt(v)+' credits</title></rect>';
     });
     svg.setAttribute('viewBox', '0 0 '+W+' '+H);
     svg.innerHTML = bars;
@@ -5566,6 +5683,11 @@ const PORTAL_HTML = `<!doctype html>
   function effortLabel(e){
     var map = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max' };
     return map[e] || e;
+  }
+  // แถบสีซ้ายของแถวประวัติ — ยิ่ง effort สูง โทนยิ่งเข้ม/ร้อน (none=เทาจาง)
+  function effortColor(e){
+    var map = { none:'#dde4ea', minimal:'#93c5fd', low:'#60a5fa', medium:'#34d399', high:'#10b981', xhigh:'#f59e0b', max:'#e11d48' };
+    return map[e] || '#dde4ea';
   }
 
   function renderEffortUsage(){
@@ -5614,8 +5736,9 @@ const PORTAL_HTML = `<!doctype html>
       var cw = rec.cacheWriteTokens || 0;
       var inputCell = fmtTokens(uncached) + ' / ' + fmtTokens(cr) + ' / ' + fmtTokens(cw);
       var inputTitle = 'input ปกติ: ' + fmtInt(uncached) + '\\ncache-read: ' + fmtInt(cr) + '\\ncache-write: ' + fmtInt(cw) + '\\nรวม input: ' + fmtInt(rec.inputTokens);
+      var bar = effortColor(rec.effort||'none');
       var tr = document.createElement('tr');
-      tr.innerHTML = '<td class="muted">'+esc(fmtTime(rec.timestamp))+'</td>'
+      tr.innerHTML = '<td class="muted" style="border-left:3px solid '+bar+'; padding-left:10px">'+esc(fmtTime(rec.timestamp))+'</td>'
         + '<td>'+esc(displayModelName(rec.model))+'</td>'
         + '<td>'+esc(effortLabel(rec.effort||'none'))+'</td>'
         + '<td class="num" title="'+esc(inputTitle)+'">'+inputCell+'</td>'
@@ -5667,6 +5790,13 @@ const PORTAL_HTML = `<!doctype html>
   $('password').addEventListener('keydown', function(e){ if (e.key==='Enter') doLogin(); });
   $('logoutBtn').addEventListener('click', logout);
   $('createKeyBtn').addEventListener('click', createKey);
+
+  // แท็บ sidebar
+  Array.prototype.forEach.call(document.querySelectorAll('.nav-item[data-tab]'), function(btn){
+    btn.addEventListener('click', function(){ selectTab(btn.getAttribute('data-tab')); });
+  });
+  var goKeys = $('goKeysBtn');
+  if (goKeys) goKeys.addEventListener('click', function(){ selectTab('keys'); });
 
   if (token) loadDash(); else show('login');
 })();

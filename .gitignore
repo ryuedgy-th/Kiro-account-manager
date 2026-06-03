@@ -47,3 +47,6 @@ Kiro register
 **/.DS_Store
 .claude/
 **/.claude/
+# impeccable design skill (installed per-developer, not part of the product)
+.cursor/skills/
+.github/skills/
