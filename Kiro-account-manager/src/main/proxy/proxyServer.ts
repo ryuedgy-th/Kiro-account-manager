@@ -425,6 +425,41 @@ export class ProxyServer {
     return undefined
   }
 
+  /**
+   * 把不同客户端的「推理强度」归一化成统一档位，供用量记录/dashboard 展示。
+   * 目的：让 OpenAI（reasoning_effort: low/high）与 Claude Code（thinking.budget_tokens）
+   * 在同一张表里口径一致（Maxplus 风格的 effort 列）。
+   *
+   * 取值优先级：
+   *   1. 显式 effort 字符串（OpenAI reasoning_effort / Claude output_config.effort）→ 直接采用
+   *   2. thinking.type==='disabled' 或缺省 → 'none'
+   *   3. 仅有 thinking.budget_tokens → 按 token 预算映射到档位（阈值见下）
+   *
+   * 返回的档位是展示用文案，不回传给 Kiro 后端（后端枚举校验另由 translator 负责）。
+   */
+  static deriveEffortLevel(body: unknown): string {
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+
+    // 1. 显式 effort（两种 API 形态）
+    const explicit =
+      (b.reasoning_effort as string | undefined) ||
+      ((b.reasoning as Record<string, unknown> | undefined)?.effort as string | undefined) ||
+      ((b.output_config as Record<string, unknown> | undefined)?.effort as string | undefined)
+    if (typeof explicit === 'string' && explicit.trim()) return explicit.trim().toLowerCase()
+
+    // 2 & 3. thinking 字段
+    const thinking = b.thinking as { type?: string; budget_tokens?: number } | undefined
+    if (!thinking || thinking.type === 'disabled') return 'none'
+    // adaptive / enabled 但没给 budget → 视为开启但未指定强度
+    const budget = typeof thinking.budget_tokens === 'number' ? thinking.budget_tokens : undefined
+    if (budget === undefined) return thinking.type === 'enabled' || thinking.type === 'adaptive' ? 'medium' : 'none'
+    if (budget <= 0) return 'none'
+    if (budget < 6000) return 'low'
+    if (budget < 16000) return 'medium'
+    if (budget < 32000) return 'high'
+    return 'max'
+  }
+
   constructor(config: Partial<ProxyConfig> = {}, events: ProxyServerEvents = {}) {
     this.config = {
       enabled: false,
@@ -1909,7 +1944,7 @@ export class ProxyServer {
     }
   }
 
-  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string): void {
+  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string, effort?: string): void {
     if (!this.config.apiKeys) return
     const apiKey = this.config.apiKeys.find(k => k.id === apiKeyId)
     if (!apiKey) return
@@ -1947,6 +1982,19 @@ export class ProxyServer {
       apiKey.usage.byModel[model].outputTokens += outputTokens
     }
 
+    // 更新推理强度档位统计（effort 缺省时归到 'none'，保证旧客户端也有一致口径）
+    const effortKey = effort && effort.trim() ? effort.trim().toLowerCase() : 'none'
+    if (!apiKey.usage.byEffort) {
+      apiKey.usage.byEffort = {}
+    }
+    if (!apiKey.usage.byEffort[effortKey]) {
+      apiKey.usage.byEffort[effortKey] = { requests: 0, credits: 0, inputTokens: 0, outputTokens: 0 }
+    }
+    apiKey.usage.byEffort[effortKey].requests++
+    apiKey.usage.byEffort[effortKey].credits += credits
+    apiKey.usage.byEffort[effortKey].inputTokens += inputTokens
+    apiKey.usage.byEffort[effortKey].outputTokens += outputTokens
+
     // 添加用量历史记录（保留最近 100 条）
     if (!apiKey.usageHistory) {
       apiKey.usageHistory = []
@@ -1957,7 +2005,8 @@ export class ProxyServer {
       inputTokens,
       outputTokens,
       credits,
-      path: path || 'unknown'
+      path: path || 'unknown',
+      effort: effortKey
     })
     if (apiKey.usageHistory.length > 100) {
       apiKey.usageHistory = apiKey.usageHistory.slice(0, 100)
@@ -1988,13 +2037,14 @@ export class ProxyServer {
     accountId: string,
     usage: { credits?: number; inputTokens: number; outputTokens: number },
     model: string | undefined,
-    path: string
+    path: string,
+    effort?: string
   ): void {
     const credits = usage.credits || 0
     if (credits <= 0 && usage.inputTokens <= 0 && usage.outputTokens <= 0) return
     this.accountPool.recordSuccess(accountId, usage.inputTokens + usage.outputTokens)
     if (matchedApiKey) {
-      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path)
+      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path, effort)
     }
   }
 
@@ -2744,12 +2794,14 @@ export class ProxyServer {
     const dailyAgg: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
     // 按模型汇总（dashboard 展示每个模型用了多少 request / credit / token）
     const modelAgg: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
-    let totalCredits = 0
+    // 按推理强度档位汇总（Maxplus 风格：客户能看到每个 effort 用了多少）
+    const effortAgg: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
+    // 合并所有 Key 的最近请求历史（含 effort），供"最近用量"明细表
+    const historyAll: import('./types').ApiKeyUsageRecord[] = []
     let totalRequests = 0
     let totalInputTokens = 0
     let totalOutputTokens = 0
     for (const k of keys) {
-      totalCredits += k.usage.totalCredits
       totalRequests += k.usage.totalRequests
       // ?? 0 兜底：token 字段是后加的，旧持久化的 key 可能缺这两个字段，
       // 直接相加会得到 NaN 并污染整份用量响应。
@@ -2769,15 +2821,63 @@ export class ProxyServer {
         modelAgg[model].inputTokens += m.inputTokens ?? 0
         modelAgg[model].outputTokens += m.outputTokens ?? 0
       }
+      for (const [eff, e] of Object.entries(k.usage.byEffort || {})) {
+        if (!effortAgg[eff]) effortAgg[eff] = { requests: 0, credits: 0, inputTokens: 0, outputTokens: 0 }
+        effortAgg[eff].requests += e.requests ?? 0
+        effortAgg[eff].credits += e.credits ?? 0
+        effortAgg[eff].inputTokens += e.inputTokens ?? 0
+        effortAgg[eff].outputTokens += e.outputTokens ?? 0
+      }
+      for (const rec of k.usageHistory || []) historyAll.push(rec)
     }
+
+    // ── 把所有对客户展示的 credit 统一换算成「实际扣费 credit」（含模型加价倍率），
+    //    让 dashboard 的数字与余额扣减口径一致；不向客户暴露 markup 倍率本身。
+    //    byModel：每条只对应一个模型 → 精确乘该模型倍率。
+    //    daily / byEffort：跨模型混合 → 用 byModel 的「实扣/原始」混合比例缩放，保证总额一致。
+    let rawModelSum = 0
+    let effModelSum = 0
+    const byModel: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
+    for (const [model, m] of Object.entries(modelAgg)) {
+      const eff = m.credits * this.modelMarkupFor(model)
+      rawModelSum += m.credits
+      effModelSum += eff
+      byModel[model] = { requests: m.requests, credits: eff, inputTokens: m.inputTokens, outputTokens: m.outputTokens }
+    }
+    const blendedRatio = rawModelSum > 0 ? effModelSum / rawModelSum : 1
+    const daily: typeof dailyAgg = {}
+    for (const [day, d] of Object.entries(dailyAgg)) {
+      daily[day] = { requests: d.requests, credits: d.credits * blendedRatio, inputTokens: d.inputTokens, outputTokens: d.outputTokens }
+    }
+    const byEffort: typeof effortAgg = {}
+    for (const [eff, e] of Object.entries(effortAgg)) {
+      byEffort[eff] = { requests: e.requests, credits: e.credits * blendedRatio, inputTokens: e.inputTokens, outputTokens: e.outputTokens }
+    }
+    const totalCredits = effModelSum
+
+    // 最近 50 条请求明细（按时间倒序）；credits 换算成实扣值（× 模型倍率）。
+    const recentHistory = historyAll
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 50)
+      .map(r => ({
+        timestamp: r.timestamp,
+        model: r.model,
+        effort: r.effort || 'none',
+        inputTokens: r.inputTokens,
+        outputTokens: r.outputTokens,
+        credits: r.credits * this.modelMarkupFor(r.model)
+      }))
+
     this.sendJson(res, 200, {
       creditBalance: customer.creditBalance,
       totalCredits,
       totalRequests,
       totalInputTokens,
       totalOutputTokens,
-      daily: dailyAgg,
-      byModel: modelAgg,
+      daily,
+      byModel,
+      byEffort,
+      recentHistory,
       pricing: this.publicPricing()
     })
   }
@@ -3401,7 +3501,7 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal)
+        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal, ProxyServer.deriveEffortLevel(request))
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -3430,7 +3530,7 @@ export class ProxyServer {
         this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         // 记录 API Key 用量
         if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions')
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions', ProxyServer.deriveEffortLevel(request))
         }
       }
     } catch (error) {
@@ -3557,7 +3657,7 @@ export class ProxyServer {
         this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
         this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest))
         }
         return
       }
@@ -3588,7 +3688,7 @@ export class ProxyServer {
       this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
       this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
       if (matchedApiKey) {
-        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
+        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest))
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
@@ -3607,7 +3707,8 @@ export class ProxyServer {
     headersSent: boolean = false,
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    effort?: string
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -3670,7 +3771,7 @@ export class ProxyServer {
         async (usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
-            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/chat/completions')
+            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/chat/completions', effort)
             resolve()
             return
           }
@@ -3691,7 +3792,7 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions', effort)
           }
 
           // 发送结束 chunk（包含完整 usage 信息）
@@ -3874,7 +3975,7 @@ export class ProxyServer {
           this.estimateTokenCount(processedRequest.messages) +
           this.estimateTokenCount(processedRequest.tools))
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined, promptInputTokens)
+          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined, promptInputTokens, ProxyServer.deriveEffortLevel(request))
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -3966,7 +4067,7 @@ export class ProxyServer {
     this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: loop.usage.inputTokens + loop.usage.outputTokens, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime })
     this.recordRequest({ path: '/v1/messages', model: request.model, accountId: account.id, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime, success: true })
     if (matchedApiKey) {
-      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages')
+      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages', ProxyServer.deriveEffortLevel(request))
     }
 
     if (!request.stream) {
@@ -4044,7 +4145,8 @@ export class ProxyServer {
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
     simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string },
-    promptInputTokens?: number
+    promptInputTokens?: number,
+    effort?: string
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -4238,7 +4340,7 @@ export class ProxyServer {
         async (usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
-            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/messages')
+            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/messages', effort)
             resolve()
             return
           }
@@ -4273,7 +4375,7 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages')
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort)
           }
 
           // 成功后更新 prompt cache tracker
@@ -4963,6 +5065,18 @@ const PORTAL_HTML = `<!doctype html>
         </div>
       </div>
 
+      <h2>ประวัติการใช้งานล่าสุด</h2>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">50 รายการล่าสุด · credits คือยอดที่หักจริง (รวมเรตของแต่ละโมเดลแล้ว)</div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">tokens (in/out)</th><th class="num">credits</th></tr></thead>
+            <tbody id="historyRows"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="historyEmpty"></div>
+      </div>
+
       <h2>การใช้งานต่อโมเดล</h2>
       <div class="card">
         <table>
@@ -4970,6 +5084,16 @@ const PORTAL_HTML = `<!doctype html>
           <tbody id="modelRows"></tbody>
         </table>
         <div class="empty" id="modelEmpty"></div>
+      </div>
+
+      <h2>การใช้งานตามระดับ Effort</h2>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">ระดับการคิด (reasoning) ที่ใช้ — ยิ่งสูงยิ่งใช้ credit มากขึ้นต่อคำขอ</div>
+        <table>
+          <thead><tr><th>effort</th><th class="num">requests</th><th class="num">credits</th><th class="num">เฉลี่ย/req</th></tr></thead>
+          <tbody id="effortRows"></tbody>
+        </table>
+        <div class="empty" id="effortEmpty"></div>
       </div>
 
       <h2>อัตราค่าบริการ (ต่อโมเดล)</h2>
@@ -5170,6 +5294,8 @@ const PORTAL_HTML = `<!doctype html>
       renderDailyTable(r.data.daily || {});
       drawTrend(r.data.daily || {});
       renderModelUsage();
+      renderEffortUsage();
+      renderHistory();
       renderPricing();
     });
   }
@@ -5409,6 +5535,63 @@ const PORTAL_HTML = `<!doctype html>
         + '<td class="num">'+fmtInt(m.requests)+'</td>'
         + '<td class="num">'+fmt(m.credits)+'</td>'
         + '<td class="num">'+fmtTokens(m.inputTokens)+' / '+fmtTokens(m.outputTokens)+'</td>';
+      rows.appendChild(tr);
+    });
+  }
+
+  // effort 档位的显示文案 + 排序权重（none 最低，max 最高）
+  var EFFORT_ORDER = { none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+  function effortLabel(e){
+    var map = { none: 'ไม่มี', minimal: 'น้อยมาก', low: 'ต่ำ', medium: 'กลาง', high: 'สูง', xhigh: 'สูงมาก', max: 'สูงสุด' };
+    return map[e] || e;
+  }
+
+  function renderEffortUsage(){
+    if (!lastUsage) return;
+    var byEffort = lastUsage.byEffort || {};
+    var ids = Object.keys(byEffort);
+    var rows = $('effortRows'); rows.innerHTML = '';
+    if (ids.length === 0){
+      $('effortEmpty').textContent = 'ยังไม่มีข้อมูลแยกตาม effort';
+      return;
+    }
+    $('effortEmpty').textContent = '';
+    // 按强度从高到低排（max 在最上面）
+    ids.sort(function(a,b){ return (EFFORT_ORDER[b]||0) - (EFFORT_ORDER[a]||0); });
+    ids.forEach(function(id){
+      var e = byEffort[id];
+      var avg = e.requests > 0 ? (e.credits / e.requests) : 0;
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>'+esc(effortLabel(id))+'</td>'
+        + '<td class="num">'+fmtInt(e.requests)+'</td>'
+        + '<td class="num">'+fmt(e.credits)+'</td>'
+        + '<td class="num">'+fmt(avg)+'</td>';
+      rows.appendChild(tr);
+    });
+  }
+
+  function fmtTime(ts){
+    var d = new Date(ts);
+    function p(n){ return (n<10?'0':'')+n; }
+    return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+  }
+
+  function renderHistory(){
+    if (!lastUsage) return;
+    var hist = lastUsage.recentHistory || [];
+    var rows = $('historyRows'); rows.innerHTML = '';
+    if (hist.length === 0){
+      $('historyEmpty').textContent = 'ยังไม่มีประวัติการใช้งาน';
+      return;
+    }
+    $('historyEmpty').textContent = '';
+    hist.forEach(function(rec){
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td class="muted">'+esc(fmtTime(rec.timestamp))+'</td>'
+        + '<td>'+esc(displayModelName(rec.model))+'</td>'
+        + '<td>'+esc(effortLabel(rec.effort||'none'))+'</td>'
+        + '<td class="num">'+fmtTokens(rec.inputTokens)+' / '+fmtTokens(rec.outputTokens)+'</td>'
+        + '<td class="num">'+fmt(rec.credits)+'</td>';
       rows.appendChild(tr);
     });
   }

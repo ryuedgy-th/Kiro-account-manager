@@ -10,6 +10,7 @@ interface UsageRecord {
   outputTokens: number
   credits: number
   path: string
+  effort?: string
 }
 
 interface ModelStats {
@@ -56,6 +57,12 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
 
   const formatModel = (model: string) => {
     return model.replace('anthropic.', '').replace('-v1:0', '')
+  }
+
+  // effort 档位显示：none → '–'，其余首字母大写，保持与客户门户口径一致
+  const formatEffort = (effort?: string) => {
+    if (!effort || effort === 'none') return '–'
+    return effort.charAt(0).toUpperCase() + effort.slice(1)
   }
 
   // 计算每日统计（最近7天）
@@ -167,6 +174,7 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
                     <tr>
                       <th className="text-left p-2 font-medium">{isEn ? 'Time' : '时间'}</th>
                       <th className="text-left p-2 font-medium">{isEn ? 'Model' : '模型'}</th>
+                      <th className="text-left p-2 font-medium">{isEn ? 'Effort' : 'Effort'}</th>
                       <th className="text-left p-2 font-medium">{isEn ? 'Path' : '路径'}</th>
                       <th className="text-right p-2 font-medium">{isEn ? 'In' : '输入'}</th>
                       <th className="text-right p-2 font-medium">{isEn ? 'Out' : '输出'}</th>
@@ -178,6 +186,7 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
                       <tr key={idx} className="border-b border-muted/30 hover:bg-muted/30">
                         <td className="p-2 text-muted-foreground whitespace-nowrap text-xs">{formatTime(record.timestamp)}</td>
                         <td className="p-2 truncate max-w-[150px]" title={record.model}>{formatModel(record.model)}</td>
+                        <td className="p-2 text-muted-foreground">{formatEffort(record.effort)}</td>
                         <td className="p-2 truncate max-w-[120px] text-muted-foreground" title={record.path}>{record.path}</td>
                         <td className="p-2 text-right text-muted-foreground">{record.inputTokens.toLocaleString()}</td>
                         <td className="p-2 text-right text-muted-foreground">{record.outputTokens.toLocaleString()}</td>

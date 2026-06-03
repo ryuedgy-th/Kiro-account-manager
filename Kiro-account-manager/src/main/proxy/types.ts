@@ -446,6 +446,13 @@ export interface ApiKeyUsageRecord {
   outputTokens: number
   credits: number
   path: string
+  /**
+   * 归一化后的推理强度档位（none/low/medium/high/xhigh/max）。
+   * 来源可能是 OpenAI reasoning_effort、Claude output_config.effort，
+   * 或由 thinking.budget_tokens 推导（见 ProxyServer.deriveEffortLevel）。
+   * 旧持久化记录无此字段 → 视为 undefined（前端显示 '–'）。
+   */
+  effort?: string
 }
 
 // API Key 类型
@@ -480,6 +487,13 @@ export interface ApiKey {
     }>
     // 按模型统计
     byModel?: Record<string, {
+      requests: number
+      credits: number
+      inputTokens: number
+      outputTokens: number
+    }>
+    // 按推理强度档位统计（none/low/medium/high/xhigh/max）
+    byEffort?: Record<string, {
       requests: number
       credits: number
       inputTokens: number
