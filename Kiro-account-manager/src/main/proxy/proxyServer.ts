@@ -2443,6 +2443,52 @@ export class ProxyServer {
   }
 
   /**
+   * 创建邀请码（invite-only 注册）。code 绑定 email，客户用 Google 登录时携带 code 完成首次注册。
+   * 共用：IPC proxy-create-invite。返回完整 invite（含 code，供管理员复制发送）。
+   */
+  createInvite(input: { email?: string; name?: string; creditBalance?: number; maxKeys?: number; expiresInDays?: number }): import('./types').PortalInvite {
+    const email = portal.normalizeEmail(input.email || '')
+    if (!portal.isValidEmail(email)) throw new Error('Invalid email')
+    // 已是客户的 email 不必再邀请
+    if (portal.findCustomerByEmail(this.config, email)) throw new Error('Email already a customer')
+    const now = Date.now()
+    if (!this.config.portalInvites) this.config.portalInvites = []
+    // 同 email 已有未使用邀请 → 撤销旧的，避免堆积
+    this.config.portalInvites = this.config.portalInvites.filter(
+      i => !(portal.normalizeEmail(i.email) === email && !i.usedAt)
+    )
+    const days = typeof input.expiresInDays === 'number' && input.expiresInDays > 0 ? input.expiresInDays : undefined
+    const invite: import('./types').PortalInvite = {
+      code: portal.generateInviteCode(),
+      email,
+      name: input.name,
+      creditBalance: typeof input.creditBalance === 'number' && input.creditBalance > 0 ? input.creditBalance : 0,
+      maxKeys: input.maxKeys,
+      createdAt: now,
+      expiresAt: days ? now + days * 24 * 3600 * 1000 : undefined
+    }
+    this.config.portalInvites.push(invite)
+    this.appendAuditLog('invite_created', { email, code: invite.code.slice(0, 6) + '…' })
+    this.events.onConfigChanged?.(this.config)
+    return invite
+  }
+
+  /** 列出所有邀请（含 code，管理端用）。 */
+  listInvites(): import('./types').PortalInvite[] {
+    return (this.config.portalInvites || []).slice().sort((a, b) => b.createdAt - a.createdAt)
+  }
+
+  /** 撤销（删除）一个未使用的邀请。已使用的邀请保留作审计。 */
+  revokeInvite(code: string): void {
+    const invite = portal.findInviteByCode(this.config, code)
+    if (!invite) throw new Error('Invite not found')
+    if (invite.usedAt) throw new Error('Invite already used')
+    this.config.portalInvites = (this.config.portalInvites || []).filter(i => i.code !== code)
+    this.appendAuditLog('invite_revoked', { email: invite.email, code: code.slice(0, 6) + '…' })
+    this.events.onConfigChanged?.(this.config)
+  }
+
+  /**
    * 人工充值/扣减 credit（amount 可为负）。返回最新余额。
    * 共用：HTTP POST /admin/customers/:id/credit 与 IPC proxy-topup-customer。
    */
@@ -2609,6 +2655,27 @@ export class ProxyServer {
   private async handlePortalApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
     const method = req.method || 'GET'
 
+    // 门户前端配置（公开）：是否启用 Google 登录 + client id，供登录页渲染按钮
+    if (path === '/portal/config' && method === 'GET') {
+      this.sendJson(res, 200, {
+        googleEnabled: !!this.config.portalGoogleEnabled && !!this.config.googleClientId,
+        googleClientId: this.config.portalGoogleEnabled ? (this.config.googleClientId || '') : ''
+      })
+      return
+    }
+
+    // Google 登录（invite-only）：不需会话，按 IP 限流
+    if (path === '/portal/google' && method === 'POST') {
+      const grl = this.checkPortalLoginRate(this.getClientIP(req))
+      if (!grl.allowed) {
+        res.setHeader('Retry-After', String(Math.ceil(grl.retryAfterMs / 1000)))
+        this.sendJson(res, 429, { error: 'Too many login attempts, try again later' })
+        return
+      }
+      await this.handlePortalGoogleLogin(req, res, signal)
+      return
+    }
+
     // 登录：不需要会话，但按 IP 限流防暴力破解
     if (path === '/portal/login' && method === 'POST') {
       const loginRl = this.checkPortalLoginRate(this.getClientIP(req))
@@ -2680,8 +2747,9 @@ export class ProxyServer {
       return
     }
     const customer = portal.findCustomerByEmail(this.config, parsed.email || '')
-    // 不区分"用户不存在"与"密码错误"，统一返回 401，防止枚举邮箱
-    const ok = !!customer && customer.enabled &&
+    // 不区分"用户不存在"与"密码错误"，统一返回 401，防止枚举邮箱。
+    // passwordless 客户（仅 Google 登录）没有 salt/hash → verifyPassword 安全返回 false。
+    const ok = !!customer && customer.enabled && !!customer.passwordSalt && !!customer.passwordHash &&
       await portal.verifyPassword(parsed.password || '', customer.passwordSalt, customer.passwordHash)
     if (!ok || !customer) {
       this.sendJson(res, 401, { error: 'Invalid email or password' })
@@ -2690,6 +2758,71 @@ export class ProxyServer {
     customer.lastLoginAt = Date.now()
     this.events.onConfigChanged?.(this.config)
     const token = portal.signSession(secret, customer.id, portal.sessionTtlHours(this.config), Date.now())
+    this.sendJson(res, 200, {
+      token,
+      customer: { id: customer.id, email: customer.email, name: customer.name, creditBalance: customer.creditBalance }
+    })
+  }
+
+  /**
+   * Google 登录（invite-only）。流程：
+   *   1. 校验 Google ID token（签名 + aud + iss + exp + email_verified）
+   *   2. 已绑定 googleSub 的客户 → 直接登录
+   *   3. email 命中现有启用客户但未绑定 → 首次绑定 googleSub 后登录
+   *   4. 否则需 invite code（与同一 email 绑定）→ 创建 passwordless 客户后登录
+   *   5. 都不满足 → 403（invite-only，不放行任意 Google 账号）
+   */
+  private async handlePortalGoogleLogin(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const secret = this.config.portalSessionSecret
+    if (!secret) { this.sendJson(res, 503, { error: 'Portal not initialized' }); return }
+    if (!this.config.portalGoogleEnabled || !this.config.googleClientId) {
+      this.sendJson(res, 503, { error: 'Google login not enabled' }); return
+    }
+    const body = await this.readBody(req, signal)
+    let parsed: { credential?: string; inviteCode?: string }
+    try { parsed = JSON.parse(body) } catch { this.sendJson(res, 400, { error: 'Invalid JSON body' }); return }
+
+    const identity = await portal.verifyGoogleIdToken(parsed.credential || '', this.config.googleClientId, Date.now())
+    if (!identity) { this.sendJson(res, 401, { error: 'Invalid Google token' }); return }
+    if (!identity.emailVerified) { this.sendJson(res, 403, { error: 'Google email not verified' }); return }
+
+    const now = Date.now()
+    let customer = portal.findCustomerByEmail(this.config, identity.email)
+
+    if (customer) {
+      // 邮箱命中现有客户：校验 googleSub 一致或首次绑定
+      if (customer.googleSub && customer.googleSub !== identity.sub) {
+        this.sendJson(res, 403, { error: 'Account mismatch' }); return
+      }
+      if (!customer.enabled) { this.sendJson(res, 403, { error: 'Account disabled' }); return }
+      if (!customer.googleSub) {
+        customer.googleSub = identity.sub
+        this.appendAuditLog('customer_google_linked', { id: customer.id, email: customer.email })
+      }
+    } else {
+      // 新邮箱：必须有与该 email 绑定的有效 invite（invite-only）
+      const invite = portal.findInviteByCode(this.config, parsed.inviteCode || '')
+      const v = portal.validateInvite(invite, identity.email, now)
+      if (!v.ok || !invite) {
+        // 统一 403，不泄露 invite 状态细节（reason 仅写审计日志）
+        this.appendAuditLog('google_login_rejected', { email: identity.email, reason: v.reason || 'no_invite' })
+        this.sendJson(res, 403, { error: 'Invitation required' }); return
+      }
+      customer = portal.buildGoogleCustomer(identity.email, identity.sub, {
+        name: invite.name || identity.name,
+        creditBalance: invite.creditBalance,
+        maxKeys: invite.maxKeys
+      }, now)
+      if (!this.config.customers) this.config.customers = []
+      this.config.customers.push(customer)
+      invite.usedAt = now
+      invite.usedByCustomerId = customer.id
+      this.appendAuditLog('customer_created_via_invite', { id: customer.id, email: customer.email })
+    }
+
+    customer.lastLoginAt = now
+    this.events.onConfigChanged?.(this.config)
+    const token = portal.signSession(secret, customer.id, portal.sessionTtlHours(this.config), now)
     this.sendJson(res, 200, {
       token,
       customer: { id: customer.id, email: customer.email, name: customer.name, creditBalance: customer.creditBalance }
@@ -3037,7 +3170,8 @@ export class ProxyServer {
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold',
-      'portalEnabled', 'portalSessionTtlHours', 'portalDefaultMaxKeys'
+      'portalEnabled', 'portalSessionTtlHours', 'portalDefaultMaxKeys',
+      'portalGoogleEnabled', 'googleClientId'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 也排除：customers / portalSessionSecret —— 含密码哈希与签名密钥，仅本地 IPC / 专用 admin 端点改
     ]
@@ -4847,6 +4981,7 @@ const PORTAL_HTML = `<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root {
     --bg:#eef2f1; --bg2:#e7edec; --shell:#ffffff; --card:#ffffff; --card-soft:#f5f8f7;
@@ -4977,6 +5112,10 @@ const PORTAL_HTML = `<!doctype html>
   code { background:var(--card-soft); padding:3px 7px; border-radius:6px; font-size:12px; word-break:break-all; border:1px solid var(--border); color:var(--txt2); }
   .hide { display:none; }
   .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
+  .hint { color:var(--muted); font-size:12px; line-height:1.5; }
+  .sep { display:flex; align-items:center; text-align:center; color:var(--muted); font-size:12px; margin:20px 0 4px; }
+  .sep::before, .sep::after { content:""; flex:1; height:1px; background:var(--border2); }
+  .sep span { padding:0 12px; }
   .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.3); border-radius:12px; padding:14px; margin-top:12px; color:var(--accent-d); font-weight:600; }
   .keybox code { background:#fff; color:var(--txt); }
   .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
@@ -5009,12 +5148,25 @@ const PORTAL_HTML = `<!doctype html>
           <div class="bd">เข้าสู่ระบบเพื่อจัดการ API Key และเครดิต</div>
         </div>
         <div class="card">
-          <label>อีเมล</label>
-          <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
-          <label>รหัสผ่าน</label>
-          <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
-          <div style="margin-top:20px"><button id="loginBtn" style="width:100%">เข้าสู่ระบบ</button></div>
-          <div class="err" id="loginErr"></div>
+          <!-- Google 登录（主渠道，invite-only） -->
+          <div id="googleBlock" class="hide">
+            <div id="gsiButton" style="display:flex;justify-content:center"></div>
+            <label style="margin-top:14px">รหัสเชิญ (Invite code)</label>
+            <input id="inviteCode" type="text" autocomplete="off" placeholder="วางรหัสเชิญที่ได้รับ (เฉพาะผู้ใช้ใหม่)">
+            <div class="hint" style="margin-top:6px">ผู้ที่ได้รับเชิญครั้งแรกต้องกรอกรหัสเชิญ ผู้ที่เคยเข้าระบบแล้วเว้นว่างได้</div>
+            <div class="err" id="googleErr"></div>
+            <div class="sep"><span>หรือเข้าสู่ระบบด้วยรหัสผ่าน</span></div>
+          </div>
+
+          <!-- 密码登录（次要渠道） -->
+          <div id="pwBlock">
+            <label>อีเมล</label>
+            <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
+            <label>รหัสผ่าน</label>
+            <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
+            <div style="margin-top:20px"><button id="loginBtn" style="width:100%">เข้าสู่ระบบ</button></div>
+            <div class="err" id="loginErr"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -5259,10 +5411,59 @@ const PORTAL_HTML = `<!doctype html>
     });
   }
 
+  // Google 登录回调：拿到 ID token 后连同 invite code 一起发给后端
+  function onGoogleCredential(resp){
+    $('googleErr').textContent = '';
+    var credential = resp && resp.credential;
+    if (!credential){ $('googleErr').textContent = 'ไม่ได้รับข้อมูลจาก Google'; return; }
+    var inviteCode = $('inviteCode').value.trim();
+    api('/portal/google', { method:'POST', body:{ credential:credential, inviteCode:inviteCode } }).then(function(r){
+      if (!r.ok){
+        var msg = (r.data && r.data.error) || 'เข้าสู่ระบบด้วย Google ไม่สำเร็จ';
+        if (r.status === 403) msg = 'บัญชีนี้ยังไม่ได้รับเชิญ กรุณากรอกรหัสเชิญที่ได้รับ หรือติดต่อผู้ดูแล';
+        $('googleErr').textContent = msg;
+        return;
+      }
+      token = r.data.token;
+      localStorage.setItem(TOKEN_KEY, token);
+      loadDash();
+    });
+  }
+
+  // โหลด config จากเซิร์ฟเวอร์ ถ้าเปิด Google ก็เรนเดอร์ปุ่ม Sign in with Google เป็นช่องทางหลัก
+  var googleInited = false;
+  function initGoogle(){
+    // เติมรหัสเชิญจาก ?invite= ใน URL ให้อัตโนมัติ (ลิงก์เชิญจากผู้ดูแล)
+    try {
+      var qp = new URLSearchParams(window.location.search).get('invite');
+      if (qp && $('inviteCode') && !$('inviteCode').value) $('inviteCode').value = qp;
+    } catch(e){}
+    if (googleInited){ $('googleBlock').classList.remove('hide'); return; }
+    api('/portal/config').then(function(r){
+      if (!r.ok || !r.data || !r.data.googleEnabled || !r.data.googleClientId) return;
+      var render = function(){
+        if (!window.google || !window.google.accounts || !window.google.accounts.id){
+          setTimeout(render, 150); return;
+        }
+        window.google.accounts.id.initialize({
+          client_id: r.data.googleClientId,
+          callback: onGoogleCredential
+        });
+        window.google.accounts.id.renderButton($('gsiButton'), {
+          theme: 'outline', size: 'large', width: 320, text: 'signin_with', shape: 'pill'
+        });
+        $('googleBlock').classList.remove('hide');
+        googleInited = true;
+      };
+      render();
+    });
+  }
+
   function logout(){
     token = '';
     localStorage.removeItem(TOKEN_KEY);
     show('login');
+    initGoogle();
   }
 
   function fmt(n){ return (Math.round((n||0)*1000)/1000).toLocaleString(); }
@@ -5798,7 +5999,7 @@ const PORTAL_HTML = `<!doctype html>
   var goKeys = $('goKeysBtn');
   if (goKeys) goKeys.addEventListener('click', function(){ selectTab('keys'); });
 
-  if (token) loadDash(); else show('login');
+  if (token) loadDash(); else { show('login'); initGoogle(); }
 })();
 </script>
 </body>

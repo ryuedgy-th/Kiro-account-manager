@@ -520,9 +520,12 @@ export interface Customer {
   id: string
   email: string             // 登录账号（唯一，比较时小写）
   name?: string             // 显示名
-  // 密码使用 scrypt 派生，存 salt + hash（均为 hex），不存明文
-  passwordSalt: string
-  passwordHash: string
+  // 密码使用 scrypt 派生，存 salt + hash（均为 hex），不存明文。
+  // Google 登录的客户可能没有密码（passwordless）→ 两字段为 optional。
+  passwordSalt?: string
+  passwordHash?: string
+  /** 绑定的 Google 账号 sub（首次 Google 登录时写入）。设置后该客户可用 Google 登录。 */
+  googleSub?: string
   enabled: boolean
   createdAt: number
   lastLoginAt?: number
@@ -534,6 +537,23 @@ export interface Customer {
   maxKeys?: number
   /** 充值流水（人工充值/扣减记录），便于对账 */
   topupHistory?: Array<{ timestamp: number; amount: number; note?: string; by?: string }>
+}
+
+/**
+ * 门户邀请（invite-only 注册）。管理员生成 code 发给客户，
+ * 客户用 Google 登录时携带 code 完成首次注册。
+ * 安全：code 绑定 email —— 必须与 Google 账号的 email 一致才放行。
+ */
+export interface PortalInvite {
+  code: string              // 随机不可猜测的邀请码
+  email: string             // 绑定的客户 email（小写，必须与 Google 账号一致）
+  name?: string             // 预设显示名
+  creditBalance: number     // 注册后初始 credit 余额
+  maxKeys?: number          // 该客户 Key 上限（undefined = 用全局默认）
+  createdAt: number
+  expiresAt?: number        // 过期时间戳（undefined = 不过期）
+  usedAt?: number           // 已使用时间戳（undefined = 未使用）
+  usedByCustomerId?: string // 注册后生成的 customer id
 }
 
 /**
@@ -700,6 +720,13 @@ export interface ProxyConfig {
    * 此上限把"接近耗尽时的超额消费"约束在 N 个请求以内，而不会无上限透支。
    */
   portalMaxConcurrentPerCustomer?: number
+
+  /** 门户邀请列表（invite-only 注册用） */
+  portalInvites?: PortalInvite[]
+  /** 启用 Google 登录（"Sign in with Google" 按钮）；需同时设置 googleClientId */
+  portalGoogleEnabled?: boolean
+  /** Google OAuth Web Client ID（用于前端 Google Identity 按钮 + 后端校验 ID token 的 aud） */
+  googleClientId?: string
 
   // ============ 计费定价（v1.10 新增，转售加价层） ============
   /**

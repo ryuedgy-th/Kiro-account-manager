@@ -15,6 +15,19 @@ interface CustomerView {
   maxKeys: number
 }
 
+// 邀请码视图（与 src/main/proxy/types.ts 的 PortalInvite 对应）
+interface InviteView {
+  code: string
+  email: string
+  name?: string
+  creditBalance: number
+  maxKeys?: number
+  createdAt: number
+  expiresAt?: number
+  usedAt?: number
+  usedByCustomerId?: string
+}
+
 // Custom APIs for renderer
 const api = {
   // 打开外部链接
@@ -987,6 +1000,18 @@ const api = {
 
   proxyDeleteCustomer: (id: string): Promise<{ success: boolean; revokedKeys?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-delete-customer', id)
+  },
+
+  proxyCreateInvite: (input: { email: string; name?: string; creditBalance?: number; maxKeys?: number; expiresInDays?: number }): Promise<{ success: boolean; invite?: InviteView; error?: string }> => {
+    return ipcRenderer.invoke('proxy-create-invite', input)
+  },
+
+  proxyListInvites: (): Promise<{ success: boolean; invites?: InviteView[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-list-invites')
+  },
+
+  proxyRevokeInvite: (code: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-revoke-invite', code)
   },
 
   // 安装 CA 证书到系统信任存储

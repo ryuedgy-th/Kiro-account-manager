@@ -22,7 +22,8 @@
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
-    "test:proxy": "node test/verify-effort.mjs && node test/verify-effort-capability.mjs && node test/probe-tools.mjs && node test/verify-webtools.mjs && node test/verify-webtools-http.mjs && node test/verify-account-pool-sync.mjs"
+    "test:proxy": "node test/verify-effort.mjs && node test/verify-effort-capability.mjs && node test/probe-tools.mjs && node test/verify-webtools.mjs && node test/verify-webtools-http.mjs && node test/verify-account-pool-sync.mjs",
+    "test:portal": "node test/verify-portal.mjs && node test/verify-google-invite.mjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",

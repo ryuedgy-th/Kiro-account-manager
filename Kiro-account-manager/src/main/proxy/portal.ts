@@ -13,7 +13,7 @@
 import * as crypto from 'crypto'
 import { promisify } from 'util'
 import { v4 as uuidv4 } from 'uuid'
-import type { ProxyConfig, Customer, ApiKey } from './types'
+import type { ProxyConfig, Customer, ApiKey, PortalInvite } from './types'
 
 const SCRYPT_KEYLEN = 64
 const SCRYPT_SALT_BYTES = 16
@@ -199,6 +199,151 @@ export async function buildCustomer(email: string, password: string, opts: { nam
       ? [{ timestamp: now, amount: opts.creditBalance, note: 'initial', by: 'admin' }]
       : []
   }
+}
+
+/**
+ * 创建 Google 登录（passwordless）客户对象。无 salt/hash，绑定 googleSub。
+ * 用于 invite 首次注册：email 已由 invite 绑定并与 Google 账号校验一致。
+ */
+export function buildGoogleCustomer(email: string, googleSub: string, opts: { name?: string; creditBalance?: number; maxKeys?: number }, now: number): Customer {
+  return {
+    id: uuidv4(),
+    email: normalizeEmail(email),
+    name: opts.name,
+    googleSub,
+    enabled: true,
+    createdAt: now,
+    creditBalance: opts.creditBalance ?? 0,
+    totalToppedUp: opts.creditBalance && opts.creditBalance > 0 ? opts.creditBalance : 0,
+    maxKeys: opts.maxKeys,
+    topupHistory: opts.creditBalance && opts.creditBalance > 0
+      ? [{ timestamp: now, amount: opts.creditBalance, note: 'initial (invite)', by: 'admin' }]
+      : []
+  }
+}
+
+// ============ 邀请码（invite-only 注册） ============
+
+/** 生成不可猜测的邀请码（base64url, 24 字节 ≈ 32 字符）。 */
+export function generateInviteCode(): string {
+  return b64urlEncode(crypto.randomBytes(24))
+}
+
+/** 按 code 查找邀请（精确匹配）。 */
+export function findInviteByCode(config: ProxyConfig, code: string): PortalInvite | undefined {
+  if (!code) return undefined
+  return (config.portalInvites || []).find(i => i.code === code)
+}
+
+/**
+ * 校验邀请是否可用于指定 email 注册。
+ * 返回 { ok, reason }：reason 仅用于服务端日志，不要原样回传给客户端（避免泄露邀请状态）。
+ */
+export function validateInvite(invite: PortalInvite | undefined, email: string, now: number): { ok: boolean; reason?: string } {
+  if (!invite) return { ok: false, reason: 'not_found' }
+  if (invite.usedAt) return { ok: false, reason: 'already_used' }
+  if (invite.expiresAt && now > invite.expiresAt) return { ok: false, reason: 'expired' }
+  if (normalizeEmail(invite.email) !== normalizeEmail(email)) return { ok: false, reason: 'email_mismatch' }
+  return { ok: true }
+}
+
+// ============ Google ID token 校验（无新依赖，仅用 node:crypto） ============
+
+interface GoogleCerts { keys: Array<{ kid: string; n: string; e: string; alg?: string; kty?: string }>; fetchedAt: number }
+let googleCertsCache: GoogleCerts | null = null
+const GOOGLE_CERTS_URL = 'https://www.googleapis.com/oauth2/v3/certs'
+const GOOGLE_CERTS_TTL_MS = 60 * 60 * 1000 // 1h（Google 轮换不频繁，缓存降低延迟与失败面）
+
+/** 拉取并缓存 Google 公钥（JWKS）。失败时若有旧缓存则复用。 */
+async function getGoogleCerts(now: number, fetchImpl: typeof fetch = fetch): Promise<GoogleCerts['keys']> {
+  if (googleCertsCache && now - googleCertsCache.fetchedAt < GOOGLE_CERTS_TTL_MS) {
+    return googleCertsCache.keys
+  }
+  try {
+    const res = await fetchImpl(GOOGLE_CERTS_URL)
+    if (!res.ok) throw new Error('certs http ' + res.status)
+    const data = await res.json() as { keys: GoogleCerts['keys'] }
+    googleCertsCache = { keys: data.keys || [], fetchedAt: now }
+    return googleCertsCache.keys
+  } catch (e) {
+    if (googleCertsCache) return googleCertsCache.keys // 退回旧缓存，避免临时网络问题阻断登录
+    throw e
+  }
+}
+
+/** 把 base64url 的 JWK (n,e) 组装成 PEM 公钥，供 crypto.verify 使用。 */
+function jwkToPem(n: string, e: string): crypto.KeyObject {
+  return crypto.createPublicKey({
+    key: { kty: 'RSA', n, e } as crypto.JsonWebKey,
+    format: 'jwk'
+  })
+}
+
+export interface GoogleIdentity { sub: string; email: string; emailVerified: boolean; name?: string }
+
+/**
+ * 校验 Google ID token（RS256）。验证：签名、aud=clientId、iss、exp/nbf、email_verified。
+ * 通过则返回 { sub, email, ... }；任何不符返回 null（调用方据此回 401/403）。
+ * fetchImpl 可注入以便单测。
+ */
+export async function verifyGoogleIdToken(
+  token: string,
+  clientId: string,
+  now: number,
+  fetchImpl: typeof fetch = fetch
+): Promise<GoogleIdentity | null> {
+  if (!token || !clientId) return null
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  let header: { alg?: string; kid?: string }
+  let payload: Record<string, unknown>
+  try {
+    header = JSON.parse(b64urlDecode(parts[0]).toString('utf8'))
+    payload = JSON.parse(b64urlDecode(parts[1]).toString('utf8'))
+  } catch {
+    return null
+  }
+  if (header.alg !== 'RS256' || !header.kid) return null
+
+  // 找到匹配 kid 的公钥
+  let keys: GoogleCerts['keys']
+  try { keys = await getGoogleCerts(now, fetchImpl) } catch { return null }
+  const jwk = keys.find(k => k.kid === header.kid)
+  if (!jwk) return null
+
+  // 验签：RS256 over `${header}.${payload}`
+  let verified = false
+  try {
+    const pubKey = jwkToPem(jwk.n, jwk.e)
+    verified = crypto.verify(
+      'RSA-SHA256',
+      Buffer.from(parts[0] + '.' + parts[1]),
+      pubKey,
+      b64urlDecode(parts[2])
+    )
+  } catch {
+    return null
+  }
+  if (!verified) return null
+
+  // 校验 claims
+  const iss = payload.iss
+  if (iss !== 'https://accounts.google.com' && iss !== 'accounts.google.com') return null
+  if (payload.aud !== clientId) return null
+  const expSec = typeof payload.exp === 'number' ? payload.exp : 0
+  const nbfSec = typeof payload.nbf === 'number' ? payload.nbf : 0
+  const nowSec = Math.floor(now / 1000)
+  if (expSec && nowSec >= expSec) return null
+  if (nbfSec && nowSec < nbfSec - 60) return null // 容忍 60s 时钟偏移
+
+  const email = typeof payload.email === 'string' ? normalizeEmail(payload.email) : ''
+  const sub = typeof payload.sub === 'string' ? payload.sub : ''
+  if (!email || !sub) return null
+  // email_verified 可能是 boolean 或字符串 "true"
+  const ev = payload.email_verified
+  const emailVerified = ev === true || ev === 'true'
+
+  return { sub, email, emailVerified, name: typeof payload.name === 'string' ? payload.name : undefined }
 }
 
 /**

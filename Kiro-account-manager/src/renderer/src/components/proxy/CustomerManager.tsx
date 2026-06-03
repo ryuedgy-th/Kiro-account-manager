@@ -6,7 +6,7 @@ import { Switch } from '@/components/ui/switch'
 import { Label } from '@/components/ui/label'
 import {
   Users, Plus, Trash2, Copy, Check, RefreshCw, Wallet,
-  Power, KeyRound, ExternalLink, AlertTriangle, X
+  Power, KeyRound, ExternalLink, AlertTriangle, X, Mail, Ticket
 } from 'lucide-react'
 import { useAccountsStore } from '@/store/accounts'
 
@@ -21,6 +21,18 @@ interface CustomerView {
   totalToppedUp: number
   keyCount: number
   maxKeys: number
+}
+
+interface InviteView {
+  code: string
+  email: string
+  name?: string
+  creditBalance: number
+  maxKeys?: number
+  createdAt: number
+  expiresAt?: number
+  usedAt?: number
+  usedByCustomerId?: string
 }
 
 export function CustomerManager() {
@@ -46,6 +58,19 @@ export function CustomerManager() {
   const [name, setName] = useState('')
   const [initialCredit, setInitialCredit] = useState('')
 
+  // Google 登录配置
+  const [googleEnabled, setGoogleEnabled] = useState(false)
+  const [googleClientId, setGoogleClientId] = useState('')
+  const [clientIdDraft, setClientIdDraft] = useState('')
+
+  // 邀请码
+  const [invites, setInvites] = useState<InviteView[]>([])
+  const [invEmail, setInvEmail] = useState('')
+  const [invName, setInvName] = useState('')
+  const [invCredit, setInvCredit] = useState('')
+  const [invExpiry, setInvExpiry] = useState('')
+  const [copiedCode, setCopiedCode] = useState<string | null>(null)
+
   // 操作弹窗（替代被 Electron 屏蔽的 window.prompt/confirm）
   // kind 区分充值 / 重置密码 / 删除三种操作，复用同一套模态外壳
   const [modal, setModal] = useState<
@@ -65,8 +90,11 @@ export function CustomerManager() {
   const loadStatus = useCallback(async () => {
     try {
       const status = await window.api.proxyGetStatus()
-      const cfg = (status?.config || {}) as { port?: number; host?: string; tls?: { enabled?: boolean }; portalEnabled?: boolean }
+      const cfg = (status?.config || {}) as { port?: number; host?: string; tls?: { enabled?: boolean }; portalEnabled?: boolean; portalGoogleEnabled?: boolean; googleClientId?: string }
       setPortalEnabled(!!cfg.portalEnabled)
+      setGoogleEnabled(!!cfg.portalGoogleEnabled)
+      setGoogleClientId(cfg.googleClientId || '')
+      setClientIdDraft(cfg.googleClientId || '')
       const host = cfg.host || '127.0.0.1'
       const isLocal = host === '127.0.0.1' || host === '::1' || host === 'localhost'
       setHostIsLocal(isLocal)
@@ -75,6 +103,15 @@ export function CustomerManager() {
       setPortalUrl(`${scheme}://${displayHost}:${cfg.port ?? 5580}/portal`)
     } catch (e) {
       console.error('Failed to load proxy status:', e)
+    }
+  }, [])
+
+  const loadInvites = useCallback(async () => {
+    try {
+      const result = await window.api.proxyListInvites()
+      if (result.success && result.invites) setInvites(result.invites)
+    } catch (e) {
+      console.error('Failed to load invites:', e)
     }
   }, [])
 
@@ -96,7 +133,8 @@ export function CustomerManager() {
   useEffect(() => {
     loadStatus()
     loadCustomers()
-  }, [loadStatus, loadCustomers])
+    loadInvites()
+  }, [loadStatus, loadCustomers, loadInvites])
 
   const togglePortal = useCallback(async (next: boolean) => {
     setBusy(true)
@@ -154,6 +192,95 @@ export function CustomerManager() {
       setBusy(false)
     }
   }, [email, password, name, initialCredit, flash, t, loadCustomers])
+
+  // 切换 Google 登录开关（共用 proxy-update-config 白名单）
+  const toggleGoogle = useCallback(async (next: boolean) => {
+    if (next && !googleClientId.trim()) {
+      flash(t('Set the Google Client ID first', '请先填写 Google Client ID'), true)
+      return
+    }
+    setBusy(true)
+    try {
+      const result = await window.api.proxyUpdateConfig({ portalGoogleEnabled: next })
+      if (result.success) {
+        setGoogleEnabled(next)
+        flash(next ? t('Google login enabled', 'Google 登录已启用') : t('Google login disabled', 'Google 登录已关闭'))
+      } else {
+        flash(result.error || t('Failed', '失败'), true)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [googleClientId, flash, t])
+
+  const saveClientId = useCallback(async () => {
+    setBusy(true)
+    try {
+      const result = await window.api.proxyUpdateConfig({ googleClientId: clientIdDraft.trim() })
+      if (result.success) {
+        setGoogleClientId(clientIdDraft.trim())
+        flash(t('Google Client ID saved', 'Google Client ID 已保存'))
+      } else {
+        flash(result.error || t('Failed', '失败'), true)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [clientIdDraft, flash, t])
+
+  const createInvite = useCallback(async () => {
+    if (!invEmail.trim()) {
+      flash(t('Email is required for an invite', '邀请需填写邮箱'), true)
+      return
+    }
+    setBusy(true)
+    try {
+      const creditNum = invCredit.trim() ? Number(invCredit) : 0
+      const expiryNum = invExpiry.trim() ? Number(invExpiry) : undefined
+      const result = await window.api.proxyCreateInvite({
+        email: invEmail.trim(),
+        name: invName.trim() || undefined,
+        creditBalance: Number.isFinite(creditNum) ? creditNum : 0,
+        expiresInDays: expiryNum && Number.isFinite(expiryNum) ? expiryNum : undefined
+      })
+      if (result.success) {
+        setInvEmail(''); setInvName(''); setInvCredit(''); setInvExpiry('')
+        flash(t('Invite created — copy the link to send', '邀请已创建 — 复制链接发送'))
+        await loadInvites()
+      } else {
+        flash(result.error || t('Failed to create invite', '创建邀请失败'), true)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [invEmail, invName, invCredit, invExpiry, flash, t, loadInvites])
+
+  // 邀请链接：portal 地址 + ?invite=code，客户打开后用 Google 登录自动带上 code
+  const inviteLink = useCallback((code: string): string => {
+    return `${portalUrl}?invite=${encodeURIComponent(code)}`
+  }, [portalUrl])
+
+  const copyInviteLink = useCallback((code: string) => {
+    navigator.clipboard.writeText(inviteLink(code)).then(() => {
+      setCopiedCode(code)
+      setTimeout(() => setCopiedCode(null), 1500)
+    })
+  }, [inviteLink])
+
+  const revokeInvite = useCallback(async (code: string) => {
+    setBusy(true)
+    try {
+      const result = await window.api.proxyRevokeInvite(code)
+      if (result.success) {
+        flash(t('Invite revoked', '邀请已撤销'))
+        await loadInvites()
+      } else {
+        flash(result.error || t('Failed', '失败'), true)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [flash, t, loadInvites])
 
   const topup = useCallback((c: CustomerView) => {
     setModalInput('100')
@@ -314,9 +441,130 @@ export function CustomerManager() {
           )}
         </div>
 
+        {/* Google 登录配置 */}
+        <div className="rounded-lg border p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="text-sm font-medium">{t('Google login (invite-only)', 'Google 登录（仅限邀请）')}</Label>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {t('Customers sign in with Google. New accounts need an invite bound to their email.',
+                   '客户用 Google 登录。新账号需使用与邮箱绑定的邀请码。')}
+              </p>
+            </div>
+            <Switch checked={googleEnabled} onCheckedChange={toggleGoogle} disabled={busy || !googleClientId.trim()} />
+          </div>
+          <div>
+            <Label className="text-xs">{t('Google OAuth Client ID', 'Google OAuth Client ID')}</Label>
+            <div className="flex items-center gap-2 mt-1">
+              <Input
+                placeholder="xxxxxxxx.apps.googleusercontent.com"
+                value={clientIdDraft}
+                onChange={(e) => setClientIdDraft(e.target.value)}
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={saveClientId}
+                disabled={busy || clientIdDraft.trim() === googleClientId}
+              >
+                {t('Save', '保存')}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1.5">
+              {t('Create an OAuth 2.0 Client ID (type: Web) in Google Cloud Console. Add your portal origin to Authorized JavaScript origins.',
+                 '在 Google Cloud Console 创建 OAuth 2.0 客户端 ID（类型：Web），并把门户域名加入"已获授权的 JavaScript 来源"。')}
+            </p>
+          </div>
+        </div>
+
+        {/* 邀请码 */}
+        <div className="rounded-lg border p-4 space-y-3">
+          <div className="flex items-center gap-2">
+            <Ticket className="h-4 w-4 text-muted-foreground" />
+            <Label className="text-sm font-medium">{t('Invites', '邀请码')}</Label>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t('An invite binds to one email. The customer logs in with that same Google account to register.',
+               '一个邀请绑定一个邮箱。客户用同一 Google 账号登录即可完成注册。')}
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Input
+              placeholder={t('Email to invite', '受邀邮箱')}
+              value={invEmail}
+              onChange={(e) => setInvEmail(e.target.value)}
+              type="email"
+            />
+            <Input
+              placeholder={t('Display name (optional)', '显示名（可选）')}
+              value={invName}
+              onChange={(e) => setInvName(e.target.value)}
+            />
+            <Input
+              placeholder={t('Initial credit (optional)', '初始 credit（可选）')}
+              value={invCredit}
+              onChange={(e) => setInvCredit(e.target.value)}
+              type="number"
+            />
+            <Input
+              placeholder={t('Expires in days (optional)', '有效天数（可选）')}
+              value={invExpiry}
+              onChange={(e) => setInvExpiry(e.target.value)}
+              type="number"
+            />
+          </div>
+          <Button onClick={createInvite} disabled={busy} className="w-full" variant="outline">
+            <Mail className="h-4 w-4 mr-1" />
+            {t('Create invite', '创建邀请')}
+          </Button>
+
+          {invites.length > 0 && (
+            <div className="space-y-2 pt-1">
+              {invites.map((inv) => {
+                const used = !!inv.usedAt
+                const expired = !used && !!inv.expiresAt && inv.expiresAt < Date.now()
+                return (
+                  <div key={inv.code} className={`rounded-md border p-2.5 ${used || expired ? 'opacity-60' : ''}`}>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium truncate">{inv.email}</span>
+                          {used && <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">{t('used', '已使用')}</span>}
+                          {expired && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600">{t('expired', '已过期')}</span>}
+                          {!used && !expired && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600">{t('pending', '待使用')}</span>}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-1 text-xs text-muted-foreground">
+                          {inv.creditBalance > 0 && <span>{t('Credit', '初始 credit')}: {inv.creditBalance}</span>}
+                          <span>{t('Created', '创建')}: {fmtDate(inv.createdAt)}</span>
+                          {inv.expiresAt && <span>{t('Expires', '过期')}: {fmtDate(inv.expiresAt)}</span>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {!used && !expired && (
+                          <Button variant="ghost" size="icon" className="h-7 w-7" title={t('Copy invite link', '复制邀请链接')} onClick={() => copyInviteLink(inv.code)} disabled={busy}>
+                            {copiedCode === inv.code ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+                          </Button>
+                        )}
+                        {!used && (
+                          <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" title={t('Revoke invite', '撤销邀请')} onClick={() => revokeInvite(inv.code)} disabled={busy}>
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
         {/* 新建客户 */}
         <div className="rounded-lg border p-4 space-y-3">
           <Label className="text-sm font-medium">{t('Create customer', '创建客户')}</Label>
+          <p className="text-xs text-muted-foreground">
+            {t('Manual password account. For Google login, send an invite instead.',
+               '手动创建密码账号。若用 Google 登录，请改用邀请。')}
+          </p>
           <div className="grid grid-cols-2 gap-3">
             <Input
               placeholder={t('Email (login)', '邮箱（登录账号）')}

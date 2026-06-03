@@ -5822,6 +5822,40 @@ app.whenReady().then(async () => {
     }
   })
 
+  // IPC: 创建邀请码（invite-only Google 登录注册）
+  ipcMain.handle('proxy-create-invite', (_event, input: { email: string; name?: string; creditBalance?: number; maxKeys?: number; expiresInDays?: number }) => {
+    try {
+      const server = initProxyServer()
+      const invite = server.createInvite(input)
+      persistProxyConfig(server)
+      return { success: true, invite }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to create invite' }
+    }
+  })
+
+  // IPC: 列出邀请码
+  ipcMain.handle('proxy-list-invites', () => {
+    try {
+      const server = initProxyServer()
+      return { success: true, invites: server.listInvites() }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to list invites' }
+    }
+  })
+
+  // IPC: 撤销未使用的邀请码
+  ipcMain.handle('proxy-revoke-invite', (_event, code: string) => {
+    try {
+      const server = initProxyServer()
+      server.revokeInvite(code)
+      persistProxyConfig(server)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to revoke invite' }
+    }
+  })
+
   // IPC: 添加账号到反代池
   ipcMain.handle('proxy-add-account', (_event, account: ProxyAccount) => {
     try {

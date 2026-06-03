@@ -134,6 +134,18 @@ interface CustomerView {
   maxKeys: number
 }
 
+interface InviteView {
+  code: string
+  email: string
+  name?: string
+  creditBalance: number
+  maxKeys?: number
+  createdAt: number
+  expiresAt?: number
+  usedAt?: number
+  usedByCustomerId?: string
+}
+
 interface KiroApi {
   openExternal: (url: string, usePrivateMode?: boolean) => void
   getAppVersion: () => Promise<string>
@@ -759,6 +771,9 @@ interface KiroApi {
   proxySetCustomerEnabled: (id: string, enabled: boolean) => Promise<{ success: boolean; customer?: CustomerView; error?: string }>
   proxyResetCustomerPassword: (id: string, password: string) => Promise<{ success: boolean; error?: string }>
   proxyDeleteCustomer: (id: string) => Promise<{ success: boolean; revokedKeys?: number; error?: string }>
+  proxyCreateInvite: (input: { email: string; name?: string; creditBalance?: number; maxKeys?: number; expiresInDays?: number }) => Promise<{ success: boolean; invite?: InviteView; error?: string }>
+  proxyListInvites: () => Promise<{ success: boolean; invites?: InviteView[]; error?: string }>
+  proxyRevokeInvite: (code: string) => Promise<{ success: boolean; error?: string }>
 
   // 安装 CA 证书到系统信任存储
   kproxyInstallCaCert: () => Promise<{ success: boolean; message?: string; error?: string }>
