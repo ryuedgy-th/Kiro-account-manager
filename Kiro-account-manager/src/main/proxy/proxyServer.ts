@@ -5542,7 +5542,7 @@ const PORTAL_HTML = `<!doctype html>
   // effort 档位的显示文案 + 排序权重（none 最低，max 最高）
   var EFFORT_ORDER = { none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
   function effortLabel(e){
-    var map = { none: 'ไม่มี', minimal: 'น้อยมาก', low: 'ต่ำ', medium: 'กลาง', high: 'สูง', xhigh: 'สูงมาก', max: 'สูงสุด' };
+    var map = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max' };
     return map[e] || e;
   }
 

@@ -59,10 +59,13 @@ export function ApiKeyUsageDialog({ open, onOpenChange, apiKey }: ApiKeyUsageDia
     return model.replace('anthropic.', '').replace('-v1:0', '')
   }
 
-  // effort 档位显示：none → '–'，其余首字母大写，保持与客户门户口径一致
+  // effort 档位显示：none → '–'，其余用与客户门户一致的英文标签
   const formatEffort = (effort?: string) => {
     if (!effort || effort === 'none') return '–'
-    return effort.charAt(0).toUpperCase() + effort.slice(1)
+    const map: Record<string, string> = {
+      minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max'
+    }
+    return map[effort] || effort.charAt(0).toUpperCase() + effort.slice(1)
   }
 
   // 计算每日统计（最近7天）
