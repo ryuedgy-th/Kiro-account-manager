@@ -512,6 +512,23 @@ export interface Customer {
   topupHistory?: Array<{ timestamp: number; amount: number; note?: string; by?: string }>
 }
 
+/**
+ * 客户脱敏视图：用于管理端（HTTP /admin/customers 与 IPC）返回给前端，
+ * 绝不包含 passwordSalt / passwordHash。附带名下 Key 数量与 maxKeys 上限。
+ */
+export interface CustomerView {
+  id: string
+  email: string
+  name?: string
+  enabled: boolean
+  createdAt: number
+  lastLoginAt?: number
+  creditBalance: number
+  totalToppedUp: number
+  keyCount: number
+  maxKeys: number
+}
+
 // 模型映射规则
 export interface ModelMappingRule {
   id: string
@@ -578,6 +595,15 @@ export interface ProxyConfig {
   multiAccountGroupIds?: string[]
   // 模型映射规则
   modelMappings?: ModelMappingRule[]
+  /**
+   * 对外开放的模型 ID 白名单（精确匹配 model ID，大小写不敏感）。
+   * 未设置或空数组 = 开放全部模型（向后兼容，零行为变更）。
+   * 设置后：/v1/models 与门户费率表只列出白名单内的模型；
+   * /v1/messages、/v1/chat/completions、/v1/responses、Gemini 等请求若指定
+   * 白名单外的模型，直接返回 403 permission_error（既隐藏也拦截）。
+   * 注意：比对的是「经 modelMappings 映射后」的最终模型 ID。
+   */
+  allowedModels?: string[]
 
   // 服务端 web 工具（web_search / web_fetch）配置
   // 启用后，代理会拦截模型发起的 web_search/web_fetch 调用并在代理侧执行（经第三方搜索 API），
@@ -650,6 +676,34 @@ export interface ProxyConfig {
    * 此上限把"接近耗尽时的超额消费"约束在 N 个请求以内，而不会无上限透支。
    */
   portalMaxConcurrentPerCustomer?: number
+
+  // ============ 计费定价（v1.10 新增，转售加价层） ============
+  /**
+   * 转售定价配置。creditBalance 仍以 credit 为单位（与 Kiro 计费口径一致），
+   * 此处叠加"加价/换算层"：把 Kiro 实扣的 credit 换算成对客户的售价（泰铢），
+   * 并支持按模型设定加价倍率。enabled !== true 时一切按原样运行（零行为变更）。
+   */
+  pricing?: PricingConfig
+}
+
+export interface PricingConfig {
+  /** 计费层总开关。未开启（默认）= 完全沿用旧逻辑：扣减原始 credit、门户按 credit 显示。 */
+  enabled?: boolean
+  /** 对客户的售价：每 credit 多少泰铢（用于充值换算与门户金额显示）。默认 0.42。 */
+  bahtPerCredit?: number
+  /** 你的成本：每 credit 多少泰铢（仅用于后台毛利显示，不影响扣费）。默认 0.16。 */
+  costPerCredit?: number
+  /** 美元兑泰铢汇率（用于把 Kiro 官方美元价换算成泰铢做对比）。默认 36。 */
+  usdToBaht?: number
+  /** 支付网关手续费百分比（用于后台净利预估，不影响扣费）。默认 0。 */
+  gatewayFeePct?: number
+  /** Kiro 官方零售单价（美元/credit），用于门户"比官方省 X%"对比。默认 0.02（$200/10000）。 */
+  kiroRetailUsdPerCredit?: number
+  /**
+   * 按模型加价倍率：实扣 credit = Kiro 原始 credit × 此倍率（缺省/未配置 = 1.0）。
+   * 仅在 enabled === true 时生效；倍率 <= 0 视为 1.0。
+   */
+  modelMarkup?: Record<string, number>
 }
 
 export interface TlsConfig {

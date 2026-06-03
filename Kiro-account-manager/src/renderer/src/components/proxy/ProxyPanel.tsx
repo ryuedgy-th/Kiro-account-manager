@@ -10,6 +10,8 @@ import { ModelsDialog } from './ModelsDialog'
 import { ModelMappingDialog } from './ModelMappingDialog'
 import { AccountSelectDialog } from './AccountSelectDialog'
 import { ApiKeyManager } from './ApiKeyManager'
+import { CustomerManager } from './CustomerManager'
+import { PricingSettings } from './PricingSettings'
 import { ClientConfigDialog } from './ClientConfigDialog'
 import { createPortal } from 'react-dom'
 
@@ -84,6 +86,8 @@ interface ProxyConfig {
   multiAccountSelectionMode?: 'all' | 'groups'
   multiAccountGroupIds?: string[]
   modelMappings?: ModelMappingRule[]
+  // 对外开放的模型白名单（空/未设 = 开放全部）
+  allowedModels?: string[]
   // v1.8 安全 / 限流 / 可观测
   maxRequestBodyBytes?: number
   allowedIPs?: string[]
@@ -103,6 +107,16 @@ interface ProxyConfig {
     provider: 'tavily'
     apiKey: string
     maxRounds?: number
+  }
+  // v1.10 转售定价层（creditBalance 仍以 credit 计，此处叠加加价/换算）
+  pricing?: {
+    enabled?: boolean
+    bahtPerCredit?: number
+    costPerCredit?: number
+    usdToBaht?: number
+    gatewayFeePct?: number
+    kiroRetailUsdPerCredit?: number
+    modelMarkup?: Record<string, number>
   }
 }
 
@@ -173,6 +187,7 @@ export function ProxyPanel() {
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; name: string }>>([])
   const [showAccountSelectDialog, setShowAccountSelectDialog] = useState(false)
   const [showApiKeyManager, setShowApiKeyManager] = useState(false)
+  const [showCustomerManager, setShowCustomerManager] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
   const [showWebSearchKey, setShowWebSearchKey] = useState(false)
   const [apiKeyFormat, setApiKeyFormat] = useState<'sk' | 'simple' | 'token'>('sk')
@@ -676,6 +691,9 @@ export function ProxyPanel() {
                   <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setShowApiKeyManager(true)} title={isEn ? 'Manage Multiple API Keys' : '管理多个 API Key'}>
                     <Settings2 className="h-3.5 w-3.5" />
                   </Button>
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setShowCustomerManager(true)} title={isEn ? 'Customer Portal & Billing' : '客户门户与计费'}>
+                    <Users className="h-3.5 w-3.5" />
+                  </Button>
                 </div>
               </div>
               <div className="relative">
@@ -1135,6 +1153,87 @@ export function ProxyPanel() {
         </CardContent>
       </Card>
 
+      {/* 对外模型白名单：勾选后只有选中的模型会出现在 /v1/models 与门户费率表，
+          且白名单外的模型直接被请求层拦截（403）。全不选 = 开放全部（向后兼容）。 */}
+      <Card className="hover-lift">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">{isEn ? 'Model Allowlist' : '对外模型白名单'}</CardTitle>
+          <CardDescription className="text-xs">
+            {isEn
+              ? 'Select which models customers can see and call. Leave all unchecked to expose every model.'
+              : '勾选对外开放的模型；列表与请求都只允许这些模型。全不选 = 开放全部。'}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {availableModels.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {isEn ? 'No models loaded. Start the service and click Refresh Models.' : '暂无模型，请启动服务后点「刷新模型」。'}
+            </p>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => {
+                    const claudeIds = availableModels
+                      .filter(m => /^claude-(opus|sonnet|haiku)-\d/i.test(m.id))
+                      .map(m => m.id)
+                    setConfig(prev => ({ ...prev, allowedModels: claudeIds }))
+                    window.api.proxyUpdateConfig({ allowedModels: claudeIds })
+                  }}
+                >
+                  {isEn ? 'Claude only' : '仅 Claude'}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => {
+                    setConfig(prev => ({ ...prev, allowedModels: [] }))
+                    window.api.proxyUpdateConfig({ allowedModels: [] })
+                  }}
+                >
+                  {isEn ? 'Allow all' : '开放全部'}
+                </Button>
+                <span className="text-[11px] text-muted-foreground">
+                  {(config.allowedModels?.length ?? 0) === 0
+                    ? (isEn ? 'All models open' : '当前：开放全部')
+                    : (isEn ? `${config.allowedModels?.length} model(s) allowed` : `当前：开放 ${config.allowedModels?.length} 个`)}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 max-h-56 overflow-y-auto">
+                {availableModels.map(m => {
+                  const checked = (config.allowedModels?.length ?? 0) === 0
+                    ? false
+                    : !!config.allowedModels?.some(id => id.toLowerCase() === m.id.toLowerCase())
+                  return (
+                    <label key={m.id} className="flex items-center gap-2 text-xs cursor-pointer rounded px-2 py-1 hover:bg-muted/50">
+                      <input
+                        type="checkbox"
+                        className="h-3.5 w-3.5"
+                        checked={checked}
+                        onChange={(e) => {
+                          const cur = config.allowedModels ?? []
+                          const next = e.target.checked
+                            ? [...cur.filter(id => id.toLowerCase() !== m.id.toLowerCase()), m.id]
+                            : cur.filter(id => id.toLowerCase() !== m.id.toLowerCase())
+                          setConfig(prev => ({ ...prev, allowedModels: next }))
+                          window.api.proxyUpdateConfig({ allowedModels: next })
+                        }}
+                      />
+                      <span className="truncate" title={m.id}>{m.name}</span>
+                      <span className="text-[10px] text-muted-foreground truncate">{m.id}</span>
+                    </label>
+                  )
+                })}
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
       {/* v1.8 反代安全 / 可观测设置（独立卡片，可折叠） */}
       <ProxySecurityPanel
         config={config as unknown as Parameters<typeof ProxySecurityPanel>[0]['config']}
@@ -1570,6 +1669,22 @@ export function ProxyPanel() {
               <Button variant="ghost" size="icon" onClick={() => setShowApiKeyManager(false)}>✕</Button>
             </div>
             <ApiKeyManager />
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* 客户门户管理弹窗 */}
+      {showCustomerManager && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowCustomerManager(false)} />
+          <div className="relative bg-background rounded-lg shadow-lg w-[860px] max-h-[85vh] overflow-y-auto p-4">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold">{isEn ? 'Customer Portal & Billing' : '客户门户与计费'}</h2>
+              <Button variant="ghost" size="icon" onClick={() => setShowCustomerManager(false)}>✕</Button>
+            </div>
+            <PricingSettings />
+            <CustomerManager />
           </div>
         </div>,
         document.body

@@ -30,13 +30,15 @@ import {
   createOpenaiStreamChunk,
   createClaudeStreamEvent,
   responsesToOpenAIChat,
-  openAIChatToResponsesResponse
+  openAIChatToResponsesResponse,
+  setModelThinkingCapability,
+  clearModelThinkingCapabilities
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { isServerWebTool, type WebToolConfig } from './webTools'
 import * as portal from './portal'
-import type { Customer } from './types'
+import type { Customer, CustomerView } from './types'
 
 
 // 把代理侧执行的 web 工具记录，转换为 Anthropic 原生 content block 序列：
@@ -138,13 +140,64 @@ type ClientModel = {
   parent: null
 }
 
+// normalizeCreditsLimit 的哨兵返回值：表示客户传入的 creditsLimit 非法（非正数 / 非数字），调用方据此回 400。
+const INVALID_LIMIT = Symbol('invalid-credits-limit')
+
+// 从 modelId 解析 Claude 家族与版本号（仅匹配规范名 claude-{family}-{major}[.-{minor}]）。
+// minor 限定 1~2 位且其后非数字，避免把日期快照（claude-sonnet-4-20250514）误读成 minor=20250514。
+// 返回 versionLabel 用于显示（"4.8" / "4"），version 为数值用于比较取最新。
+function parseClaudeFamilyVersion(id: string): { family: string; version: number; versionLabel: string } | null {
+  const m = id.toLowerCase().match(/^claude-(opus|sonnet|haiku)-(\d+)(?:[.-](\d{1,2})(?=$|[^\d]))?/)
+  if (!m) return null
+  const major = m[2]
+  const minor = m[3]
+  const versionLabel = minor !== undefined ? `${major}.${minor}` : major
+  return { family: m[1], version: parseFloat(versionLabel), versionLabel }
+}
+
 function modelDisplayName(id: string, modelName?: string): string {
+  // Claude 规范模型：始终用 modelId 里的真实版本号生成显示名（"Opus 4.8"），
+  // 不信任后端 modelName——它常把多个版本统一写成 "Opus 4"，导致下拉里无法区分版本。
+  const cv = parseClaudeFamilyVersion(id)
+  if (cv) {
+    return `${cv.family.charAt(0).toUpperCase()}${cv.family.slice(1)} ${cv.versionLabel}`
+  }
   if (modelName?.trim()) return modelName
   return id
     .split('-')
     .filter(Boolean)
     .map(part => part === 'gpt' ? 'GPT' : part === 'ai' ? 'AI' : part[0]?.toUpperCase() + part.slice(1))
     .join(' ')
+}
+
+// 内部/历史模型 ID：大写 CW 内部 ID（CLAUDE_SONNET_4_..._V1_0）、simple-task、claude-3.x 历史版本。
+// 这些仍可经 /v1/messages 直接按 ID 调用，只是不进 picker / 费率表（避免列表冗杂、版本无法区分）。
+function isInternalOrLegacyModelId(id: string): boolean {
+  const lower = id.toLowerCase()
+  return /^[A-Z0-9_]+$/.test(id)
+    || lower === 'simple-task'
+    || lower.startsWith('claude-3')
+}
+
+// 把完整模型列表精简为「面向客户端 picker / 费率表」的列表：
+//   - 同一 Claude 家族（opus/sonnet/haiku）只保留版本号最高的一个；
+//   - 剔除内部/历史 ID；
+//   - 非 Claude（auto / gpt 别名 / deepseek 等）原样保留。
+// 供 /v1/models（Cowork/Claude Code 下拉）与 /portal/rates（客户费率表）共用，保证两处口径一致。
+function filterPickerModels<T extends { id: string }>(models: T[]): T[] {
+  const latestByFamily = new Map<string, { version: number; id: string }>()
+  for (const m of models) {
+    const cv = parseClaudeFamilyVersion(m.id)
+    if (!cv) continue
+    const cur = latestByFamily.get(cv.family)
+    if (!cur || cv.version > cur.version) latestByFamily.set(cv.family, { version: cv.version, id: m.id })
+  }
+  return models.filter(m => {
+    if (isInternalOrLegacyModelId(m.id)) return false
+    const cv = parseClaudeFamilyVersion(m.id)
+    if (cv) return latestByFamily.get(cv.family)?.id === m.id
+    return true
+  }).filter((m, i, arr) => arr.findIndex(x => x.id === m.id) === i) // 去重（按 id 保留首个），供 /portal/rates 直接 map 时不出现重复行
 }
 
 function modelFamily(id: string): string {
@@ -203,6 +256,24 @@ function extractThinkingEfforts(schema?: Record<string, unknown> | null): string
     return effortEnum || undefined
   }
   return undefined
+}
+
+// 从 Kiro 模型的 additionalModelRequestFieldsSchema 读取该模型是否支持 thinking。
+function schemaSupportsThinking(schema?: Record<string, unknown> | null): boolean {
+  return !!(schema?.properties as Record<string, unknown> | undefined)?.thinking
+}
+
+// 将后端返回的模型真实能力同步进 translator 的能力注册表，
+// 供 buildAdditionalModelRequestFields 按真实 schema 决定是否下发 thinking / 哪些 effort 合法。
+function syncModelThinkingCapabilities(models: KiroModel[]): void {
+  clearModelThinkingCapabilities()
+  for (const m of models) {
+    if (!m.modelId) continue
+    setModelThinkingCapability(m.modelId, {
+      supportsThinking: schemaSupportsThinking(m.additionalModelRequestFieldsSchema),
+      thinkingEfforts: extractThinkingEfforts(m.additionalModelRequestFieldsSchema) ?? []
+    })
+  }
 }
 
 function buildClientModel(input: {
@@ -1060,6 +1131,7 @@ export class ProxyServer {
   // 清除模型缓存，强制下次请求重新获取
   clearModelCache(): void {
     this.modelCache = null
+    clearModelThinkingCapabilities()
     console.log('[ProxyServer] Model cache cleared')
   }
 
@@ -1108,6 +1180,8 @@ export class ProxyServer {
               setModelContextWindow(m.modelId, m.tokenLimits.maxInputTokens)
             }
           }
+          // 同步真实 thinking/effort 能力到 translator，供 additionalModelRequestFields 构建时校验
+          syncModelThinkingCapabilities(kiroModels)
         }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
@@ -1802,6 +1876,39 @@ export class ProxyServer {
   }
 
   // 记录 API Key 用量
+  /**
+   * 计费层：返回某模型的加价倍率。计费未启用、未配置或非正数时一律返回 1.0，
+   * 因此默认行为与旧逻辑完全一致（实扣 = 原始 credit × 1）。
+   */
+  private modelMarkupFor(model?: string): number {
+    const pricing = this.config.pricing
+    if (!pricing || pricing.enabled !== true || !model) return 1
+    const m = pricing.modelMarkup?.[model]
+    return typeof m === 'number' && m > 0 ? m : 1
+  }
+
+  /**
+   * 门户对外暴露的定价视图：仅含面向客户的安全字段（售价 / 汇率 / 官方对比 / 加价倍率），
+   * 绝不包含成本价 costPerCredit 或网关费等内部毛利信息。计费未启用时返回 { enabled:false }。
+   */
+  private publicPricing(): {
+    enabled: boolean
+    bahtPerCredit?: number
+    usdToBaht?: number
+    kiroRetailUsdPerCredit?: number
+    modelMarkup?: Record<string, number>
+  } {
+    const p = this.config.pricing
+    if (!p || p.enabled !== true) return { enabled: false }
+    return {
+      enabled: true,
+      bahtPerCredit: typeof p.bahtPerCredit === 'number' && p.bahtPerCredit > 0 ? p.bahtPerCredit : 0.42,
+      usdToBaht: typeof p.usdToBaht === 'number' && p.usdToBaht > 0 ? p.usdToBaht : 36,
+      kiroRetailUsdPerCredit: typeof p.kiroRetailUsdPerCredit === 'number' && p.kiroRetailUsdPerCredit > 0 ? p.kiroRetailUsdPerCredit : 0.02,
+      modelMarkup: p.modelMarkup || {}
+    }
+  }
+
   recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string): void {
     if (!this.config.apiKeys) return
     const apiKey = this.config.apiKeys.find(k => k.id === apiKeyId)
@@ -1858,10 +1965,11 @@ export class ProxyServer {
 
     // 客户门户预付扣费：Key 归属某客户时，从其 creditBalance 扣减本次消耗的 credit。
     // 允许扣成负数（最后一次请求可能略微超额），下次请求 validateApiKey 会因 <=0 拒绝。
+    // v1.10：启用计费层后，按模型加价倍率扣减（实扣 = 原始 credit × markup）。
     if (apiKey.customerId && credits > 0 && this.config.customers) {
       const customer = this.config.customers.find(c => c.id === apiKey.customerId)
       if (customer) {
-        customer.creditBalance -= credits
+        customer.creditBalance -= credits * this.modelMarkupFor(model)
       }
     }
 
@@ -1907,6 +2015,19 @@ export class ProxyServer {
   }
 
   // 应用模型映射
+  /**
+   * 模型白名单判定：config.allowedModels 未设置或为空 = 放行全部（向后兼容）。
+   * 设置后按「精确 model ID（大小写不敏感）」比对——避免 family 级放行误开放
+   * 同家族的历史/内部版本（如只想开 claude-sonnet-4.6 却连带放行 claude-3.x）。
+   */
+  private isModelAllowed(modelId: string): boolean {
+    const allow = this.config.allowedModels
+    if (!allow || allow.length === 0) return true
+    const target = (modelId || '').trim().toLowerCase()
+    if (!target) return false
+    return allow.some(m => m.trim().toLowerCase() === target)
+  }
+
   private applyModelMapping(requestedModel: string, apiKeyId?: string): string {
     const mappings = this.config.modelMappings
     if (!mappings || mappings.length === 0) return requestedModel
@@ -2184,16 +2305,45 @@ export class ProxyServer {
         return
       }
       await this.handleAdminTopupCustomer(req, res, customerId, signal)
+    } else if (/^\/admin\/customers\/[^/]+\/(enable|disable)$/.test(path) && method === 'POST') {
+      // 启用/停用客户
+      let customerId: string
+      try { customerId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'Customer not found')
+        return
+      }
+      this.handleAdminSetCustomerEnabled(res, customerId, path.endsWith('/enable'))
+    } else if (/^\/admin\/customers\/[^/]+\/password$/.test(path) && method === 'POST') {
+      // 管理员重置客户密码
+      let customerId: string
+      try { customerId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'Customer not found')
+        return
+      }
+      await this.handleAdminResetCustomerPassword(req, res, customerId, signal)
+    } else if (/^\/admin\/customers\/[^/]+$/.test(path) && method === 'DELETE') {
+      // 删除客户（同时吊销其名下 Key）
+      let customerId: string
+      try { customerId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'Customer not found')
+        return
+      }
+      this.handleAdminDeleteCustomer(res, customerId)
     } else {
       this.sendError(res, 404, 'Admin endpoint not found')
     }
   }
 
   // ============ 管理 API - 客户管理 ============
+  //
+  // 业务逻辑集中在「programmatic」方法（createCustomer / topupCustomer / ...），
+  // 不耦合 http req/res：校验失败抛 Error，调用方（HTTP handler 或 主进程 IPC）
+  // 自行转成各自的响应。这样 REST(/admin/*) 与 桌面端 IPC 共用同一份实现，
+  // 不会出现「改一处漏一处」的重复逻辑。
 
-  /** 客户列表脱敏视图（不含密码哈希/salt，附带名下 Key 数量） */
-  private handleAdminListCustomers(res: http.ServerResponse): void {
-    const customers = (this.config.customers || []).map(c => ({
+  /** 单个客户脱敏视图（不含密码哈希/salt） */
+  private toCustomerView(c: Customer): CustomerView {
+    return {
       id: c.id,
       email: c.email,
       name: c.name,
@@ -2204,11 +2354,100 @@ export class ProxyServer {
       totalToppedUp: c.totalToppedUp || 0,
       keyCount: portal.customerKeys(this.config, c.id).length,
       maxKeys: portal.maxKeysFor(this.config, c)
-    }))
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ customers }))
+    }
   }
 
+  /** 客户列表（脱敏）。供 HTTP 与 IPC 共用。 */
+  listCustomers(): CustomerView[] {
+    return (this.config.customers || []).map(c => this.toCustomerView(c))
+  }
+
+  /**
+   * 创建客户。校验失败抛 Error（message 可直接展示）。成功返回脱敏视图。
+   * 共用：HTTP POST /admin/customers 与 IPC proxy-create-customer。
+   */
+  async createCustomer(input: { email?: string; password?: string; name?: string; creditBalance?: number; maxKeys?: number }): Promise<CustomerView> {
+    const email = portal.normalizeEmail(input.email || '')
+    if (!portal.isValidEmail(email)) throw new Error('Invalid email')
+    if (!portal.isStrongEnoughPassword(input.password || '')) throw new Error('Password too short (min 8 chars)')
+    if (portal.findCustomerByEmail(this.config, email)) throw new Error('Email already exists')
+    const now = Date.now()
+    const customer = await portal.buildCustomer(email, input.password!, {
+      name: input.name,
+      creditBalance: typeof input.creditBalance === 'number' ? input.creditBalance : 0,
+      maxKeys: input.maxKeys
+    }, now)
+    if (!this.config.customers) this.config.customers = []
+    this.config.customers.push(customer)
+    this.appendAuditLog('customer_created', { id: customer.id, email: customer.email })
+    this.events.onConfigChanged?.(this.config)
+    return this.toCustomerView(customer)
+  }
+
+  /**
+   * 人工充值/扣减 credit（amount 可为负）。返回最新余额。
+   * 共用：HTTP POST /admin/customers/:id/credit 与 IPC proxy-topup-customer。
+   */
+  topupCustomer(customerId: string, amount: number, note?: string): { creditBalance: number } {
+    const amt = Number(amount)
+    if (!Number.isFinite(amt) || amt === 0) throw new Error('amount must be a non-zero number')
+    const customer = portal.findCustomerById(this.config, customerId)
+    if (!customer) throw new Error('Customer not found')
+    customer.creditBalance += amt
+    if (amt > 0) customer.totalToppedUp = (customer.totalToppedUp || 0) + amt
+    if (!customer.topupHistory) customer.topupHistory = []
+    customer.topupHistory.unshift({ timestamp: Date.now(), amount: amt, note, by: 'admin' })
+    if (customer.topupHistory.length > 100) customer.topupHistory = customer.topupHistory.slice(0, 100)
+    this.appendAuditLog('customer_topup', { id: customer.id, amount: amt })
+    this.events.onConfigChanged?.(this.config)
+    return { creditBalance: customer.creditBalance }
+  }
+
+  /** 启用/停用客户（停用后该客户无法登录门户、名下 Key 全部被拒）。 */
+  setCustomerEnabled(customerId: string, enabled: boolean): CustomerView {
+    const customer = portal.findCustomerById(this.config, customerId)
+    if (!customer) throw new Error('Customer not found')
+    customer.enabled = enabled
+    this.appendAuditLog('customer_enabled_changed', { id: customer.id, enabled })
+    this.events.onConfigChanged?.(this.config)
+    return this.toCustomerView(customer)
+  }
+
+  /** 管理员重置客户密码（旧密码立即失效）。 */
+  async resetCustomerPassword(customerId: string, newPassword: string): Promise<void> {
+    if (!portal.isStrongEnoughPassword(newPassword || '')) throw new Error('Password too short (min 8 chars)')
+    const customer = portal.findCustomerById(this.config, customerId)
+    if (!customer) throw new Error('Customer not found')
+    const { salt, hash } = await portal.hashPassword(newPassword)
+    customer.passwordSalt = salt
+    customer.passwordHash = hash
+    this.appendAuditLog('customer_password_reset', { id: customer.id })
+    this.events.onConfigChanged?.(this.config)
+  }
+
+  /**
+   * 删除客户，并吊销其名下全部 Key（避免遗留可用 Key 仍能计费扣到已删客户）。
+   * 返回被吊销的 Key 数量。
+   */
+  deleteCustomer(customerId: string): { revokedKeys: number } {
+    const customer = portal.findCustomerById(this.config, customerId)
+    if (!customer) throw new Error('Customer not found')
+    const before = (this.config.apiKeys || []).length
+    this.config.apiKeys = (this.config.apiKeys || []).filter(k => k.customerId !== customerId)
+    const revokedKeys = before - (this.config.apiKeys || []).length
+    this.config.customers = (this.config.customers || []).filter(c => c.id !== customerId)
+    this.appendAuditLog('customer_deleted', { id: customerId, revokedKeys })
+    this.events.onConfigChanged?.(this.config)
+    return { revokedKeys }
+  }
+
+  /** HTTP 适配：客户列表 */
+  private handleAdminListCustomers(res: http.ServerResponse): void {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ customers: this.listCustomers() }))
+  }
+
+  /** HTTP 适配：创建客户 */
   private async handleAdminCreateCustomer(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const body = await this.readBody(req, signal)
     let parsed: { email?: string; password?: string; name?: string; creditBalance?: number; maxKeys?: number }
@@ -2216,33 +2455,17 @@ export class ProxyServer {
       this.sendError(res, 400, 'Invalid JSON body')
       return
     }
-    const email = portal.normalizeEmail(parsed.email || '')
-    if (!portal.isValidEmail(email)) {
-      this.sendError(res, 400, 'Invalid email')
-      return
+    try {
+      const customer = await this.createCustomer(parsed)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, customer: { id: customer.id, email: customer.email, creditBalance: customer.creditBalance } }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to create customer'
+      this.sendError(res, msg === 'Email already exists' ? 409 : 400, msg)
     }
-    if (!portal.isStrongEnoughPassword(parsed.password || '')) {
-      this.sendError(res, 400, 'Password too short (min 8 chars)')
-      return
-    }
-    if (portal.findCustomerByEmail(this.config, email)) {
-      this.sendError(res, 409, 'Email already exists')
-      return
-    }
-    const now = Date.now()
-    const customer = await portal.buildCustomer(email, parsed.password!, {
-      name: parsed.name,
-      creditBalance: typeof parsed.creditBalance === 'number' ? parsed.creditBalance : 0,
-      maxKeys: parsed.maxKeys
-    }, now)
-    if (!this.config.customers) this.config.customers = []
-    this.config.customers.push(customer)
-    this.appendAuditLog('customer_created', { id: customer.id, email: customer.email })
-    this.events.onConfigChanged?.(this.config)
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ success: true, customer: { id: customer.id, email: customer.email, creditBalance: customer.creditBalance } }))
   }
 
+  /** HTTP 适配：充值/扣减 credit */
   private async handleAdminTopupCustomer(req: http.IncomingMessage, res: http.ServerResponse, customerId: string, signal?: AbortSignal): Promise<void> {
     const body = await this.readBody(req, signal)
     let parsed: { amount?: number; note?: string }
@@ -2250,25 +2473,56 @@ export class ProxyServer {
       this.sendError(res, 400, 'Invalid JSON body')
       return
     }
-    const amount = Number(parsed.amount)
-    if (!Number.isFinite(amount) || amount === 0) {
-      this.sendError(res, 400, 'amount must be a non-zero number')
+    try {
+      const { creditBalance } = this.topupCustomer(customerId, Number(parsed.amount), parsed.note)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, creditBalance }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to top up'
+      this.sendError(res, msg === 'Customer not found' ? 404 : 400, msg)
+    }
+  }
+
+  /** HTTP 适配：启用/停用客户（path 末段 enable|disable） */
+  private handleAdminSetCustomerEnabled(res: http.ServerResponse, customerId: string, enabled: boolean): void {
+    try {
+      const view = this.setCustomerEnabled(customerId, enabled)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, customer: view }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed'
+      this.sendError(res, msg === 'Customer not found' ? 404 : 400, msg)
+    }
+  }
+
+  /** HTTP 适配：重置客户密码 */
+  private async handleAdminResetCustomerPassword(req: http.IncomingMessage, res: http.ServerResponse, customerId: string, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    let parsed: { password?: string }
+    try { parsed = JSON.parse(body) } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
       return
     }
-    const customer = portal.findCustomerById(this.config, customerId)
-    if (!customer) {
-      this.sendError(res, 404, 'Customer not found')
-      return
+    try {
+      await this.resetCustomerPassword(customerId, parsed.password || '')
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed'
+      this.sendError(res, msg === 'Customer not found' ? 404 : 400, msg)
     }
-    customer.creditBalance += amount
-    if (amount > 0) customer.totalToppedUp = (customer.totalToppedUp || 0) + amount
-    if (!customer.topupHistory) customer.topupHistory = []
-    customer.topupHistory.unshift({ timestamp: Date.now(), amount, note: parsed.note, by: 'admin' })
-    if (customer.topupHistory.length > 100) customer.topupHistory = customer.topupHistory.slice(0, 100)
-    this.appendAuditLog('customer_topup', { id: customer.id, amount })
-    this.events.onConfigChanged?.(this.config)
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ success: true, creditBalance: customer.creditBalance }))
+  }
+
+  /** HTTP 适配：删除客户 */
+  private handleAdminDeleteCustomer(res: http.ServerResponse, customerId: string): void {
+    try {
+      const { revokedKeys } = this.deleteCustomer(customerId)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, revokedKeys }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed'
+      this.sendError(res, msg === 'Customer not found' ? 404 : 400, msg)
+    }
   }
 
   // ============ 客户门户 API ============
@@ -2324,12 +2578,21 @@ export class ProxyServer {
         creditBalance: customer.creditBalance,
         totalToppedUp: customer.totalToppedUp || 0,
         maxKeys: portal.maxKeysFor(this.config, customer),
-        keyCount: portal.customerKeys(this.config, customer.id).length
+        keyCount: portal.customerKeys(this.config, customer.id).length,
+        pricing: this.publicPricing()
       })
     } else if (path === '/portal/keys' && method === 'GET') {
       this.handlePortalListKeys(res, customer)
     } else if (path === '/portal/keys' && method === 'POST') {
       await this.handlePortalCreateKey(req, res, customer, signal)
+    } else if (/^\/portal\/keys\/[^/]+$/.test(path) && method === 'PUT') {
+      let keyId: string
+      try { keyId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendJson(res, 404, { error: 'Key not found' })
+        return
+      }
+      const body = await this.readBody(req, signal)
+      this.handlePortalUpdateKey(res, customer, keyId, body)
     } else if (/^\/portal\/keys\/[^/]+$/.test(path) && method === 'DELETE') {
       let keyId: string
       try { keyId = decodeURIComponent(path.split('/')[3]) } catch {
@@ -2339,6 +2602,8 @@ export class ProxyServer {
       this.handlePortalDeleteKey(res, customer, keyId)
     } else if (path === '/portal/usage' && method === 'GET') {
       this.handlePortalUsage(res, customer)
+    } else if (path === '/portal/rates' && method === 'GET') {
+      await this.handlePortalRates(res, signal)
     } else {
       this.sendJson(res, 404, { error: 'Not found' })
     }
@@ -2382,7 +2647,8 @@ export class ProxyServer {
       createdAt: k.createdAt,
       lastUsedAt: k.lastUsedAt,
       totalCredits: k.usage.totalCredits,
-      totalRequests: k.usage.totalRequests
+      totalRequests: k.usage.totalRequests,
+      creditsLimit: k.creditsLimit ?? null
     }))
     this.sendJson(res, 200, { keys })
   }
@@ -2395,9 +2661,15 @@ export class ProxyServer {
       return
     }
     const body = await this.readBody(req, signal)
-    let parsed: { name?: string } = {}
+    let parsed: { name?: string; creditsLimit?: unknown } = {}
     try { parsed = body ? JSON.parse(body) : {} } catch {
       this.sendJson(res, 400, { error: 'Invalid JSON body' })
+      return
+    }
+    // 客户自助设置的 credit 上限（按该 Key 累计扣费计）。仅接受正数；缺省/0/null = 无限制。
+    const creditsLimit = this.normalizeCreditsLimit(parsed.creditsLimit)
+    if (creditsLimit === INVALID_LIMIT) {
+      this.sendJson(res, 400, { error: 'creditsLimit must be a positive number' })
       return
     }
     // 读 body 后、push 前再次校验（readBody 是 await，期间可能有并发创建）——闭合竞态
@@ -2408,12 +2680,47 @@ export class ProxyServer {
     }
     const name = (parsed.name || '').trim().slice(0, 64) || `key-${existing.length + 1}`
     const newKey = portal.buildApiKey(name, customer.id, Date.now())
+    if (typeof creditsLimit === 'number') newKey.creditsLimit = creditsLimit
     if (!this.config.apiKeys) this.config.apiKeys = []
     this.config.apiKeys.push(newKey)
     this.appendAuditLog('portal_key_created', { customerId: customer.id, keyId: newKey.id })
     this.events.onConfigChanged?.(this.config)
     // 创建时返回一次完整 key（仅此一次），之后列表只给脱敏值
-    this.sendJson(res, 200, { id: newKey.id, name: newKey.name, key: newKey.key })
+    this.sendJson(res, 200, { id: newKey.id, name: newKey.name, key: newKey.key, creditsLimit: newKey.creditsLimit ?? null })
+  }
+
+  private handlePortalUpdateKey(res: http.ServerResponse, customer: Customer, keyId: string, body: string): void {
+    const key = (this.config.apiKeys || []).find(k => k.id === keyId)
+    // 严格校验归属：只能改自己的 Key
+    if (!key || key.customerId !== customer.id) {
+      this.sendJson(res, 404, { error: 'Key not found' })
+      return
+    }
+    let parsed: { creditsLimit?: unknown } = {}
+    try { parsed = body ? JSON.parse(body) : {} } catch {
+      this.sendJson(res, 400, { error: 'Invalid JSON body' })
+      return
+    }
+    const creditsLimit = this.normalizeCreditsLimit(parsed.creditsLimit)
+    if (creditsLimit === INVALID_LIMIT) {
+      this.sendJson(res, 400, { error: 'creditsLimit must be a positive number' })
+      return
+    }
+    // number → 设上限；undefined（缺省/null/0）→ 清除上限（无限制）
+    if (typeof creditsLimit === 'number') key.creditsLimit = creditsLimit
+    else delete key.creditsLimit
+    this.appendAuditLog('portal_key_updated', { customerId: customer.id, keyId: key.id, creditsLimit: key.creditsLimit ?? null })
+    this.events.onConfigChanged?.(this.config)
+    this.sendJson(res, 200, { id: key.id, creditsLimit: key.creditsLimit ?? null })
+  }
+
+  // 解析客户传入的 creditsLimit：正有限数 → 该数值；缺省/null/<=0 → undefined（无限制）；
+  // 其它（字符串/NaN/负数以外的非法值）→ INVALID_LIMIT 哨兵，调用方据此回 400。
+  private normalizeCreditsLimit(raw: unknown): number | undefined | typeof INVALID_LIMIT {
+    if (raw === undefined || raw === null) return undefined
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) return INVALID_LIMIT
+    if (raw <= 0) return undefined
+    return raw
   }
 
   private handlePortalDeleteKey(res: http.ServerResponse, customer: Customer, keyId: string): void {
@@ -2433,25 +2740,75 @@ export class ProxyServer {
     const keys = portal.customerKeys(this.config, customer.id)
     // 汇总名下所有 Key 的按日用量
     const dailyAgg: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
+    // 按模型汇总（dashboard 展示每个模型用了多少 request / credit / token）
+    const modelAgg: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> = {}
     let totalCredits = 0
     let totalRequests = 0
+    let totalInputTokens = 0
+    let totalOutputTokens = 0
     for (const k of keys) {
       totalCredits += k.usage.totalCredits
       totalRequests += k.usage.totalRequests
+      // ?? 0 兜底：token 字段是后加的，旧持久化的 key 可能缺这两个字段，
+      // 直接相加会得到 NaN 并污染整份用量响应。
+      totalInputTokens += k.usage.totalInputTokens ?? 0
+      totalOutputTokens += k.usage.totalOutputTokens ?? 0
       for (const [day, d] of Object.entries(k.usage.daily || {})) {
         if (!dailyAgg[day]) dailyAgg[day] = { requests: 0, credits: 0, inputTokens: 0, outputTokens: 0 }
-        dailyAgg[day].requests += d.requests
-        dailyAgg[day].credits += d.credits
-        dailyAgg[day].inputTokens += d.inputTokens
-        dailyAgg[day].outputTokens += d.outputTokens
+        dailyAgg[day].requests += d.requests ?? 0
+        dailyAgg[day].credits += d.credits ?? 0
+        dailyAgg[day].inputTokens += d.inputTokens ?? 0
+        dailyAgg[day].outputTokens += d.outputTokens ?? 0
+      }
+      for (const [model, m] of Object.entries(k.usage.byModel || {})) {
+        if (!modelAgg[model]) modelAgg[model] = { requests: 0, credits: 0, inputTokens: 0, outputTokens: 0 }
+        modelAgg[model].requests += m.requests ?? 0
+        modelAgg[model].credits += m.credits ?? 0
+        modelAgg[model].inputTokens += m.inputTokens ?? 0
+        modelAgg[model].outputTokens += m.outputTokens ?? 0
       }
     }
     this.sendJson(res, 200, {
       creditBalance: customer.creditBalance,
       totalCredits,
       totalRequests,
-      daily: dailyAgg
+      totalInputTokens,
+      totalOutputTokens,
+      daily: dailyAgg,
+      byModel: modelAgg,
+      pricing: this.publicPricing()
     })
+  }
+
+  /**
+   * 门户费率表：返回当前 Kiro 各模型的计费倍率（rateMultiplier / rateUnit），
+   * 供客户在 dashboard 查看"哪个模型每次请求大概扣多少 credit"。
+   * 复用 getAvailableModels（带 5 分钟缓存）+ filterPickerModels，口径与 /v1/models 一致；
+   * 列表无法获取时返回空数组（dashboard 端会显示占位提示），不报错阻塞页面。
+   */
+  private async handlePortalRates(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    let rates: Array<{ id: string; name: string; rateMultiplier: number | null; rateUnit: string | null; maxInputTokens: number | null; maxOutputTokens: number | null }> = []
+    try {
+      const { models } = await this.getAvailableModels(signal)
+      // 客户费率表只展示我们实际对外提供的 3 个 Claude 家族（Opus/Sonnet/Haiku）。
+      // filterPickerModels 已把每个家族收敛到最新版本，这里再按 Claude 家族过滤掉
+      // Auto / 第三方模型（Deepseek/MiniMax/GLM/Qwen 等）——它们不在售卖范围内。
+      rates = filterPickerModels(models)
+        .filter(m => parseClaudeFamilyVersion(m.id))
+        .filter(m => this.isModelAllowed(m.id))
+        .map(m => ({
+        id: m.id,
+        name: modelDisplayName(m.id, m.name),
+        rateMultiplier: typeof m.rateMultiplier === 'number' ? m.rateMultiplier : null,
+        rateUnit: m.rateUnit || null,
+        maxInputTokens: m.maxInputTokens ?? null,
+        maxOutputTokens: m.maxOutputTokens ?? null
+      }))
+    } catch (e) {
+      if (this.isAbortError(e, signal)) throw e
+      proxyLogger.warn('ProxyServer', `handlePortalRates failed: ${(e as Error).message}`)
+    }
+    this.sendJson(res, 200, { models: rates })
   }
 
   /** 客户门户静态页面（自包含 HTML，无外部依赖） */
@@ -2551,7 +2908,7 @@ export class ProxyServer {
       'tokenRefreshBeforeExpiry', 'autoStart', 'clientDrivenToolExecution',
       'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
       'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
-      'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings',
+      'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings', 'allowedModels',
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
@@ -2684,7 +3041,7 @@ export class ProxyServer {
   // Gemini v1beta 模型列表
   private async handleGeminiModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const result = await this.getAvailableModels(signal)
-    const geminiModels = result.models.map(m => ({
+    const geminiModels = result.models.filter(m => this.isModelAllowed(m.id)).map(m => ({
       name: `models/${m.id}`,
       version: '001',
       displayName: m.name || m.id,
@@ -2736,6 +3093,12 @@ export class ProxyServer {
       temperature: geminiReq.generationConfig?.temperature,
       top_p: geminiReq.generationConfig?.topP,
       max_tokens: geminiReq.generationConfig?.maxOutputTokens
+    }
+
+    // 模型白名单拦截
+    if (!this.isModelAllowed(openaiRequest.model)) {
+      this.sendError(res, 403, `Model not available: ${openaiRequest.model}`)
+      return
     }
 
     // 复用 OpenAI 流程
@@ -2877,6 +3240,8 @@ export class ProxyServer {
                 setModelContextWindow(m.modelId, m.tokenLimits.maxInputTokens)
               }
             }
+            // 同步真实 thinking/effort 能力到 translator，供 additionalModelRequestFields 构建时校验
+            syncModelThinkingCapabilities(kiroModels)
             proxyLogger.info('ProxyServer', `Fetched ${kiroModels.length} models from Kiro API`)
           }
         } catch (error) {
@@ -2933,9 +3298,14 @@ export class ProxyServer {
       }
     }
 
+    // 4. 精简下拉列表（与 /portal/rates 共用 filterPickerModels，保证口径一致）：
+    //    同一 Claude 家族只留最新版本 + 剔除内部/历史 ID，避免 Cowork/Claude Code
+    //    下拉里出现一堆无法区分的 "Opus 4"。被剔除的模型仍可经 /v1/messages 按 ID 直调。
+    const pickerModels = filterPickerModels(allModels).filter(m => this.isModelAllowed(m.id))
+
     this.throwIfResponseClosed(res, signal)
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ object: 'list', data: allModels }))
+    res.end(JSON.stringify({ object: 'list', data: pickerModels }))
   }
 
   // 处理 OpenAI Chat Completions 请求
@@ -2955,6 +3325,16 @@ export class ProxyServer {
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
+
+    // 模型白名单拦截
+    if (!this.isModelAllowed(request.model)) {
+      this.recordRequestFailed()
+      const msg = `Model not available: ${request.model}`
+      this.sendError(res, 403, msg)
+      this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 403, error: msg })
+      this.recordRequest({ path: '/v1/chat/completions', model: request.model, responseTime: 0, success: false, error: msg })
+      return
+    }
 
     const startTime = Date.now()
 
@@ -3087,6 +3467,16 @@ export class ProxyServer {
       this.sendError(res, 400, message)
       this.events.onResponse?.({ path: '/v1/responses', status: 400, error: message })
       this.recordRequest({ path: '/v1/responses', responseTime: Date.now() - startTime, success: false, error: message })
+      return
+    }
+
+    // 模型白名单拦截
+    if (!this.isModelAllowed(chatRequest.model)) {
+      this.recordRequestFailed()
+      const msg = `Model not available: ${chatRequest.model}`
+      this.sendError(res, 403, msg)
+      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 403, error: msg })
+      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, responseTime: Date.now() - startTime, success: false, error: msg })
       return
     }
 
@@ -3378,6 +3768,16 @@ export class ProxyServer {
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
 
+    // 模型白名单拦截：映射后的模型不在白名单 → 403（既隐藏于 /v1/models，也拦截直调）
+    if (!this.isModelAllowed(request.model)) {
+      this.recordRequestFailed()
+      const msg = `Model not available: ${request.model}`
+      this.sendError(res, 403, msg, 'anthropic')
+      this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 403, error: msg })
+      this.recordRequest({ path: '/v1/messages', model: request.model, responseTime: 0, success: false, error: msg })
+      return
+    }
+
     const startTime = Date.now()
 
     this.recordNewRequest()
@@ -3465,8 +3865,14 @@ export class ProxyServer {
         )
       } else if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
+        // 按 Claude 原始请求结构算 input token（与 /v1/messages/count_tokens 同源），
+        // 让 message_start 的用量与客户端 pre-flight count_tokens 的结果一致，避免上下文统计偏差。
+        const promptInputTokens = Math.max(1,
+          this.estimateTokenCount(processedRequest.system) +
+          this.estimateTokenCount(processedRequest.messages) +
+          this.estimateTokenCount(processedRequest.tools))
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined)
+          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined, promptInputTokens)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -3571,8 +3977,17 @@ export class ProxyServer {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
     const id = response.id || `msg_${uuidv4()}`
     const write = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) }
+    // message_start.usage 与主流式路径口径保持一致：input_tokens 不含缓存，且带 cache 拆分字段。
+    const replayCacheRead = response.usage.cache_read_input_tokens || 0
+    const replayCacheCreation = response.usage.cache_creation_input_tokens || 0
+    const replayStartUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } = {
+      input_tokens: Math.max(1, loop.usage.inputTokens - replayCacheRead - replayCacheCreation),
+      output_tokens: 0
+    }
+    if (replayCacheRead > 0) replayStartUsage.cache_read_input_tokens = replayCacheRead
+    if (replayCacheCreation > 0) replayStartUsage.cache_creation_input_tokens = replayCacheCreation
     write('message_start', createClaudeStreamEvent('message_start', {
-      message: { id, type: 'message', role: 'assistant', content: [], model: request.model, stop_reason: null, stop_sequence: null, usage: { input_tokens: loop.usage.inputTokens, output_tokens: 0 } }
+      message: { id, type: 'message', role: 'assistant', content: [], model: request.model, stop_reason: null, stop_sequence: null, usage: replayStartUsage }
     }))
     response.content.forEach((block, index) => {
       if (block.type === 'text') {
@@ -3626,7 +4041,8 @@ export class ProxyServer {
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
-    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
+    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string },
+    promptInputTokens?: number
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -3654,11 +4070,27 @@ export class ProxyServer {
       pendingThinkingSignature = undefined
     }
 
-    // 估算输入 tokens（基于 payload 大小）
-    const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
-    
+    // message_start 的 usage 必须与 message_delta 的口径一致，否则客户端（如 Claude Code）
+    // 统计上下文用量时会偏高。Anthropic 规范里 message_start.usage 就带有完整的
+    // input_tokens + cache_read/creation 拆分，且 input_tokens 不含缓存部分。
+    // 这里优先用调用方按 Claude 原始请求结构算出的 token 数（与 /v1/messages/count_tokens 同源），
+    // 仅在缺失时回退到基于 payload 体积的粗略估算（≈3.5 字符/token，贴近 cl100k_base）。
+    const cacheReadStart = simulatedCacheUsage?.cacheReadInputTokens || 0
+    const cacheCreationStart = simulatedCacheUsage?.cacheCreationInputTokens || 0
+    const grossInputTokens = (typeof promptInputTokens === 'number' && promptInputTokens > 0)
+      ? promptInputTokens
+      : Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3.5))
+    // 扣除缓存命中部分，避免客户端重复计入（与 buildClaudeUsage 的口径保持一致）
+    const startInputTokens = Math.max(1, grossInputTokens - cacheReadStart - cacheCreationStart)
+
     // 发送 message_start（仅首轮）
     if (currentRound === 0) {
+      const startUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } = {
+        input_tokens: startInputTokens,
+        output_tokens: 0
+      }
+      if (cacheReadStart > 0) startUsage.cache_read_input_tokens = cacheReadStart
+      if (cacheCreationStart > 0) startUsage.cache_creation_input_tokens = cacheCreationStart
       const messageStart = createClaudeStreamEvent('message_start', {
         message: {
           id,
@@ -3668,7 +4100,7 @@ export class ProxyServer {
           model,
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: estimatedInputTokens, output_tokens: 0 }
+          usage: startUsage
         }
       })
       res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
@@ -4276,93 +4708,285 @@ export class ProxyServer {
 }
 
 // ============ 客户门户静态页面 ============
-// 自包含单页（vanilla JS，无外部依赖）：登录 → 查看余额 → 管理 API Key → 查看用量。
+// 自包含单页（vanilla JS，无外部依赖）：登录 → 查看余额/用量/费率 → 管理 API Key。
 // 通过 fetch 调用 /portal/* JSON API；会话 token 存 localStorage。
+// 动态 HTML 一律用字符串拼接（不用模板字面量/${}），避免与外层 TS 模板字面量冲突，
+// 并统一经 esc() 转义防 XSS。
 const PORTAL_HTML = `<!doctype html>
 <html lang="th">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>API Portal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#3b82f6; --danger:#ef4444; --ok:#22c55e; }
+  :root {
+    --bg:#070b16; --bg2:#0f172a; --card:#121a2e; --card2:#16203a;
+    --border:#202b45; --border2:#2c3a5c; --txt:#f1f5fb; --txt2:#c4cee0; --muted:#7e8aa6;
+    --accent:#10b981; --accent2:#34d399; --accent3:#6ee7b7; --accent-dim:rgba(16,185,129,.10);
+    --blue:#60a5fa; --danger:#fb7185; --ok:#10b981; --warn:#fbbf24;
+    --radius:18px; --shadow:0 10px 40px -12px rgba(0,0,0,.55);
+  }
   * { box-sizing:border-box; }
-  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--txt); }
-  .wrap { max-width:760px; margin:0 auto; padding:24px 16px; }
-  h1 { font-size:20px; margin:0 0 16px; }
-  h2 { font-size:15px; margin:24px 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:16px; }
-  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
-  input { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:#0b1220; color:var(--txt); font-size:14px; }
-  button { padding:9px 16px; border:none; border-radius:8px; background:var(--accent); color:#fff; font-size:14px; cursor:pointer; }
-  button:hover { opacity:.9; }
-  button.secondary { background:#475569; }
-  button.danger { background:var(--danger); }
-  button:disabled { opacity:.5; cursor:not-allowed; }
+  html { scroll-behavior:smooth; }
+  body {
+    margin:0; color:var(--txt);
+    font-family:"Inter","IBM Plex Sans Thai",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    background:
+      radial-gradient(900px 500px at 85% -5%, rgba(52,211,153,.10), transparent 60%),
+      radial-gradient(900px 500px at 10% 0%, rgba(96,165,250,.08), transparent 55%),
+      var(--bg);
+    min-height:100vh; -webkit-font-smoothing:antialiased; line-height:1.5;
+  }
+  .wrap { max-width:1080px; margin:0 auto; padding:26px 22px 70px; }
+  .grid2 { display:grid; grid-template-columns:1.5fr 1fr; gap:18px; align-items:start; }
+  @media (max-width:780px){ .grid2 { grid-template-columns:1fr; } }
+
+  /* ===== sticky top nav ===== */
+  .nav { position:sticky; top:0; z-index:50; backdrop-filter:saturate(180%) blur(14px); background:rgba(7,11,22,.72); border-bottom:1px solid var(--border); }
+  .nav-inner { max-width:1080px; margin:0 auto; padding:13px 22px; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .brand-row { display:flex; align-items:center; gap:11px; font-weight:700; font-size:16px; letter-spacing:-.01em; }
+  .nav-user { display:flex; align-items:center; gap:12px; }
+  .nav-user .meta { text-align:right; line-height:1.25; }
+  .nav-user .meta .nm { font-size:13px; font-weight:600; }
+  .nav-user .meta .sb { font-size:11px; color:var(--muted); }
+
+  /* ===== per-model price compare (MaxPlus line items) ===== */
+  .price-row { display:grid; grid-template-columns:84px 1fr auto; align-items:center; gap:12px; padding:13px 4px; border-bottom:1px solid var(--border); }
+  .price-row:last-child { border-bottom:none; }
+  .price-row .pk { font-weight:600; font-size:14px; color:var(--txt2); }
+  .price-row .pv .from { color:var(--muted); text-decoration:line-through; font-size:13px; font-variant-numeric:tabular-nums; }
+  .price-row .pv .arrow { color:var(--muted); margin:0 7px; }
+  .price-row .pv .to { font-weight:700; font-size:15px; color:var(--accent2); font-variant-numeric:tabular-nums; }
+  .price-row .pv .subc { display:block; font-size:11px; color:var(--muted); margin-top:2px; }
+  .price-row .badge { font-size:12px; font-weight:700; color:var(--accent2); background:var(--accent-dim); padding:4px 9px; border-radius:8px; white-space:nowrap; }
+  .price-foot { font-size:11px; color:var(--muted); margin-top:12px; }
+  .seg { display:inline-flex; gap:2px; padding:3px; background:rgba(0,0,0,.25); border:1px solid var(--border); border-radius:11px; }
+  .seg button { padding:7px 14px; border-radius:8px; font-size:13px; font-weight:600; background:transparent; color:var(--muted); box-shadow:none; }
+  .seg button.on { background:var(--accent); color:#04231a; box-shadow:0 2px 8px -2px rgba(16,185,129,.5); }
+  .est-tag { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:6px; background:rgba(251,191,36,.15); color:var(--warn); margin-left:8px; vertical-align:middle; }
+  .act-tag { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:6px; background:rgba(16,185,129,.15); color:var(--accent2); margin-left:8px; vertical-align:middle; }
+  .empty { color:var(--muted); font-size:13px; padding:6px 0; }
+  h1 { font-size:24px; font-weight:800; margin:0; letter-spacing:-.02em; }
+  h2 { font-size:12px; margin:28px 0 12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+  .card {
+    background:linear-gradient(180deg, var(--card2), var(--card));
+    border:1px solid var(--border); border-radius:16px; padding:20px; margin-bottom:16px;
+    box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.25);
+  }
+  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 5px; font-weight:500; }
+  input {
+    width:100%; padding:12px 14px; border:1px solid var(--border2); border-radius:10px;
+    background:#0a1120; color:var(--txt); font-size:15px; transition:border-color .15s, box-shadow .15s;
+  }
+  input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+  button {
+    padding:11px 18px; border:none; border-radius:10px;
+    background:linear-gradient(180deg, var(--accent2), var(--accent)); color:#04231a;
+    font-size:14px; font-weight:600; cursor:pointer; transition:transform .08s, opacity .15s;
+  }
+  button:hover { opacity:.92; } button:active { transform:translateY(1px); }
+  button.secondary { background:rgba(255,255,255,.06); color:var(--txt); border:1px solid var(--border2); }
+  button.danger { background:rgba(244,63,94,.12); color:var(--danger); border:1px solid rgba(244,63,94,.3); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .balance { font-size:32px; font-weight:700; }
+
+  /* hero balance */
+  .hero {
+    background:
+      radial-gradient(600px 200px at 100% 0%, rgba(16,185,129,.10), transparent 70%),
+      linear-gradient(180deg, var(--card2), var(--card));
+    border:1px solid var(--border); border-radius:20px; padding:26px;
+    position:relative; overflow:hidden;
+  }
+  .hero .lbl { font-size:13px; color:var(--muted); margin-bottom:6px; }
+  .balance { font-size:46px; font-weight:800; line-height:1; letter-spacing:-.02em; }
   .balance.low { color:var(--danger); }
+  .balance .unit { font-size:18px; font-weight:600; color:var(--muted); margin-left:6px; }
+  .balance-baht { font-size:17px; color:var(--accent2); margin-top:10px; font-weight:600; }
+
   .muted { color:var(--muted); font-size:13px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; }
+  .stat {
+    background:rgba(255,255,255,.025); border:1px solid var(--border); border-radius:12px; padding:14px 16px;
+  }
+  .stat .v { font-size:22px; font-weight:700; letter-spacing:-.01em; }
+  .stat .k { font-size:12px; color:var(--muted); margin-top:3px; }
+  .stat.accent { background:var(--accent-dim); border-color:rgba(16,185,129,.25); }
+  .stat.accent .v { color:var(--accent2); }
+
+  /* savings bar (MaxPlus-style) */
+  .savings { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .savings .pct { font-size:34px; font-weight:800; color:var(--accent2); line-height:1; }
+  .savings .old { color:var(--muted); text-decoration:line-through; font-size:15px; }
+  .savings .new { font-size:26px; font-weight:800; }
+  .savings-track { height:8px; border-radius:999px; background:rgba(255,255,255,.07); margin-top:14px; overflow:hidden; }
+  .savings-fill { height:100%; background:linear-gradient(90deg, var(--accent), var(--accent2)); border-radius:999px; }
+  .chip { display:inline-block; font-size:12px; font-weight:700; padding:3px 10px; border-radius:999px; background:var(--accent); color:#04231a; }
+
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); }
-  th { color:var(--muted); font-weight:500; }
-  code { background:#0b1220; padding:2px 6px; border-radius:5px; font-size:12px; word-break:break-all; }
+  th,td { text-align:left; padding:11px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:none; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  code { background:#0a1120; padding:3px 7px; border-radius:6px; font-size:12px; word-break:break-all; border:1px solid var(--border); }
   .hide { display:none; }
   .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
-  .keybox { background:#0b1220; border:1px solid var(--ok); border-radius:8px; padding:12px; margin-top:10px; }
-  .topbar { display:flex; justify-content:space-between; align-items:center; }
+  .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.35); border-radius:10px; padding:14px; margin-top:12px; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+  .logo { width:36px; height:36px; border-radius:11px; flex-shrink:0; background:linear-gradient(135deg,var(--accent3),var(--accent),var(--blue)); display:inline-flex; align-items:center; justify-content:center; font-size:19px; color:#04231a; box-shadow:0 4px 14px rgba(16,185,129,.4); }
+  .avatar { width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg,var(--accent2),var(--blue)); display:inline-flex; align-items:center; justify-content:center; font-weight:700; color:#04231a; font-size:15px; flex-shrink:0; }
+  .who { display:flex; align-items:center; gap:10px; margin-top:14px; }
+  .pill { display:inline-block; font-size:11px; padding:2px 9px; border-radius:999px; font-weight:600; }
+  .pill.ok { background:rgba(16,185,129,.15); color:var(--accent2); }
+  .pill.warn { background:rgba(245,158,11,.15); color:var(--warn); }
+  .chart { width:100%; height:130px; display:block; }
+  .chart-empty { color:var(--muted); font-size:13px; padding:30px 0; text-align:center; }
+  .legend { font-size:12px; color:var(--muted); margin-top:8px; }
+  .login-center { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; }
+  .login-card { width:100%; max-width:400px; }
+  .brand { text-align:center; margin-bottom:24px; }
+  .brand .logo { width:58px; height:58px; border-radius:16px; margin:0 auto 14px; font-size:28px; }
+  .brand .bt { font-size:22px; font-weight:800; letter-spacing:-.02em; }
+  .brand .bd { font-size:13px; color:var(--muted); margin-top:5px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <!-- Login view -->
   <div id="loginView">
-    <h1>เข้าสู่ระบบ</h1>
-    <div class="card">
-      <label>อีเมล</label>
-      <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
-      <label>รหัสผ่าน</label>
-      <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
-      <div style="margin-top:14px"><button id="loginBtn">เข้าสู่ระบบ</button></div>
-      <div class="err" id="loginErr"></div>
+    <div class="login-center">
+      <div class="login-card">
+        <div class="brand">
+          <div class="logo">⚡</div>
+          <div class="bt">API Portal</div>
+          <div class="bd">เข้าสู่ระบบเพื่อจัดการ API Key และเครดิต</div>
+        </div>
+        <div class="card">
+          <label>อีเมล</label>
+          <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
+          <label>รหัสผ่าน</label>
+          <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
+          <div style="margin-top:20px"><button id="loginBtn" style="width:100%">เข้าสู่ระบบ</button></div>
+          <div class="err" id="loginErr"></div>
+        </div>
+      </div>
     </div>
   </div>
 
   <!-- Dashboard view -->
   <div id="dashView" class="hide">
-    <div class="topbar">
-      <h1>แดชบอร์ด</h1>
-      <button class="secondary" id="logoutBtn">ออกจากระบบ</button>
-    </div>
-    <div class="muted" id="whoami"></div>
-
-    <h2>เครดิตคงเหลือ</h2>
-    <div class="card">
-      <div class="balance" id="balance">–</div>
-      <div class="muted" id="balanceNote">เติมเครดิตติดต่อแอดมิน</div>
-    </div>
-
-    <h2>API Keys</h2>
-    <div class="card">
-      <div class="row">
-        <input id="keyName" placeholder="ชื่อ key (เช่น my-app)" style="flex:1; min-width:160px">
-        <button id="createKeyBtn">สร้าง Key</button>
+    <div class="nav">
+      <div class="nav-inner">
+        <div class="brand-row"><span class="logo">⚡</span> API Portal</div>
+        <div class="nav-user">
+          <div class="meta">
+            <div class="nm" id="whoami"></div>
+            <div class="sb">บัญชีลูกค้า</div>
+          </div>
+          <span class="avatar" id="avatar">–</span>
+          <button class="secondary" id="logoutBtn">ออกจากระบบ</button>
+        </div>
       </div>
-      <div class="err" id="keyErr"></div>
-      <div id="newKeyBox"></div>
-      <table style="margin-top:12px">
-        <thead><tr><th>ชื่อ</th><th>Key</th><th>credits</th><th></th></tr></thead>
-        <tbody id="keyRows"></tbody>
-      </table>
     </div>
 
-    <h2>การใช้งาน</h2>
-    <div class="card">
-      <div class="muted">รวมทั้งหมด: <span id="usageTotal">–</span></div>
-      <table style="margin-top:10px">
-        <thead><tr><th>วันที่</th><th>requests</th><th>credits</th></tr></thead>
-        <tbody id="usageRows"></tbody>
-      </table>
+    <div class="wrap">
+      <div class="grid2">
+        <!-- left column -->
+        <div>
+          <div class="hero">
+            <div class="lbl">เครดิตคงเหลือ</div>
+            <div class="balance" id="balance">–</div>
+            <div class="balance-baht" id="balanceValue"></div>
+            <div class="muted" id="balanceNote" style="margin-top:10px">เติมเครดิตติดต่อแอดมิน</div>
+          </div>
+
+          <div class="stats" style="margin-bottom:18px">
+            <div class="stat"><div class="v" id="sumRequests">–</div><div class="k">requests รวม</div></div>
+            <div class="stat accent"><div class="v" id="sumCredits">–</div><div class="k">credits ที่ใช้</div></div>
+            <div class="stat" id="spentStat" style="display:none"><div class="v" id="priceSpent">–</div><div class="k">ใช้ไปแล้ว (฿)</div></div>
+            <div class="stat"><div class="v" id="sumInput">–</div><div class="k">input tokens</div></div>
+            <div class="stat"><div class="v" id="sumOutput">–</div><div class="k">output tokens</div></div>
+          </div>
+
+          <div class="card">
+            <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">แนวโน้มการใช้ credit</strong><span class="muted">14 วันล่าสุด</span></div>
+            <div id="trendWrap"><svg class="chart" id="trendChart" preserveAspectRatio="none"></svg></div>
+            <div class="legend" id="trendLegend"></div>
+          </div>
+        </div>
+
+        <!-- right column -->
+        <div>
+          <div id="savingsCard" class="card hide" style="background:linear-gradient(160deg, rgba(16,185,129,.16), rgba(16,185,129,.04)); border-color:rgba(16,185,129,.30)">
+            <div class="savings">
+              <div>
+                <div class="muted" style="font-size:12px">ประหยัด · เทียบราคาทางการ</div>
+                <div style="margin-top:4px"><span class="pct" id="savePct">–</span></div>
+                <div style="margin-top:6px"><span class="chip" id="saveX"></span></div>
+              </div>
+              <div style="text-align:right">
+                <div class="old" id="saveOld"></div>
+                <div class="new" id="saveNew"></div>
+              </div>
+            </div>
+            <div class="savings-track"><div class="savings-fill" id="saveFill" style="width:0%"></div></div>
+            <div class="muted" id="priceNote" style="margin-top:12px"></div>
+          </div>
+
+          <div id="priceCompareCard" class="card hide">
+            <div class="topbar" style="margin-bottom:10px"><strong style="font-size:15px">ราคาต่อ 1M tokens</strong><span class="muted" id="priceCompareModel">Anthropic → เรา</span></div>
+            <div class="seg" id="modelTabs"></div>
+            <div class="muted" style="font-size:12px; margin:8px 0">เทียบราคาทางการ Anthropic กับราคาของเรา</div>
+            <div id="priceRows"></div>
+            <div class="price-foot" id="priceFoot"></div>
+          </div>
+
+          <div class="card">
+            <div class="topbar" style="margin-bottom:14px"><strong style="font-size:15px">API Keys</strong></div>
+            <div class="row">
+              <input id="keyName" placeholder="ชื่อ key (เช่น my-app)" style="flex:1; min-width:140px">
+              <input id="keyLimit" type="number" min="0" step="any" placeholder="ลิมิต credit (เว้นว่าง = ไม่จำกัด)" style="flex:1; min-width:140px">
+              <button id="createKeyBtn">สร้าง</button>
+            </div>
+            <div class="err" id="keyErr"></div>
+            <div id="newKeyBox"></div>
+            <table style="margin-top:12px">
+              <thead><tr><th>ชื่อ</th><th>Key</th><th class="num">credits / ลิมิต</th><th></th></tr></thead>
+              <tbody id="keyRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <h2>การใช้งานต่อโมเดล</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>โมเดล</th><th class="num">requests</th><th class="num">credits</th><th class="num">tokens (in/out)</th></tr></thead>
+          <tbody id="modelRows"></tbody>
+        </table>
+        <div class="empty" id="modelEmpty"></div>
+      </div>
+
+      <h2>อัตราค่าบริการ (ต่อโมเดล)</h2>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">อัตราที่ระบบใช้คิดเครดิต — โปร่งใส ตรงตามที่หักจริง</div>
+        <table>
+          <thead><tr><th>โมเดล</th><th class="num">official</th><th class="num">เฉลี่ย/req</th><th class="num">context</th></tr></thead>
+          <tbody id="rateRows"></tbody>
+        </table>
+        <div class="empty" id="rateEmpty"></div>
+      </div>
+
+      <h2>การใช้งานรายวัน</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>วันที่</th><th class="num">requests</th><th class="num">credits</th></tr></thead>
+          <tbody id="usageRows"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
@@ -4372,6 +4996,11 @@ const PORTAL_HTML = `<!doctype html>
   var TOKEN_KEY = 'portal_token';
   var token = localStorage.getItem(TOKEN_KEY) || '';
   var $ = function(id){ return document.getElementById(id); };
+  var lastUsage = null;
+  var lastRates = null;
+  var pricing = { enabled: false };
+  var selectedFam = null;   // family ที่กำลังดูในการ์ดเทียบราคา (null = ตาม topFamily())
+  var famPinned = false;    // true เมื่อผู้ใช้กดเลือก tab เอง (หยุด auto-follow topFamily)
 
   function api(path, opts){
     opts = opts || {};
@@ -4412,21 +5041,43 @@ const PORTAL_HTML = `<!doctype html>
   }
 
   function fmt(n){ return (Math.round((n||0)*1000)/1000).toLocaleString(); }
+  function fmtInt(n){ return Math.round(n||0).toLocaleString(); }
+  function fmtTokens(n){
+    n = n || 0;
+    if (n >= 1e9) return (Math.round(n/1e8)/10) + 'B';
+    if (n >= 1e6) return (Math.round(n/1e5)/10) + 'M';
+    if (n >= 1e3) return (Math.round(n/100)/10) + 'K';
+    return String(Math.round(n));
+  }
+  function fmtBaht(n){
+    n = n || 0;
+    return (Math.round(n*100)/100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
 
   function loadDash(){
     api('/portal/me').then(function(r){
       if (!r.ok){ logout(); return; }
       show('dash');
       var c = r.data;
+      pricing = (c && c.pricing) || { enabled: false };
       $('whoami').textContent = c.email + (c.name ? ' ('+c.name+')' : '');
+      var av = $('avatar');
+      if (av) av.textContent = ((c.name || c.email || '?').trim()[0] || '?').toUpperCase();
       var bal = $('balance');
-      bal.textContent = fmt(c.creditBalance) + ' credits';
+      bal.innerHTML = fmt(c.creditBalance) + '<span class="unit">credits</span>';
       bal.classList.toggle('low', c.creditBalance <= 0);
+      // 启用计费时，把余额换算成泰铢显示在下方
+      if (pricing.enabled && pricing.bahtPerCredit > 0){
+        $('balanceValue').textContent = '≈ ฿' + fmtBaht(c.creditBalance * pricing.bahtPerCredit);
+      } else {
+        $('balanceValue').textContent = '';
+      }
       $('balanceNote').textContent = c.creditBalance <= 0
         ? 'เครดิตหมด — ติดต่อแอดมินเพื่อเติม'
         : 'เติมเครดิตติดต่อแอดมิน';
       loadKeys();
       loadUsage();
+      loadRates();
     });
   }
 
@@ -4435,26 +5086,66 @@ const PORTAL_HTML = `<!doctype html>
       if (!r.ok) return;
       var rows = $('keyRows'); rows.innerHTML = '';
       (r.data.keys || []).forEach(function(k){
+        // credits ที่ใช้ / ลิมิต (ถ้ามี) — เกินลิมิตจะถูกระบบปฏิเสธ request อัตโนมัติ
+        var used = fmt(k.totalCredits);
+        var limitLabel = (k.creditsLimit != null && k.creditsLimit > 0)
+          ? used + ' / ' + fmt(k.creditsLimit)
+          : used + ' / ∞';
         var tr = document.createElement('tr');
-        tr.innerHTML = '<td>'+esc(k.name)+'</td><td><code>'+esc(k.keyMasked)+'</code></td><td>'+fmt(k.totalCredits)+'</td>'
-          + '<td><button class="danger" data-id="'+esc(k.id)+'">ลบ</button></td>';
+        tr.innerHTML = '<td>'+esc(k.name)+'</td><td><code>'+esc(k.keyMasked)+'</code></td>'
+          + '<td class="num">'+esc(limitLabel)+'</td>'
+          + '<td style="white-space:nowrap">'
+          +   '<button class="secondary" data-edit="'+esc(k.id)+'" data-limit="'+(k.creditsLimit != null ? esc(k.creditsLimit) : '')+'">ลิมิต</button> '
+          +   '<button class="danger" data-id="'+esc(k.id)+'">ลบ</button></td>';
         rows.appendChild(tr);
       });
       Array.prototype.forEach.call(rows.querySelectorAll('button[data-id]'), function(btn){
         btn.addEventListener('click', function(){ delKey(btn.getAttribute('data-id')); });
       });
+      Array.prototype.forEach.call(rows.querySelectorAll('button[data-edit]'), function(btn){
+        btn.addEventListener('click', function(){ editKeyLimit(btn.getAttribute('data-edit'), btn.getAttribute('data-limit')); });
+      });
     });
+  }
+
+  // อ่าน + validate ค่าลิมิตจาก input/prompt: ว่าง = ไม่จำกัด (null); ต้องเป็นตัวเลข > 0
+  // คืน { ok, value } โดย value = null (ไม่จำกัด) หรือ number > 0; ok=false เมื่อกรอกไม่ถูก
+  function parseLimit(raw){
+    var s = String(raw == null ? '' : raw).trim();
+    if (s === '') return { ok:true, value:null };
+    var n = Number(s);
+    if (!isFinite(n) || n <= 0) return { ok:false, value:null };
+    return { ok:true, value:n };
   }
 
   function createKey(){
     $('keyErr').textContent = '';
     var name = $('keyName').value.trim();
+    var lim = parseLimit($('keyLimit').value);
+    if (!lim.ok){ $('keyErr').textContent = 'ลิมิตต้องเป็นตัวเลขมากกว่า 0 (หรือเว้นว่าง = ไม่จำกัด)'; return; }
+    var body = { name:name };
+    if (lim.value != null) body.creditsLimit = lim.value;
     $('createKeyBtn').disabled = true;
-    api('/portal/keys', { method:'POST', body:{ name:name } }).then(function(r){
+    api('/portal/keys', { method:'POST', body:body }).then(function(r){
       $('createKeyBtn').disabled = false;
       if (!r.ok){ $('keyErr').textContent = (r.data && r.data.error) || 'สร้างไม่สำเร็จ'; return; }
       $('keyName').value = '';
+      $('keyLimit').value = '';
       $('newKeyBox').innerHTML = '<div class="keybox">คัดลอก key นี้เก็บไว้ (แสดงครั้งเดียว):<br><code>'+esc(r.data.key)+'</code></div>';
+      loadKeys();
+    });
+  }
+
+  // แก้ลิมิต credit ของ key เดิม: prompt ว่าง = ลบลิมิต (ไม่จำกัด); ส่ง PUT /portal/keys/:id
+  function editKeyLimit(id, current){
+    var cur = (current == null || current === '') ? '' : String(current);
+    var input = prompt('ลิมิต credit ของ key นี้ (เว้นว่าง = ไม่จำกัด):', cur);
+    if (input === null) return; // กดยกเลิก
+    var lim = parseLimit(input);
+    if (!lim.ok){ $('keyErr').textContent = 'ลิมิตต้องเป็นตัวเลขมากกว่า 0 (หรือเว้นว่าง = ไม่จำกัด)'; return; }
+    $('keyErr').textContent = '';
+    api('/portal/keys/' + encodeURIComponent(id), { method:'PUT', body:{ creditsLimit: lim.value } }).then(function(r){
+      if (!r.ok){ $('keyErr').textContent = (r.data && r.data.error) || 'แก้ไขไม่สำเร็จ'; return; }
       loadKeys();
     });
   }
@@ -4469,16 +5160,291 @@ const PORTAL_HTML = `<!doctype html>
   function loadUsage(){
     api('/portal/usage').then(function(r){
       if (!r.ok) return;
-      $('usageTotal').textContent = fmt(r.data.totalCredits) + ' credits / ' + (r.data.totalRequests||0) + ' requests';
-      var rows = $('usageRows'); rows.innerHTML = '';
-      var days = Object.keys(r.data.daily || {}).sort().reverse().slice(0, 14);
-      days.forEach(function(day){
-        var d = r.data.daily[day];
-        var tr = document.createElement('tr');
-        tr.innerHTML = '<td>'+esc(day)+'</td><td>'+d.requests+'</td><td>'+fmt(d.credits)+'</td>';
-        rows.appendChild(tr);
-      });
+      lastUsage = r.data;
+      $('sumRequests').textContent = fmtInt(r.data.totalRequests);
+      $('sumCredits').textContent = fmt(r.data.totalCredits);
+      $('sumInput').textContent = fmtTokens(r.data.totalInputTokens);
+      $('sumOutput').textContent = fmtTokens(r.data.totalOutputTokens);
+      renderDailyTable(r.data.daily || {});
+      drawTrend(r.data.daily || {});
+      renderModelUsage();
+      renderPricing();
     });
+  }
+
+  // 计费卡片：把累计消耗的 credit 换算成泰铢，并与 Anthropic 官方 API 价格对比"省了多少"
+  function renderPricing(){
+    var on = pricing.enabled && (pricing.bahtPerCredit > 0);
+    $('savingsCard').classList.toggle('hide', !on);
+    $('spentStat').style.display = on ? '' : 'none';
+    renderPriceCompare();
+    if (!on) return;
+
+    var spentCredits = (lastUsage && lastUsage.totalCredits) || 0;
+    $('priceSpent').textContent = '฿' + fmtBaht(spentCredits * pricing.bahtPerCredit);
+
+    // เทียบกับเรียก Anthropic API ตรง ๆ — ใช้ ratio เดียวกับการ์ดราคาด้านล่าง (แกนเดียว ไม่ขัดกัน)
+    var s = anthropicSavings();
+    if (s && s.savedPct > 0){
+      var timesX = 1 / s.ratio;
+      $('savePct').textContent = s.savedPct.toFixed(2) + '%';
+      $('saveX').textContent = 'ถูกกว่า ' + (timesX >= 10 ? timesX.toFixed(0) : timesX.toFixed(1)) + 'x';
+      $('saveOld').textContent = 'Anthropic API';
+      $('saveNew').textContent = 'ถูกกว่า ' + s.savedPct.toFixed(1) + '%';
+      $('saveFill').style.width = Math.max(2, Math.min(100, s.savedPct)).toFixed(1) + '%';
+      $('priceNote').textContent = 'งานเดียวกันถ้าเรียก Anthropic API ตรง ๆ จะแพงกว่าราว ' + timesX.toFixed(0) + ' เท่า';
+    } else {
+      $('savePct').textContent = '–';
+      $('saveX').textContent = '';
+      $('saveOld').textContent = '';
+      $('saveNew').textContent = '';
+      $('saveFill').style.width = '0%';
+      $('priceNote').textContent = '';
+    }
+  }
+
+  function loadRates(){
+    api('/portal/rates').then(function(r){
+      if (!r.ok) return;
+      lastRates = r.data.models || [];
+      renderRates();
+      renderModelUsage();
+      renderPriceCompare();
+    });
+  }
+
+  // ราคาทางการต่อ 1M tokens (USD) ของผู้ให้บริการต้นทาง — ใช้เป็น "ราคาก่อนลด" เทียบให้เห็นความคุ้ม
+  // จัดกลุ่มตาม family ของชื่อโมเดล (opus/sonnet/haiku) ค่าที่ไม่เข้าเกณฑ์ใช้ default opus
+  var OFFICIAL_USD_1M = {
+    opus:   { Input:15, Output:75, 'Cache write':18.75, 'Cache read':1.5 },
+    sonnet: { Input:3,  Output:15, 'Cache write':3.75,  'Cache read':0.3 },
+    haiku:  { Input:1,  Output:5,  'Cache write':1.25,  'Cache read':0.1 }
+  };
+  // ประมาณการ credit ที่กินต่อ 1M input tokens (ใช้ตอนยังไม่มีข้อมูลใช้งานจริง)
+  // อิงข้อมูลจริง: Opus ~6.4 cr/1M input; family อื่น scale ตามสัดส่วนราคา Anthropic
+  var DEFAULT_CR_PER_1M_INPUT = { opus:6.4, sonnet:1.28, haiku:0.43 };
+  function familyOf(name){
+    var s = String(name||'').toLowerCase();
+    if (s.indexOf('haiku') >= 0) return 'haiku';
+    if (s.indexOf('sonnet') >= 0) return 'sonnet';
+    return 'opus';
+  }
+
+  // รวมยอดใช้งานของทุกโมเดลใน family เดียวกัน (opus/sonnet/haiku) เพื่อหา cr/1M input จริง
+  // คืน { credits, inputTokens, pickId } โดย pickId = โมเดลที่กิน credit มากสุดใน family (ใช้เป็น label)
+  function familyUsage(fam){
+    var byModel = (lastUsage && lastUsage.byModel) || {};
+    var credits = 0, inputTokens = 0, pickId = null, pickCr = -1;
+    Object.keys(byModel).forEach(function(id){
+      if (familyOf(displayModelName(id)) !== fam) return;
+      var m = byModel[id];
+      credits += m.credits || 0;
+      inputTokens += m.inputTokens || 0;
+      if ((m.credits || 0) > pickCr){ pickCr = m.credits || 0; pickId = id; }
+    });
+    return { credits:credits, inputTokens:inputTokens, pickId:pickId };
+  }
+
+  // คำนวณว่า family หนึ่ง "ถูกกว่าเรียก Anthropic API ตรง ๆ" เท่าไหร่ (แกนเดียวที่ทั้งหน้าใช้ร่วมกัน)
+  // ratio = ราคาเรา/1M input ÷ ราคา Anthropic/1M input ; savedPct = (1-ratio)×100
+  // ราคาเรา/1M input = credit ที่กินจริงต่อ 1M input × bahtPerCredit  (= ยอดที่หักจริง)
+  // actual = true เมื่อมีข้อมูลใช้งานจริงพอ (>50k input tokens) ไม่งั้นเป็นค่าประมาณการ
+  function anthropicSavingsFor(fam){
+    if (!pricing.enabled || !(pricing.bahtPerCredit > 0) || !(pricing.usdToBaht > 0)) return null;
+    if (!OFFICIAL_USD_1M[fam]) return null;
+    var u = familyUsage(fam);
+    var crPer1M = DEFAULT_CR_PER_1M_INPUT[fam];
+    var actual = false;
+    if (u.inputTokens > 50000 && u.credits > 0){
+      crPer1M = u.credits / u.inputTokens * 1e6;
+      actual = true;
+    }
+    var ourInputBaht = crPer1M * pricing.bahtPerCredit;
+    var offInputBaht = OFFICIAL_USD_1M[fam].Input * pricing.usdToBaht;
+    var ratio = offInputBaht > 0 ? (ourInputBaht / offInputBaht) : 1;
+    return { fam:fam, pickId:u.pickId, ratio:ratio, savedPct:(1-ratio)*100, ourInputBaht:ourInputBaht, actual:actual };
+  }
+
+  // family ที่กิน credit มากสุด (ใช้เป็นค่าเริ่มต้นของการ์ด + การ์ด "ประหยัด" ด้านบน)
+  function topFamily(){
+    var byModel = (lastUsage && lastUsage.byModel) || {};
+    var byFam = {}, best = 'opus', bestCr = -1;
+    Object.keys(byModel).forEach(function(id){
+      var fam = familyOf(displayModelName(id));
+      byFam[fam] = (byFam[fam] || 0) + (byModel[id].credits || 0);
+    });
+    Object.keys(byFam).forEach(function(fam){ if (byFam[fam] > bestCr){ bestCr = byFam[fam]; best = fam; } });
+    return best;
+  }
+
+  // การ์ด "ประหยัด" ด้านบนใช้ family ที่ใช้งานเยอะสุด (แกนเดียวกับการ์ดเทียบราคา)
+  function anthropicSavings(){
+    return anthropicSavingsFor(topFamily());
+  }
+
+  // tab เลือก family (Opus/Sonnet/Haiku) — กดแล้ว pin ไว้ ไม่ให้ auto-follow topFamily อีก
+  var FAM_TABS = [ { fam:'opus', label:'Opus' }, { fam:'sonnet', label:'Sonnet' }, { fam:'haiku', label:'Haiku' } ];
+  function renderModelTabs(active){
+    var wrap = $('modelTabs'); if (!wrap) return;
+    wrap.innerHTML = '';
+    FAM_TABS.forEach(function(t){
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = t.label;
+      if (t.fam === active) btn.className = 'on';
+      btn.addEventListener('click', function(){
+        selectedFam = t.fam;
+        famPinned = true;
+        renderPriceCompare();
+      });
+      wrap.appendChild(btn);
+    });
+  }
+
+  // การ์ดเทียบราคาต่อ 1M tokens แบบ line item (Input/Output/Cache) — Anthropic ขีดฆ่า → ราคาเรา
+  // ใช้ ratio เดียวกับ anthropicSavingsFor() ทุกแถว (credit ที่หัก/token เป็นสัดส่วนเดียวกับราคา Anthropic/token)
+  // family ที่แสดง = tab ที่ผู้ใช้ pin ไว้ ไม่งั้นตาม topFamily(); ติดป้าย actual/ประมาณการตามว่ามี usage จริงไหม
+  function renderPriceCompare(){
+    if (!pricing.enabled || !(pricing.bahtPerCredit > 0) || !(pricing.usdToBaht > 0)){
+      $('priceCompareCard').classList.add('hide');
+      return;
+    }
+    var fam = (famPinned && selectedFam) ? selectedFam : topFamily();
+    selectedFam = fam;
+    var s = anthropicSavingsFor(fam);
+    $('priceCompareCard').classList.toggle('hide', !s);
+    if (!s) return;
+
+    renderModelTabs(fam);
+
+    var label = s.pickId ? displayModelName(s.pickId) : 'Claude ' + fam.charAt(0).toUpperCase() + fam.slice(1);
+    var official = OFFICIAL_USD_1M[s.fam];
+    var ratio = s.ratio;
+    var tag = s.actual
+      ? '<span class="act-tag">จากการใช้งานจริง</span>'
+      : '<span class="est-tag">ประมาณการ</span>';
+
+    var rows = $('priceRows'); rows.innerHTML = '';
+    var keys = ['Input','Output','Cache write','Cache read'];
+    keys.forEach(function(k){
+      var offUsd = official[k];
+      var offBaht = offUsd * pricing.usdToBaht;       // ราคา Anthropic เป็นบาท/1M
+      var ourBaht = offBaht * ratio;                  // ราคาเรา/1M (สัดส่วนเดียวกับ input)
+      var pct = offBaht > 0 ? (1 - ourBaht/offBaht) * 100 : 0;
+      var div = document.createElement('div');
+      div.className = 'price-row';
+      div.innerHTML =
+        '<div class="pk">' + esc(k) + '</div>' +
+        '<div class="pv"><span class="from">฿' + fmtBaht(offBaht) + '</span>' +
+          '<span class="arrow">→</span><span class="to">฿' + fmtBaht(ourBaht) + '</span>' +
+          '<span class="subc">$' + offUsd + ' /1M · Anthropic</span></div>' +
+        '<div class="badge">↓' + pct.toFixed(2) + '%</div>';
+      rows.appendChild(div);
+    });
+    $('priceCompareModel').innerHTML = esc(label) + ' · Anthropic → เรา' + tag;
+    $('priceFoot').innerHTML = 'ถูกกว่าเรียก Anthropic API ตรง ๆ เฉลี่ย <b>' + s.savedPct.toFixed(2) + '%</b> · หน่วยบาทต่อ 1 ล้าน tokens';
+  }
+
+  function renderDailyTable(daily){
+    var rows = $('usageRows'); rows.innerHTML = '';
+    var days = Object.keys(daily).sort().reverse().slice(0, 14);
+    days.forEach(function(day){
+      var d = daily[day];
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>'+esc(day)+'</td><td class="num">'+d.requests+'</td><td class="num">'+fmt(d.credits)+'</td>';
+      rows.appendChild(tr);
+    });
+  }
+
+  // 内联 SVG 柱状图：最近 14 天每日 credit 消耗，无外部依赖
+  function drawTrend(daily){
+    var svg = $('trendChart');
+    var legend = $('trendLegend');
+    var days = Object.keys(daily).sort().slice(-14);
+    if (days.length === 0){
+      svg.innerHTML = '';
+      $('trendWrap').innerHTML = '<div class="chart-empty">ยังไม่มีข้อมูลการใช้งาน</div>';
+      legend.textContent = '';
+      return;
+    }
+    var W = 800, H = 120, pad = 4;
+    var max = 0;
+    days.forEach(function(day){ if (daily[day].credits > max) max = daily[day].credits; });
+    if (max <= 0) max = 1;
+    var n = days.length;
+    var bw = (W - pad*2) / n;
+    var bars = '';
+    days.forEach(function(day, i){
+      var v = daily[day].credits || 0;
+      var h = Math.max(1, (v / max) * (H - pad*2));
+      var x = pad + i*bw + bw*0.15;
+      var y = H - pad - h;
+      var w = bw*0.7;
+      bars += '<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+w.toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="#3b82f6"><title>'+esc(day)+': '+fmt(v)+' credits</title></rect>';
+    });
+    svg.setAttribute('viewBox', '0 0 '+W+' '+H);
+    svg.innerHTML = bars;
+    legend.textContent = days[0] + ' → ' + days[days.length-1] + '  •  สูงสุด/วัน: ' + fmt(max) + ' credits';
+  }
+
+  function renderModelUsage(){
+    if (!lastUsage) return;
+    var byModel = lastUsage.byModel || {};
+    var ids = Object.keys(byModel);
+    var rows = $('modelRows'); rows.innerHTML = '';
+    if (ids.length === 0){
+      $('modelEmpty').textContent = 'ยังไม่มีข้อมูลแยกตามโมเดล';
+      return;
+    }
+    $('modelEmpty').textContent = '';
+    // credit 多的排前面
+    ids.sort(function(a,b){ return byModel[b].credits - byModel[a].credits; });
+    ids.forEach(function(id){
+      var m = byModel[id];
+      var label = displayModelName(id);
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>'+esc(label)+'</td>'
+        + '<td class="num">'+fmtInt(m.requests)+'</td>'
+        + '<td class="num">'+fmt(m.credits)+'</td>'
+        + '<td class="num">'+fmtTokens(m.inputTokens)+' / '+fmtTokens(m.outputTokens)+'</td>';
+      rows.appendChild(tr);
+    });
+  }
+
+  function renderRates(){
+    var rows = $('rateRows'); rows.innerHTML = '';
+    if (!lastRates || lastRates.length === 0){
+      $('rateEmpty').textContent = 'ไม่สามารถดึงอัตราค่าบริการได้ในขณะนี้';
+      return;
+    }
+    $('rateEmpty').textContent = '';
+    var byModel = (lastUsage && lastUsage.byModel) || {};
+    lastRates.forEach(function(m){
+      var official = (m.rateMultiplier != null)
+        ? fmt(m.rateMultiplier) + (m.rateUnit ? ' /' + m.rateUnit : '')
+        : '–';
+      // actual 平均 = 该模型实际扣的 credit / 实际 request 数（有用量才算）
+      var u = byModel[m.id];
+      var actual = '–';
+      if (u && u.requests > 0){
+        actual = fmt(u.credits / u.requests) + ' /req';
+      }
+      var ctx = m.maxInputTokens ? fmtTokens(m.maxInputTokens) : '–';
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>'+esc(m.name)+'</td>'
+        + '<td class="num">'+esc(official)+'</td>'
+        + '<td class="num">'+esc(actual)+'</td>'
+        + '<td class="num">'+esc(ctx)+'</td>';
+      rows.appendChild(tr);
+    });
+  }
+
+  // 用费率表里的显示名美化用量表的模型 id（拿不到就回退原始 id）
+  function displayModelName(id){
+    if (lastRates){
+      for (var i=0;i<lastRates.length;i++){ if (lastRates[i].id === id) return lastRates[i].name; }
+    }
+    return id;
   }
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }

@@ -5731,6 +5731,97 @@ app.whenReady().then(async () => {
     }
   })
 
+  // ============ 客户门户管理 IPC ============
+  // 复用 ProxyServer 上的 programmatic 方法（与 HTTP /admin/* 同一份实现），
+  // 避免逻辑重复。每次变更后持久化 proxyConfig，确保重启不丢。
+
+  const persistProxyConfig = (server: ReturnType<typeof initProxyServer>): void => {
+    if (store) store.set('proxyConfig', server.getConfig())
+  }
+
+  // IPC: 开关客户门户
+  ipcMain.handle('proxy-portal-set-enabled', (_event, enabled: boolean) => {
+    try {
+      const server = initProxyServer()
+      server.updateConfig({ portalEnabled: !!enabled })
+      persistProxyConfig(server)
+      const cfg = server.getConfig()
+      return { success: true, portalEnabled: !!cfg.portalEnabled, needsRestart: server.needsRestart() }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to toggle portal' }
+    }
+  })
+
+  // IPC: 客户列表（脱敏）
+  ipcMain.handle('proxy-list-customers', () => {
+    try {
+      const server = initProxyServer()
+      return { success: true, customers: server.listCustomers() }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to list customers' }
+    }
+  })
+
+  // IPC: 创建客户
+  ipcMain.handle('proxy-create-customer', async (_event, input: { email: string; password: string; name?: string; creditBalance?: number; maxKeys?: number }) => {
+    try {
+      const server = initProxyServer()
+      const customer = await server.createCustomer(input)
+      persistProxyConfig(server)
+      return { success: true, customer }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to create customer' }
+    }
+  })
+
+  // IPC: 充值/扣减 credit
+  ipcMain.handle('proxy-topup-customer', (_event, id: string, amount: number, note?: string) => {
+    try {
+      const server = initProxyServer()
+      const result = server.topupCustomer(id, amount, note)
+      persistProxyConfig(server)
+      return { success: true, creditBalance: result.creditBalance }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to top up' }
+    }
+  })
+
+  // IPC: 启用/停用客户
+  ipcMain.handle('proxy-set-customer-enabled', (_event, id: string, enabled: boolean) => {
+    try {
+      const server = initProxyServer()
+      const customer = server.setCustomerEnabled(id, !!enabled)
+      persistProxyConfig(server)
+      return { success: true, customer }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to update customer' }
+    }
+  })
+
+  // IPC: 重置客户密码
+  ipcMain.handle('proxy-reset-customer-password', async (_event, id: string, password: string) => {
+    try {
+      const server = initProxyServer()
+      await server.resetCustomerPassword(id, password)
+      persistProxyConfig(server)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to reset password' }
+    }
+  })
+
+  // IPC: 删除客户（同时吊销名下 Key）
+  ipcMain.handle('proxy-delete-customer', (_event, id: string) => {
+    try {
+      const server = initProxyServer()
+      const result = server.deleteCustomer(id)
+      persistProxyConfig(server)
+      return { success: true, revokedKeys: result.revokedKeys }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete customer' }
+    }
+  })
+
   // IPC: 添加账号到反代池
   ipcMain.handle('proxy-add-account', (_event, account: ProxyAccount) => {
     try {

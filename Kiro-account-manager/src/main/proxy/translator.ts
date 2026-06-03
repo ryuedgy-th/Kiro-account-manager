@@ -39,36 +39,95 @@ import {
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
-// 判断模型是否支持 additionalModelRequestFields.thinking 参数
-// 只有 Claude 4+ 系列模型支持，非 Claude 模型（deepseek/minimax/glm/qwen 等）不支持
-function modelSupportsThinkingParam(modelId: string): boolean {
+// 模型能力注册表：以后端 /v1/models 返回的真实 schema 为准（由 proxyServer 在拉取/缓存模型时同步）。
+// 这是判断「该模型是否接受 additionalModelRequestFields / 接受哪些 effort 值」的唯一权威来源——
+// 后端实测：claude-sonnet-4.6 的 effort 枚举为 [low,medium,high,max]（无 xhigh），
+// claude-haiku-4.5 / deepseek / minimax / glm / qwen 完全不接受 additionalModelRequestFields。
+// 早期版本用「Claude 4+ 一律支持」的硬编码猜测，会对不支持的模型或非法 effort 值强行下发，导致后端
+// 返回 400（"additionalModelRequestFields is not supported for this model" 或
+// "does not have a value in the enumeration [...]"）。
+interface ModelThinkingCapability {
+  supportsThinking: boolean
+  thinkingEfforts: string[] // 后端允许的 effort 枚举；为空表示该模型不接受 effort
+}
+
+const modelCapabilityRegistry = new Map<string, ModelThinkingCapability>()
+
+function capabilityKey(modelId: string): string {
+  return modelId.trim().toLowerCase()
+}
+
+// 由 proxyServer 在每次成功拉取模型列表后调用，将后端真实能力同步进来。
+export function setModelThinkingCapability(
+  modelId: string,
+  capability: ModelThinkingCapability
+): void {
+  if (!modelId) return
+  modelCapabilityRegistry.set(capabilityKey(modelId), {
+    supportsThinking: capability.supportsThinking,
+    thinkingEfforts: capability.thinkingEfforts ?? []
+  })
+}
+
+export function clearModelThinkingCapabilities(): void {
+  modelCapabilityRegistry.clear()
+}
+
+function lookupCapability(modelId: string): ModelThinkingCapability | undefined {
+  return modelCapabilityRegistry.get(capabilityKey(modelId))
+}
+
+// 后备启发式：仅在注册表尚未填充（首个请求早于首次模型拉取）时使用，保守判断模型族是否「可能」支持。
+// 注意：这只决定是否「尝试」下发字段，真正的 effort 合法性始终以注册表为准（注册表为空时仅下发安全枚举）。
+function heuristicSupportsThinking(modelId: string): boolean {
   const lower = modelId.toLowerCase()
-  // 必须是 claude 模型
   if (!lower.includes('claude')) return false
-  // claude-3.x 不支持 thinking
   if (lower.includes('claude-3-') || lower.includes('claude-3.')) return false
-  // auto 模型由后端决定，保守不传
   if (lower === 'auto') return false
-  // claude-sonnet-4、claude-opus-4、claude-haiku-4.5 等都支持
   return true
 }
 
+// 注册表未填充时允许下发的 effort 安全集合：取所有支持 thinking 的 Claude 模型 effort 枚举的交集
+// （sonnet=[low,medium,high,max]、opus=[low,medium,high,xhigh,max]）。
+// 不含 xhigh——它仅 opus 接受，对 sonnet 下发会触发 enumeration 400。模型列表拉取后改以真实枚举为准。
+const SAFE_THINKING_EFFORTS = new Set(['low', 'medium', 'high', 'max'])
+
 // 统一构建 additionalModelRequestFields（thinking + reasoning effort）
 // effort 走 additionalModelRequestFields.output_config.effort（与 /v1/models 暴露的 schema 对齐，
-// 见 proxyServer.ts extractThinkingEfforts：output_config 与 thinking 同级，位于 additionalModelRequestFields 下）
-// 仅对支持 thinking 的 Claude 4+ 模型传递；非 Claude 模型 schema 无这些属性，传了会 400
+// 见 proxyServer.ts extractThinkingEfforts：output_config 与 thinking 同级，位于 additionalModelRequestFields 下）。
+// 一律以后端真实能力注册表为准：
+//   - 注册表显示该模型不支持 thinking → 返回 undefined（不下发任何字段）
+//   - 客户端请求的 effort 不在后端枚举内 → 丢弃该 effort（不会因非法值触发 400）
+//   - 注册表尚未填充 → 退回保守启发式判断模型族，effort 只下发安全集合内的值（防止 xhigh 误发 sonnet）
 function buildAdditionalModelRequestFields(
   modelId: string,
   thinking?: { type: string } | undefined,
   effort?: string | undefined
 ): Record<string, unknown> | undefined {
-  if (!modelSupportsThinkingParam(modelId)) return undefined
+  const capability = lookupCapability(modelId)
+  const normalizedEffort = effort?.trim()
+
+  // 注册表已知该模型：以真实能力为准
+  if (capability) {
+    if (!capability.supportsThinking) return undefined
+    const fields: Record<string, unknown> = {}
+    if (thinking && thinking.type !== 'disabled') {
+      fields.thinking = { type: 'adaptive' }
+    }
+    // 仅在 effort 落在后端允许枚举内时下发，否则静默丢弃（防止 enumeration 400）
+    if (normalizedEffort && capability.thinkingEfforts.includes(normalizedEffort)) {
+      fields.output_config = { effort: normalizedEffort }
+    }
+    return Object.keys(fields).length > 0 ? fields : undefined
+  }
+
+  // 注册表未知（尚未拉取模型）：退回保守启发式，effort 仅下发安全集合内的值
+  if (!heuristicSupportsThinking(modelId)) return undefined
   const fields: Record<string, unknown> = {}
   if (thinking && thinking.type !== 'disabled') {
     fields.thinking = { type: 'adaptive' }
   }
-  const normalizedEffort = effort?.trim()
-  if (normalizedEffort) {
+  if (normalizedEffort && SAFE_THINKING_EFFORTS.has(normalizedEffort)) {
     fields.output_config = { effort: normalizedEffort }
   }
   return Object.keys(fields).length > 0 ? fields : undefined
@@ -988,12 +1047,19 @@ export function claudeToKiro(
   // 转换工具定义
   const kiroTools = convertClaudeTools(request.tools, toolNameRegistry, webToolsEnabled)
 
-  // 将 Claude thinking + output_config.effort 参数映射为 Kiro additionalModelRequestFields
-  // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
-  // 非 Claude 模型（deepseek/minimax/glm 等）的 schema 没有这些属性，传了会 400
+  // 仅传 effort，不传 thinking 字段到 additionalModelRequestFields。
+  //
+  // 原因（已实测验证）：一旦 payload 里出现 additionalModelRequestFields.thinking，
+  // Kiro 后端会把推理内容以「加密」形式返回（只给 signature，没有可读 thinking 文本），
+  // 客户付了 reasoning token 的费用却看不到思考过程。反之，不传 thinking 字段时，
+  // 后端会回传明文 thinking（客户可见），且 effort 仍正常生效（high effort 实测推理量更大）。
+  //
+  // 多轮 + signature 续传不受影响：历史里的 thinking block 走 reasoningContent 通道
+  // （见本文件 messageToKiro / kiroToClaudeResponse），与此字段无关，已实测 200 通过。
+  // 注意：仅改 Claude path；OpenAI path 维持原状。
   const additionalModelRequestFields = buildAdditionalModelRequestFields(
     modelId,
-    request.thinking,
+    undefined,
     request.output_config?.effort
   )
 

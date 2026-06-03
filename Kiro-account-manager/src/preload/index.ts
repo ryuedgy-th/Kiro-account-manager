@@ -1,6 +1,20 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+// 客户脱敏视图（与 src/main/proxy/types.ts 的 CustomerView 对应；preload 为独立 bundle 故就地声明）
+interface CustomerView {
+  id: string
+  email: string
+  name?: string
+  enabled: boolean
+  createdAt: number
+  lastLoginAt?: number
+  creditBalance: number
+  totalToppedUp: number
+  keyCount: number
+  maxKeys: number
+}
+
 // Custom APIs for renderer
 const api = {
   // 打开外部链接
@@ -944,6 +958,35 @@ const api = {
   // 重置 API Key 用量统计
   proxyResetApiKeyUsage: (id: string): Promise<{ success: boolean; error?: string }> => {
     return ipcRenderer.invoke('proxy-reset-api-key-usage', id)
+  },
+
+  // ============ 客户门户管理 ============
+  proxyPortalSetEnabled: (enabled: boolean): Promise<{ success: boolean; portalEnabled?: boolean; needsRestart?: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-portal-set-enabled', enabled)
+  },
+
+  proxyListCustomers: (): Promise<{ success: boolean; customers?: CustomerView[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-list-customers')
+  },
+
+  proxyCreateCustomer: (input: { email: string; password: string; name?: string; creditBalance?: number; maxKeys?: number }): Promise<{ success: boolean; customer?: CustomerView; error?: string }> => {
+    return ipcRenderer.invoke('proxy-create-customer', input)
+  },
+
+  proxyTopupCustomer: (id: string, amount: number, note?: string): Promise<{ success: boolean; creditBalance?: number; error?: string }> => {
+    return ipcRenderer.invoke('proxy-topup-customer', id, amount, note)
+  },
+
+  proxySetCustomerEnabled: (id: string, enabled: boolean): Promise<{ success: boolean; customer?: CustomerView; error?: string }> => {
+    return ipcRenderer.invoke('proxy-set-customer-enabled', id, enabled)
+  },
+
+  proxyResetCustomerPassword: (id: string, password: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-reset-customer-password', id, password)
+  },
+
+  proxyDeleteCustomer: (id: string): Promise<{ success: boolean; revokedKeys?: number; error?: string }> => {
+    return ipcRenderer.invoke('proxy-delete-customer', id)
   },
 
   // 安装 CA 证书到系统信任存储

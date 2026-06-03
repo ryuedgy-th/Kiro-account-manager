@@ -120,6 +120,20 @@ interface StatusResult {
   error?: { message: string }
 }
 
+// 客户脱敏视图（对应 src/main/proxy/types.ts 的 CustomerView）
+interface CustomerView {
+  id: string
+  email: string
+  name?: string
+  enabled: boolean
+  createdAt: number
+  lastLoginAt?: number
+  creditBalance: number
+  totalToppedUp: number
+  keyCount: number
+  maxKeys: number
+}
+
 interface KiroApi {
   openExternal: (url: string, usePrivateMode?: boolean) => void
   getAppVersion: () => Promise<string>
@@ -736,6 +750,15 @@ interface KiroApi {
 
   // 重置 API Key 用量统计
   proxyResetApiKeyUsage: (id: string) => Promise<{ success: boolean; error?: string }>
+
+  // ============ 客户门户管理 ============
+  proxyPortalSetEnabled: (enabled: boolean) => Promise<{ success: boolean; portalEnabled?: boolean; needsRestart?: boolean; error?: string }>
+  proxyListCustomers: () => Promise<{ success: boolean; customers?: CustomerView[]; error?: string }>
+  proxyCreateCustomer: (input: { email: string; password: string; name?: string; creditBalance?: number; maxKeys?: number }) => Promise<{ success: boolean; customer?: CustomerView; error?: string }>
+  proxyTopupCustomer: (id: string, amount: number, note?: string) => Promise<{ success: boolean; creditBalance?: number; error?: string }>
+  proxySetCustomerEnabled: (id: string, enabled: boolean) => Promise<{ success: boolean; customer?: CustomerView; error?: string }>
+  proxyResetCustomerPassword: (id: string, password: string) => Promise<{ success: boolean; error?: string }>
+  proxyDeleteCustomer: (id: string) => Promise<{ success: boolean; revokedKeys?: number; error?: string }>
 
   // 安装 CA 证书到系统信任存储
   kproxyInstallCaCert: () => Promise<{ success: boolean; message?: string; error?: string }>

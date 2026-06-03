@@ -321,7 +321,7 @@ export function mapModelId(model: string): string {
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
   // 3) Kiro 支持的非 Claude 模型（deepseek/minimax/glm/qwen 等）及路由别名（auto/simple-task）原样透传
   //    关键：这些不能 fallback 到 Claude，否则 (a) 用户选的模型被静默替换，
-  //    (b) modelSupportsThinkingParam 会误判为 Claude 而注入 thinking/effort 导致 400
+  //    (b) translator 的能力注册表会误判为 Claude 而注入 thinking/effort 导致 400
   if (KIRO_PASSTHROUGH_MODEL_RE.test(lower)) return modelId
   // 4) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
   console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
