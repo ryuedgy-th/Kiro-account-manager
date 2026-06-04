@@ -653,6 +653,8 @@ export interface ProxyConfig {
   enabled: boolean
   port: number
   host: string
+  /** 数据目录（cert/log 等）。headless 模式下显式指定；Electron 下留空走 userData。 */
+  dataDir?: string
   apiKey?: string  // 保留兼容性
   apiKeys?: ApiKey[]  // 多 API Key 支持
   enableMultiAccount: boolean

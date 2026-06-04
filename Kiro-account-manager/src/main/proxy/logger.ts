@@ -1,8 +1,16 @@
 // 代理服务器日志模块
 import * as fs from 'fs'
 import * as path from 'path'
-import { app } from 'electron'
+import * as os from 'os'
 import { redactString, redactValue } from '../utils/redact'
+
+// headless 友好：不在模块顶层 import electron。
+// Electron 主进程通过 ProxyLogStore.initialize(userDataPath) 自动注入；
+// headless service 可用 config.logDir 显式指定，或设环境变量 KIRO_DATA_DIR。
+let injectedDataDir: string | undefined
+export function setProxyLoggerDataDir(dir: string): void {
+  if (dir) injectedDataDir = dir
+}
 
 export interface LogEntry {
   timestamp: string
@@ -43,8 +51,9 @@ class ProxyLogger {
     this.config = { ...this.config, ...config }
     
     if (this.config.enabled && !this.config.logDir) {
-      // 默认日志目录
-      this.config.logDir = path.join(app.getPath('userData'), 'logs', 'proxy')
+      // 默认日志目录（headless 友好：优先 inject/env，最后退到临时目录）
+      const base = injectedDataDir || process.env.KIRO_DATA_DIR || path.join(os.tmpdir(), 'kiro-proxy')
+      this.config.logDir = path.join(base, 'logs', 'proxy')
     }
 
     if (this.config.enabled) {
@@ -252,6 +261,8 @@ class ProxyLogStore {
   initialize(userDataPath: string): void {
     if (this.initialized) return
     this.initialized = true
+    // 同时把日志目录注入给 ProxyLogger（保持 Electron 侧原有 userData 行为）
+    setProxyLoggerDataDir(userDataPath)
     this.storePath = path.join(userDataPath, 'proxy-logs.json')
     this.load()
   }

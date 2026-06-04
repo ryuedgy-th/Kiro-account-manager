@@ -1190,6 +1190,44 @@ export function buildKiroPayload(
     }
   }
 
+  // ====== 第三阶段：按 token 预算截断超大 tool_result（含「当前轮」）======
+  // 关键修复（data-backed）：byte 阈值(1.5MB)远高于 Kiro 的 token 限制(~200k)，实测 payload
+  // 最大仅 1.27MB 从不触发 byte 截断；且旧逻辑只截断 history、不截断「当前轮」的 tool_result。
+  // playwright/MCP 等单个巨型工具结果会原样发出 → CONTENT_LENGTH_EXCEEDS_THRESHOLD(400)
+  // → 流式无重试 → 客户端(Claude Code)中断。这里按 token 预算把最大的 tool_result 文本
+  // 逐个截断（当前轮 + history 都纳入），直到估算 token 落入预算内。
+  {
+    const tokenBudget = getEffectiveTokenLimit(modelId) // 模型 ctx - buffer（ListAvailableModels 失败时回退 opus 200k → 180k）
+    let estTokens = estimatePayloadTokens(payload)
+    if (estTokens > tokenBudget) {
+      const collectTexts = (msg?: { userInputMessage?: { userInputMessageContext?: { toolResults?: Array<{ content?: Array<{ text?: string }> }> } } }): Array<{ text?: string }> => {
+        const out: Array<{ text?: string }> = []
+        const trs = msg?.userInputMessage?.userInputMessageContext?.toolResults
+        if (trs) for (const tr of trs) for (const c of (tr.content || [])) {
+          if (c.text && c.text.length > TOOL_RESULT_TRUNCATE_LENGTH) out.push(c)
+        }
+        return out
+      }
+      const candidates: Array<{ text?: string }> = [
+        ...collectTexts(payload.conversationState.currentMessage),
+        ...(payload.conversationState.history || []).flatMap(m => collectTexts(m as { userInputMessage?: { userInputMessageContext?: { toolResults?: Array<{ content?: Array<{ text?: string }> }> } } }))
+      ]
+      // 大块优先截断
+      candidates.sort((a, b) => (b.text?.length || 0) - (a.text?.length || 0))
+      let truncated = 0
+      for (const c of candidates) {
+        if (estTokens <= tokenBudget) break
+        const orig = c.text!.length
+        c.text = `${c.text!.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${orig} chars, trimmed to fit ~${tokenBudget} token limit]`
+        truncated++
+        estTokens = estimatePayloadTokens(payload)
+      }
+      if (truncated > 0) {
+        console.log(`[KiroPayload] Token-budget truncated ${truncated} large tool results → est ${estTokens.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens (prevents CONTENT_LENGTH 400)`)
+      }
+    }
+  }
+
   // 调试日志
   console.log(`[KiroPayload] Built payload (native history mode):`, {
     contentLength: finalContent.length,
@@ -1448,7 +1486,7 @@ export async function callKiroApiStream(
         return
       }
       lastError = error as Error
-      console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error)
+      console.error(`[KiroAPI] Endpoint ${endpoint.name} failed: ${(error as Error)?.message || String(error)}`)
       
       // 如果是认证错误，不继续尝试其他端点
       if ((error as Error).message.includes('Auth error')) {
@@ -2302,7 +2340,8 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       throwIfAborted(signal)
       
       if (!response.ok) {
-        console.error('[KiroAPI] ListAvailableModels failed:', response.status)
+        const body = await response.text().catch(() => '')
+        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status} ${body.slice(0, 300)}`)
         break
       }
 

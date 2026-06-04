@@ -5424,6 +5424,38 @@ app.whenReady().then(async () => {
     return { success: true }
   })
 
+  // IPC: 导出 headless service 数据文件（accounts + proxyConfig + stats）
+  // 供独立 headless proxy service（src/service）读取，作为 GUI → service 的数据桥
+  ipcMain.handle('proxy-export-service-data', async () => {
+    if (!store) await initStore()
+    if (!store) return { success: false, error: 'store not initialized' }
+    const serviceData = {
+      proxyConfig: store.get('proxyConfig') || null,
+      accountData: store.get('accountData') || { accounts: {} },
+      stats: {
+        totalCredits: store.get('proxyTotalCredits', 0),
+        inputTokens: store.get('proxyInputTokens', 0),
+        outputTokens: store.get('proxyOutputTokens', 0),
+        totalRequests: store.get('proxyTotalRequests', 0),
+        successRequests: store.get('proxySuccessRequests', 0),
+        failedRequests: store.get('proxyFailedRequests', 0)
+      }
+    }
+    const result = await dialog.showSaveDialog(mainWindow!, {
+      title: 'Export Service Data',
+      defaultPath: 'kiro-service-data.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    })
+    if (result.canceled || !result.filePath) return { success: false, canceled: true }
+    try {
+      const { writeFileSync } = await import('fs')
+      writeFileSync(result.filePath, JSON.stringify(serviceData, null, 2), 'utf-8')
+      return { success: true, filePath: result.filePath }
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : 'write failed' }
+    }
+  })
+
   // IPC: 重置请求统计
   ipcMain.handle('proxy-reset-request-stats', () => {
     if (proxyServer) {

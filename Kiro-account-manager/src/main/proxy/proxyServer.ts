@@ -687,12 +687,11 @@ export class ProxyServer {
       cert = fs.readFileSync(tls.certPath, 'utf8')
       key = fs.readFileSync(tls.keyPath, 'utf8')
     } else {
-      // 自动生成自签证书（位于 userData/proxy-tls/）
+      // 自动生成自签证书（位于 dataDir/proxy-tls/）
       try {
-        const { app } = require('electron')
         const { ensureProxySelfSignedCert } = require('./selfSignedCert')
         const hostnames = [this.config.host || '127.0.0.1']
-        const result = ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
+        const result = ensureProxySelfSignedCert(this.getProxyDataDir(), hostnames)
         proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
         cert = result.cert
         key = result.key
@@ -705,13 +704,26 @@ export class ProxyServer {
   }
 
   /**
+   * 解析数据目录（cert/log 等）：headless 友好。
+   * 优先 config.dataDir → 环境变量 KIRO_DATA_DIR → Electron userData（仅 Electron 内可用）→ tmpdir。
+   */
+  private getProxyDataDir(): string {
+    if (this.config.dataDir) return this.config.dataDir
+    if (process.env.KIRO_DATA_DIR) return process.env.KIRO_DATA_DIR
+    try {
+      const { app } = require('electron')
+      if (app?.getPath) return app.getPath('userData')
+    } catch { /* 非 Electron 环境，忽略 */ }
+    return require('path').join(require('os').tmpdir(), 'kiro-proxy')
+  }
+
+  /**
    * 获取（或生成）反代自签证书信息（供 UI 显示/导出 PEM）
    */
   getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
     try {
-      const { app } = require('electron')
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
+      return ensureProxySelfSignedCert(this.getProxyDataDir(), [this.config.host || '127.0.0.1'])
     } catch (err) {
       proxyLogger.warn('ProxyServer', `getSelfSignedCertInfo failed: ${(err as Error).message}`)
       return null
@@ -721,10 +733,9 @@ export class ProxyServer {
   /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
   regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
     try {
-      const { app } = require('electron')
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
       this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
+      return ensureProxySelfSignedCert(this.getProxyDataDir(), [this.config.host || '127.0.0.1'], true)
     } catch (err) {
       proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
       return null
@@ -4736,7 +4747,7 @@ export class ProxyServer {
         // 把 cacheProfile/usage + input token 估算推迟给 handleClaudeStream：先发上游请求，
         // 再在网络 RTT 期间计算并发出 message_start（见 ensureStarted / setImmediate）。
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          undefined, undefined, ProxyServer.deriveEffortLevel(request), prepareCache)
+          undefined, undefined, ProxyServer.deriveEffortLevel(request), prepareCache, request.max_tokens)
       } else {
         // 非流式响应（带重试机制）
         const { cacheProfile, cacheUsage } = prepareCache()
@@ -4915,7 +4926,9 @@ export class ProxyServer {
     effort?: string,
     // 推迟计算缓存 usage + input token 的 thunk（stream 路径专用）。给定时，先发上游请求，
     // 再在网络 RTT 期间调用它计算并发出 message_start——同步开销与网络往返重叠。
-    prepareCache?: () => { estimatedInputTokens: number; cacheProfile: unknown; cacheUsage: { cacheCreationInputTokens: number; cacheReadInputTokens: number } }
+    prepareCache?: () => { estimatedInputTokens: number; cacheProfile: unknown; cacheUsage: { cacheCreationInputTokens: number; cacheReadInputTokens: number } },
+    // client ที่ขอมา (จาก request.max_tokens) — ใช้ตรวจ truncation เพื่อรายงาน stop_reason='max_tokens'
+    maxTokens?: number
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -5169,8 +5182,18 @@ export class ProxyServer {
             promptCacheTracker.update(simCache.accountId, simCache.cacheProfile as any)
           }
           // 发送 message_delta（包含完整 usage 信息）
+          // stop_reason 优先级（保守策略，不影响已工作的工具循环）：
+          //   1) 有工具调用 → 'tool_use'（客户端继续执行工具）
+          //   2) 否则若输出 token 达到/超过 client 请求的 max_tokens → 'max_tokens'（响应被截断）
+          //      —— 关键修复：旧逻辑此时误报 'end_turn'，导致 Claude Code 以为正常结束而提前停工
+          //   3) 否则 → 'end_turn'
           const hasToolCalls = pendingToolCalls.size > 0
-          const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
+          const truncatedByMaxTokens = !hasToolCalls && !!maxTokens && maxTokens > 0 && usage.outputTokens >= maxTokens
+          const stopReason: 'tool_use' | 'max_tokens' | 'end_turn' =
+            hasToolCalls ? 'tool_use' : (truncatedByMaxTokens ? 'max_tokens' : 'end_turn')
+          if (truncatedByMaxTokens) {
+            proxyLogger.info('ProxyServer', `stop_reason=max_tokens (output ${usage.outputTokens} >= max_tokens ${maxTokens}) — response truncated`)
+          }
           const messageDelta = createClaudeStreamEvent('message_delta', {
             delta: { stop_reason: stopReason, stop_sequence: null } as any,
             usage: this.buildClaudeUsage(usage, simCache)

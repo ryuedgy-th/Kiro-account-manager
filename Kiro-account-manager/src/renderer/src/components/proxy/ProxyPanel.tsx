@@ -610,6 +610,21 @@ export function ProxyPanel() {
             </div>
           )}
 
+          {/* 导出 headless service 数据文件（GUI → 独立 service 数据桥） */}
+          <div className="flex items-center gap-2">
+            <Label className="min-w-[80px]">{isEn ? 'Service:' : '独立服务:'}</Label>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                const r = await window.api.proxyExportServiceData()
+                if (!r.success && !r.canceled) console.error('[Proxy] export service data failed:', r.error)
+              }}
+            >
+              {isEn ? 'Export Service Data' : '导出独立服务数据'}
+            </Button>
+          </div>
+
           {/* 基础配置 — 4 列紧凑布局：端口 + 监听 + API Key + 格式选择 */}
           <div className="grid grid-cols-12 gap-3">
             <div className="col-span-2 space-y-1.5">

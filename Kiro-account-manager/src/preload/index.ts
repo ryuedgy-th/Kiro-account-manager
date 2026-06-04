@@ -696,6 +696,11 @@ const api = {
     return ipcRenderer.invoke('proxy-reset-tokens')
   },
 
+  // 导出 headless service 数据文件（GUI → service 数据桥）
+  proxyExportServiceData: (): Promise<{ success: boolean; filePath?: string; canceled?: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-export-service-data')
+  },
+
   // 重置请求统计
   proxyResetRequestStats: (): Promise<{ success: boolean }> => {
     return ipcRenderer.invoke('proxy-reset-request-stats')

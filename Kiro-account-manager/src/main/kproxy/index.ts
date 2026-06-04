@@ -1,5 +1,4 @@
 // K-Proxy 模块入口
-import { app } from 'electron'
 import * as path from 'path'
 import { CertManager, createCertManager } from './certManager'
 import { MitmProxy } from './mitmProxy'
@@ -11,6 +10,17 @@ import type {
   DeviceIdMapping
 } from './types'
 import { DEFAULT_KPROXY_CONFIG } from './types'
+
+// headless 友好：不在顶层 import electron。
+// 优先环境变量 KIRO_DATA_DIR → Electron userData（仅 Electron 内）→ tmpdir。
+function resolveKproxyBaseDir(): string {
+  if (process.env.KIRO_DATA_DIR) return process.env.KIRO_DATA_DIR
+  try {
+    const { app } = require('electron')
+    if (app?.getPath) return app.getPath('userData')
+  } catch { /* 非 Electron 环境 */ }
+  return path.join(require('os').tmpdir(), 'kiro-proxy')
+}
 
 // 导出类型
 export * from './types'
@@ -33,7 +43,7 @@ export class KProxyService {
   constructor(config: Partial<KProxyConfig> = {}, events: KProxyEvents = {}) {
     this.config = { ...DEFAULT_KPROXY_CONFIG, ...config }
     this.events = events
-    this.dataPath = path.join(app.getPath('userData'), 'kproxy')
+    this.dataPath = path.join(resolveKproxyBaseDir(), 'kproxy')
   }
 
   /**

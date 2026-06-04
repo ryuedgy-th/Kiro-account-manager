@@ -640,6 +640,7 @@ interface KiroApi {
 
   // 重置累计 tokens
   proxyResetTokens: () => Promise<{ success: boolean }>
+  proxyExportServiceData: () => Promise<{ success: boolean; filePath?: string; canceled?: boolean; error?: string }>
 
   // 重置请求统计
   proxyResetRequestStats: () => Promise<{ success: boolean }>
