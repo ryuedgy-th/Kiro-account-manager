@@ -365,3 +365,85 @@ export function isValidEmail(email: string): boolean {
 export function isStrongEnoughPassword(pw: string): boolean {
   return typeof pw === 'string' && pw.length >= 8 && pw.length <= MAX_PASSWORD_LENGTH
 }
+
+// ============ 转账slip自动充值（slip2go）纯逻辑 ============
+// 抽到 portal.ts 作纯函数，便于 esbuild 单测（与密码/会话逻辑同样不依赖 electron）。
+// proxyServer 负责 HTTP/持久化，金额与防重复的核心判定集中在这里。
+
+/**
+ * THB → credit 换算。在「分（สตางค์）」整数域计算避免浮点漂移，floor 保证不会多给 credit。
+ * rate <= 0 视为非法 → 返回 0 credit（调用方应拒绝入账）。
+ */
+export function bahtToCredits(bahtAmount: number, bahtPerCredit: number): number {
+  if (!Number.isFinite(bahtAmount) || bahtAmount <= 0) return 0
+  if (!Number.isFinite(bahtPerCredit) || bahtPerCredit <= 0) return 0
+  const bahtCents = Math.round(bahtAmount * 100)
+  const rateCents = Math.round(bahtPerCredit * 100)
+  if (rateCents <= 0) return 0
+  return Math.floor(bahtCents / rateCents)
+}
+
+/** slip2go 结果码 → 客户可读拒绝原因（不泄露内部细节）。 */
+export function slipRejectReason(code: number): string {
+  switch (code) {
+    case 200401: return 'receiver_not_match'
+    case 200402: return 'amount_not_match'
+    case 200403: return 'date_not_match'
+    case 200404: return 'slip_not_found'   // 银行查无此slip = 可能伪造
+    case 200501: return 'duplicate_slip'
+    case 200000: return 'conditions_not_asserted'
+    default: return code >= 400000 ? 'verification_error' : 'rejected'
+  }
+}
+
+/** 仅 200200（Slip is Valid，所有 checkCondition 通过）才允许入账。 */
+export function isSlipCreditable(code: number): boolean {
+  return code === 200200
+}
+
+export interface SlipReceiverMatcher {
+  accountType?: string
+  accountNumber?: string
+  accountNameTH?: string
+  accountNameEN?: string
+}
+
+/**
+ * 服务端二次核对收款人是否为我方账号（不只信 slip2go 的 200200，defense in depth）。
+ * slip2go 返回账号常部分脱敏（如 "xxx-x-x5366-x"），故用「数字后缀匹配」：
+ * 我方账号末 4 位数字需出现在 slip 返回账号的数字串中；或姓名 TH/EN 任一部分匹配。
+ * ours 为空 = 未配置 checkReceiver（运营自担）→ 返回 true。
+ */
+export function slipReceiverMatches(
+  ours: SlipReceiverMatcher[],
+  receiverAccount: string | undefined,
+  receiverName: string | undefined
+): boolean {
+  if (!Array.isArray(ours) || ours.length === 0) return true
+  const recvDigits = (receiverAccount || '').replace(/\D/g, '')
+  const recvName = (receiverName || '').toLowerCase()
+  for (const o of ours) {
+    if (o.accountNumber) {
+      const od = o.accountNumber.replace(/\D/g, '')
+      if (od.length >= 4 && recvDigits.length >= 4 && recvDigits.includes(od.slice(-4))) return true
+    }
+    if (o.accountNameTH && recvName && recvName.includes(o.accountNameTH.toLowerCase())) return true
+    if (o.accountNameEN && recvName && recvName.includes(o.accountNameEN.toLowerCase())) return true
+  }
+  return false
+}
+
+/**
+ * slip 新鲜度判定。返回 'ok' | 'too_old' | 'future'。
+ * ageMs > freshnessHours → too_old；ageMs < -300s（容忍 5 分钟时钟偏移）→ future。
+ * 无法解析日期 → 'ok'（不因解析失败而误拒，金额/收款人/去重仍各自把关）。
+ */
+export function slipFreshness(slipDateTimeIso: string | undefined, freshnessHours: number, now: number): 'ok' | 'too_old' | 'future' {
+  if (!slipDateTimeIso) return 'ok'
+  const ts = Date.parse(slipDateTimeIso)
+  if (!Number.isFinite(ts)) return 'ok'
+  const ageMs = now - ts
+  if (ageMs > Math.max(0, freshnessHours) * 3600_000) return 'too_old'
+  if (ageMs < -300_000) return 'future'
+  return 'ok'
+}

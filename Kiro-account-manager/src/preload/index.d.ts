@@ -134,6 +134,41 @@ interface CustomerView {
   maxKeys: number
 }
 
+// slip2go 自动充值配置脱敏视图（apiSecret 仅以 '***' 表示是否已设置；对应 SlipTopupConfig）
+interface SlipTopupReceiverAccount {
+  accountType?: string
+  accountNumber?: string
+  accountNameTH?: string
+  accountNameEN?: string
+}
+interface SlipTopupConfigView {
+  enabled: boolean
+  apiSecret: string
+  receiverAccounts: SlipTopupReceiverAccount[]
+  minAmountThb?: number
+  maxAmountThb?: number
+  freshnessHours?: number
+  dailyMaxSubmitsPerCustomer?: number
+  perMinuteMaxSubmitsPerCustomer?: number
+}
+// slip充值流水视图（对应 SlipTopupRecord）
+interface SlipTopupRecordView {
+  id: string
+  transRef: string
+  referenceId: string
+  customerId: string
+  bahtAmount: number
+  creditsAdded: number
+  bahtPerCreditAtTime: number
+  code: number
+  status: 'settled' | 'rejected'
+  rejectReason?: string
+  receiverAccount?: string
+  senderName?: string
+  slipDateTime?: string
+  verifiedAt: number
+}
+
 interface InviteView {
   code: string
   email: string
@@ -768,6 +803,9 @@ interface KiroApi {
   proxyListCustomers: () => Promise<{ success: boolean; customers?: CustomerView[]; error?: string }>
   proxyCreateCustomer: (input: { email: string; password: string; name?: string; creditBalance?: number; maxKeys?: number }) => Promise<{ success: boolean; customer?: CustomerView; error?: string }>
   proxyTopupCustomer: (id: string, amount: number, note?: string) => Promise<{ success: boolean; creditBalance?: number; error?: string }>
+  proxySlipTopupGetConfig: () => Promise<{ success: boolean; config?: SlipTopupConfigView; error?: string }>
+  proxySlipTopupSetConfig: (input: Partial<SlipTopupConfigView>) => Promise<{ success: boolean; config?: SlipTopupConfigView; error?: string }>
+  proxySlipTopupRecords: (limit?: number) => Promise<{ success: boolean; records?: SlipTopupRecordView[]; error?: string }>
   proxySetCustomerEnabled: (id: string, enabled: boolean) => Promise<{ success: boolean; customer?: CustomerView; error?: string }>
   proxyResetCustomerPassword: (id: string, password: string) => Promise<{ success: boolean; error?: string }>
   proxyDeleteCustomer: (id: string) => Promise<{ success: boolean; revokedKeys?: number; error?: string }>

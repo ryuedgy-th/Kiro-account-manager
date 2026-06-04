@@ -23,7 +23,9 @@ import {
   countTokens,
   getModelContextLength,
   setModelContextWindow,
-  getModelContextWindow
+  getModelContextWindow,
+  estimateBase64DocumentTokens,
+  IMAGE_TOKEN_ESTIMATE
 } from './tokenCounter'
 // 重新导出以保持向后兼容（proxyServer.ts 等模块仍 from './kiroApi' 导入）
 export { setModelContextWindow, getModelContextWindow }
@@ -82,8 +84,44 @@ function estimateTokensFromString(str: string): number {
   return Math.ceil(Buffer.byteLength(str, 'utf-8') / 3.5)
 }
 
+/**
+ * 估算整个 payload 的 token 数（binary-aware）。
+ *
+ * 关键：不能直接 JSON.stringify(payload) 再按长度估算，否则 images/documents 里的
+ * base64（一个 PDF 可达数 MB）会被算成上百万 token，污染裁剪阈值与上下文统计。
+ * 这里把 base64 附件单独按“解码字节数”折算，其余文本走字符系数。
+ */
 function estimatePayloadTokens(payload: KiroPayload): number {
-  return estimateTokensFromString(JSON.stringify(payload))
+  let tokens = 0
+  const accountForMessage = (msg?: KiroHistoryMessage): void => {
+    if (!msg) return
+    const input = msg.userInputMessage
+    if (input) {
+      // 文本/上下文：把 base64 字段剥离后再按字符估算
+      tokens += estimateTokensFromString(stringifyWithoutBinary(input))
+      tokens += (input.images?.length ?? 0) * IMAGE_TOKEN_ESTIMATE
+      for (const doc of input.documents ?? []) {
+        tokens += estimateBase64DocumentTokens(doc.source?.bytes || '', doc.format)
+      }
+    }
+    if (msg.assistantResponseMessage) {
+      tokens += estimateTokensFromString(JSON.stringify(msg.assistantResponseMessage))
+    }
+  }
+  accountForMessage(payload.conversationState.currentMessage)
+  for (const msg of payload.conversationState.history ?? []) accountForMessage(msg)
+  // profileArn / inferenceConfig / additionalModelRequestFields 等其余字段开销很小，忽略不计
+  return Math.max(1, tokens)
+}
+
+// 序列化消息但剔除 base64 二进制字段（images/documents 的 source.bytes），
+// 这些字段单独按解码字节折算，避免 base64 字符串污染按长度的 token 估算。
+function stringifyWithoutBinary(input: KiroUserInputMessage): string {
+  if (!input.images?.length && !input.documents?.length) {
+    return JSON.stringify(input)
+  }
+  const { images, documents, ...rest } = input
+  return JSON.stringify(rest)
 }
 
 /**
@@ -1323,9 +1361,11 @@ export async function callKiroApiStream(
       }
 
       // 解析 Event Stream
-      // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
-      const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+      // 关键：不再把 payloadStr 透传给 parseEventStream 做 tiktoken——payload 里可能含
+      // 数 MB 的 base64 附件，对其同步 encode 会阻塞 event loop 让反代卡死。
+      // 改为在此用 binary-aware 估算先算好 input token 兜底值（base64 按解码字节折算）。
+      const bootstrapInputTokens = estimatePayloadTokens(requestPayload)
+      await parseEventStream(response.body!, onChunk, onComplete, onError, bootstrapInputTokens, signal, requestedModelId)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1409,10 +1449,9 @@ async function parseEventStream(
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
-  inputChars: number = 0,  // 输入字符长度（兜底估算用）
+  bootstrapInputTokens: number = 0,  // 调用方预先用 binary-aware 估算的 input token 兜底值
   signal?: AbortSignal,
-  modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
-  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  modelId?: string         // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
 ): Promise<void> {
   const reader = body.getReader()
   const abort = () => {
@@ -1438,14 +1477,12 @@ async function parseEventStream(
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
   
-  // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
-  // 这里只是兜底初值，后续真实事件会覆盖
-  if (payloadStr) {
-    // 用 tiktoken cl100k_base 精确计算（±5%）
-    usage.inputTokens = countTokens(payloadStr)
-  } else if (inputChars > 0) {
-    // 字符系数兜底（针对 payload JSON 经验值 0.42）
-    usage.inputTokens = Math.max(1, Math.round(inputChars * 0.42))
+  // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > 调用方 binary-aware 兜底）
+  // 这里只是兜底初值，后续真实事件会覆盖。
+  // 注意：绝不在此对 payload 跑 tiktoken——payload 可能含数 MB base64 附件，
+  // 同步 encode 会阻塞事件循环导致反代卡死。调用方已用 estimatePayloadTokens 算好兜底值。
+  if (bootstrapInputTokens > 0) {
+    usage.inputTokens = bootstrapInputTokens
   }
   
   // Tool use 状态跟踪 - 用于累积输入片段
@@ -2009,6 +2046,31 @@ function appendWebToolTurn(
   toolResults: KiroToolResult[]
 ): void {
   payload.conversationState.history = payload.conversationState.history || []
+
+  // 关键修复：先把"上一轮的 currentMessage"（用户原始问题，或上一轮的 web toolResults）
+  // 落入 history，再追加本轮 assistant。否则 currentMessage 会被直接覆盖，导致：
+  //   1) 用户原始问题 / 上一轮 toolResults 丢失；
+  //   2) 上一轮 assistant 的 toolUse 失去配对的 toolResult → Bedrock 报
+  //      TOOL_USE_RESULT_MISMATCH（"Expected toolResult blocks at messages.N.content"）。
+  // 仅在第 2 轮（含）以上的 web 工具调用时触发，因此表现为"多次搜索才偶发 400"。
+  const prevCurrent = payload.conversationState.currentMessage
+  if (prevCurrent?.userInputMessage) {
+    // tools 无需随 history 重复携带（新 currentMessage 会重新附带），去掉以免每轮膨胀
+    const prevContext = prevCurrent.userInputMessage.userInputMessageContext
+    let historyContext = prevContext
+    if (prevContext && 'tools' in prevContext) {
+      historyContext = { ...prevContext }
+      delete (historyContext as Record<string, unknown>).tools
+      if (Object.keys(historyContext).length === 0) historyContext = undefined
+    }
+    payload.conversationState.history.push({
+      userInputMessage: {
+        ...prevCurrent.userInputMessage,
+        userInputMessageContext: historyContext
+      }
+    })
+  }
+
   payload.conversationState.history.push({
     assistantResponseMessage: {
       content: assistantContent || '',
@@ -2019,7 +2081,7 @@ function appendWebToolTurn(
   const modelId = getPayloadModelId(payload)
   // 关键：携带原始 tools 声明。Bedrock 要求只要消息含 toolUse/toolResult，
   // 请求就必须带 toolConfig（即 tools）；否则报 "toolConfig field must be defined"。
-  const prevTools = payload.conversationState.currentMessage?.userInputMessage?.userInputMessageContext?.tools
+  const prevTools = prevCurrent?.userInputMessage?.userInputMessageContext?.tools
   payload.conversationState.currentMessage = {
     userInputMessage: {
       content: '',

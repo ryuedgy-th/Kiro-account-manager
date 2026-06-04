@@ -8,6 +8,7 @@ import type { Socket } from 'net'
 import type {
   OpenAIChatRequest,
   OpenAIMessage,
+  OpenAIContentPart,
   OpenAIResponsesRequest,
   ClaudeRequest,
   ClaudeContentBlock,
@@ -36,9 +37,12 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { estimateBase64DocumentTokens, IMAGE_TOKEN_ESTIMATE } from './tokenCounter'
 import { isServerWebTool, type WebToolConfig } from './webTools'
 import * as portal from './portal'
-import type { Customer, CustomerView } from './types'
+import type { Customer, CustomerView, SlipTopupRecord } from './types'
+import { fetch as undiciFetch, type Dispatcher } from 'undici'
+import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
 
 
 // 把代理侧执行的 web 工具记录，转换为 Anthropic 原生 content block 序列：
@@ -374,6 +378,18 @@ export class ProxyServer {
   private portalLoginBuckets: Map<string, { count: number; windowStart: number }> = new Map()
   /** 客户在途请求计数（信用预留），防并发请求穿透预付余额造成超额消费 */
   private customerInFlight: Map<string, number> = new Map()
+  /**
+   * slip2go 已入账的银行交易号集合（去重主键）。启动时从 slipTopupRecords(settled) 重建，
+   * 入账时同步写入——保证同一笔真实转账只入账一次，且 restart 后仍生效。
+   */
+  private usedSlipTransRefs: Set<string> = new Set()
+  /**
+   * 正在验证中的slip指纹（sha256(qrCode)）。check→add 之间无 await，
+   * 防同一slip并发提交触发重复 slip2go 调用与重复入账竞态。
+   */
+  private inFlightSlipKeys: Set<string> = new Set()
+  /** slip 提交按客户的限流桶（每分钟 + 每日），独立于业务限流，防刷耗 slip2go 配额 */
+  private slipSubmitBuckets: Map<string, { minuteCount: number; minuteStart: number; dayCount: number; dayStart: number }> = new Map()
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
   private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
   /** P2-17 审计日志（最近 200 条） */
@@ -615,6 +631,9 @@ export class ProxyServer {
       // 让 timer 在 Node 退出时不阻塞
       this.cleanupTimer.unref?.()
 
+      // 从持久化的slip充值流水重建 transRef 去重集合（restart 后仍防重复入账）
+      this.rebuildSlipTransRefIndex()
+
       const protocol = this.isHttps ? 'https' : 'http'
       this.server.listen(this.config.port, this.config.host, () => {
         proxyLogger.info('ProxyServer', `Started on ${protocol}://${this.config.host}:${this.config.port} (keepAlive=${keepAliveMs}ms)`)
@@ -851,7 +870,14 @@ export class ProxyServer {
     request.tools?.forEach(tool => this.validateCacheControl(tool.cache_control))
   }
 
-  private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
+  // 通用 HTTP 附件下载（图片/文档共用）：带超时、代理、content-type 校验与大小上限。
+  // 关键：必须有 maxBytes 上限——否则恶意/超大 URL 会把整文件读进内存（内存放大），
+  // 且下载是请求处理的一部分，过大附件会拖慢/拖垮服务。
+  private async downloadHttpAttachment(
+    url: string,
+    opts: { allowedTypes?: string[]; maxBytes: number; label: string },
+    signal?: AbortSignal
+  ): Promise<{ contentType: string; base64: string }> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
     const abort = () => controller.abort(this.getAbortError(signal))
@@ -870,21 +896,35 @@ export class ProxyServer {
         ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
         : await undiciFetch(url, { signal: controller.signal }) as unknown as globalThis.Response
       if (!response.ok) {
-        throw new Error(`Failed to download image: HTTP ${response.status}`)
+        throw new Error(`Failed to download ${opts.label.toLowerCase()}: HTTP ${response.status}`)
       }
-      const contentType = response.headers.get('content-type')?.split(';')[0]?.toLowerCase()
-      if (!contentType || !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)) {
-        throw new Error(`Unsupported image content-type: ${contentType || 'unknown'}`)
+      const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() || ''
+      if (opts.allowedTypes && (!contentType || !opts.allowedTypes.includes(contentType))) {
+        throw new Error(`Unsupported ${opts.label.toLowerCase()} content-type: ${contentType || 'unknown'}`)
+      }
+      // 提前用 Content-Length 拒绝超大文件（部分服务器会提供）
+      const declared = parseInt(response.headers.get('content-length') || '0', 10)
+      if (Number.isFinite(declared) && declared > opts.maxBytes) {
+        throw new Error(`${opts.label} exceeds ${(opts.maxBytes / (1024 * 1024)).toFixed(0)}MB limit`)
       }
       const arrayBuffer = await response.arrayBuffer()
-      if (arrayBuffer.byteLength > 10 * 1024 * 1024) {
-        throw new Error('Image exceeds 10MB limit')
+      if (arrayBuffer.byteLength > opts.maxBytes) {
+        throw new Error(`${opts.label} exceeds ${(opts.maxBytes / (1024 * 1024)).toFixed(0)}MB limit`)
       }
-      return `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
+      return { contentType: contentType || 'application/octet-stream', base64: Buffer.from(arrayBuffer).toString('base64') }
     } finally {
       clearTimeout(timeout)
       signal?.removeEventListener('abort', abort)
     }
+  }
+
+  private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
+    const { contentType, base64 } = await this.downloadHttpAttachment(url, {
+      allowedTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
+      maxBytes: 10 * 1024 * 1024,
+      label: 'Image'
+    }, signal)
+    return `data:${contentType};base64,${base64}`
   }
 
   private async resolveOpenAIHttpImages(request: OpenAIChatRequest, signal?: AbortSignal): Promise<OpenAIChatRequest> {
@@ -902,13 +942,22 @@ export class ProxyServer {
     await Promise.all(request.messages.map(async message => {
       if (!Array.isArray(message.content)) return
       await Promise.all(message.content.map(async block => {
-        if (block.type !== 'image' || block.source?.type !== 'url') return
-        const dataUrl = await this.downloadImageDataUrl(block.source.url, signal)
-        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
-        if (!match) {
-          throw new Error('Downloaded image produced invalid data URL')
+        if (block.source?.type !== 'url') return
+        if (block.type === 'image') {
+          const dataUrl = await this.downloadImageDataUrl(block.source.url, signal)
+          const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+          if (!match) {
+            throw new Error('Downloaded image produced invalid data URL')
+          }
+          block.source = { type: 'base64', media_type: match[1], data: match[2] }
+        } else if (block.type === 'document') {
+          // PDF/文档 URL：下载并转 base64（旧实现只处理图片，文档 URL 会被原样透传给 Kiro 而失败）
+          const { contentType, base64 } = await this.downloadHttpAttachment(block.source.url, {
+            maxBytes: 32 * 1024 * 1024,
+            label: 'Document'
+          }, signal)
+          block.source = { type: 'base64', media_type: contentType, data: base64 }
         }
-        block.source = { type: 'base64', media_type: match[1], data: match[2] }
       }))
     }))
     return request
@@ -2284,7 +2333,10 @@ export class ProxyServer {
       // P0-1 body 超限 → 413
       if (error instanceof BodyTooLargeError) {
         proxyLogger.warn('ProxyServer', `Body too large from ${clientIP}: ${error.received}/${error.limit} bytes (${path})`)
-        this.sendError(res, 413, `Request body too large (max ${error.limit} bytes)`,
+        const limitMB = (error.limit / (1024 * 1024)).toFixed(0)
+        const gotMB = (error.received / (1024 * 1024)).toFixed(1)
+        this.sendError(res, 413,
+          `Request body too large: ${gotMB}MB exceeds the ${limitMB}MB limit. Attachments (PDF/images) are base64-encoded and ~33% larger than the original file. Reduce the file size or raise "maxRequestBodyBytes" in proxy settings.`,
           this.isAnthropicPath(path) ? 'anthropic' : 'openai')
         return
       }
@@ -2507,6 +2559,218 @@ export class ProxyServer {
     return { creditBalance: customer.creditBalance }
   }
 
+  // ============ 转账slip自动充值（slip2go） ============
+
+  /**
+   * 设置slip自动充值配置（含 apiSecret）。仅本地 IPC 调用，不经 HTTP admin。
+   * 部分更新：仅覆盖传入字段，未传字段保留原值（apiSecret 传空字符串视为「不修改」）。
+   * 返回脱敏视图（不含 apiSecret 明文）。
+   */
+  setSlipTopupConfig(input: Partial<import('./types').SlipTopupConfig>): import('./types').SlipTopupConfig {
+    const prev = this.config.slipTopup
+    const next: import('./types').SlipTopupConfig = {
+      enabled: typeof input.enabled === 'boolean' ? input.enabled : (prev?.enabled ?? false),
+      // apiSecret 传空 = 保留旧值（避免前端回显空串误清空密钥）
+      apiSecret: (typeof input.apiSecret === 'string' && input.apiSecret.length > 0) ? input.apiSecret : (prev?.apiSecret ?? ''),
+      receiverAccounts: Array.isArray(input.receiverAccounts) ? input.receiverAccounts : (prev?.receiverAccounts ?? []),
+      minAmountThb: typeof input.minAmountThb === 'number' ? input.minAmountThb : prev?.minAmountThb,
+      maxAmountThb: typeof input.maxAmountThb === 'number' ? input.maxAmountThb : prev?.maxAmountThb,
+      freshnessHours: typeof input.freshnessHours === 'number' ? input.freshnessHours : prev?.freshnessHours,
+      dailyMaxSubmitsPerCustomer: typeof input.dailyMaxSubmitsPerCustomer === 'number' ? input.dailyMaxSubmitsPerCustomer : prev?.dailyMaxSubmitsPerCustomer,
+      perMinuteMaxSubmitsPerCustomer: typeof input.perMinuteMaxSubmitsPerCustomer === 'number' ? input.perMinuteMaxSubmitsPerCustomer : prev?.perMinuteMaxSubmitsPerCustomer
+    }
+    this.config.slipTopup = next
+    this.appendAuditLog('slip_topup_config_changed', { enabled: next.enabled, receiverCount: next.receiverAccounts.length, hasSecret: !!next.apiSecret })
+    this.events.onConfigChanged?.(this.config)
+    return this.slipTopupConfigView()
+  }
+
+  /** slip 配置脱敏视图（apiSecret 仅返回是否已设置，不返回明文）。供 IPC/UI 读取。 */
+  slipTopupConfigView(): import('./types').SlipTopupConfig {
+    const c = this.config.slipTopup
+    return {
+      enabled: c?.enabled ?? false,
+      apiSecret: c?.apiSecret ? '***' : '',
+      receiverAccounts: c?.receiverAccounts ?? [],
+      minAmountThb: c?.minAmountThb,
+      maxAmountThb: c?.maxAmountThb,
+      freshnessHours: c?.freshnessHours,
+      dailyMaxSubmitsPerCustomer: c?.dailyMaxSubmitsPerCustomer,
+      perMinuteMaxSubmitsPerCustomer: c?.perMinuteMaxSubmitsPerCustomer
+    }
+  }
+
+  /** 最近的slip充值流水（默认 50 条，已脱敏——apiSecret 从不在记录中）。供后台对账。 */
+  listSlipTopupRecords(limit = 50): SlipTopupRecord[] {
+    return (this.config.slipTopupRecords || []).slice(0, Math.max(1, Math.min(limit, 500)))
+  }
+
+  /**
+   * 客户端可见的slip充值信息（绝不含 apiSecret）。enabled=false 时返回 { enabled:false }，
+   * 前端据此隐藏「เติมเงิน」入口。含收款账号（供客户核对转账目标）与金额限制。
+   */
+  private publicSlipTopupInfo(): {
+    enabled: boolean
+    receiverAccounts?: Array<{ accountType?: string; accountNumber?: string; accountNameTH?: string; accountNameEN?: string }>
+    minAmountThb?: number
+    maxAmountThb?: number
+  } {
+    const c = this.config.slipTopup
+    if (!c || !c.enabled || !c.apiSecret) return { enabled: false }
+    return {
+      enabled: true,
+      receiverAccounts: c.receiverAccounts || [],
+      minAmountThb: c.minAmountThb ?? 1,
+      maxAmountThb: c.maxAmountThb && c.maxAmountThb > 0 ? c.maxAmountThb : undefined
+    }
+  }
+
+  /** 启动时从持久化流水重建 transRef 去重集合（仅 settled）。幂等，可重复调用。 */
+  private rebuildSlipTransRefIndex(): void {
+    this.usedSlipTransRefs.clear()
+    for (const r of this.config.slipTopupRecords || []) {
+      if (r.status === 'settled' && r.transRef) this.usedSlipTransRefs.add(r.transRef)
+    }
+  }
+
+  /**
+   * THB → credit 换算（与门户计费口径一致）。委托 portal.bahtToCredits 做整数域计算，
+   * 这里只负责取 rate（pricing 未启用时回退默认 0.47 ฿/credit）。
+   */
+  private bahtToCredits(bahtAmount: number): { credits: number; bahtPerCredit: number } {
+    const rate = (this.config.pricing?.enabled ? this.config.pricing.bahtPerCredit : undefined) || 0.47
+    return { credits: portal.bahtToCredits(bahtAmount, rate), bahtPerCredit: rate }
+  }
+
+  /**
+   * slip 提交限流（每分钟 + 每日，按客户）。在调用 slip2go 之前检查，保护有限的验证配额。
+   * 返回 allowed=false 时调用方回 429。limit=0 表示该维度不限制。
+   */
+  private checkSlipSubmitRate(customerId: string): { allowed: boolean; reason?: string } {
+    const cfg = this.config.slipTopup
+    const perMin = cfg?.perMinuteMaxSubmitsPerCustomer ?? 5
+    const perDay = cfg?.dailyMaxSubmitsPerCustomer ?? 20
+    const now = Date.now()
+    let b = this.slipSubmitBuckets.get(customerId)
+    if (!b) { b = { minuteCount: 0, minuteStart: now, dayCount: 0, dayStart: now }; this.slipSubmitBuckets.set(customerId, b) }
+    if (now - b.minuteStart >= 60_000) { b.minuteCount = 0; b.minuteStart = now }
+    if (now - b.dayStart >= 86_400_000) { b.dayCount = 0; b.dayStart = now }
+    if (perMin > 0 && b.minuteCount >= perMin) return { allowed: false, reason: 'per_minute' }
+    if (perDay > 0 && b.dayCount >= perDay) return { allowed: false, reason: 'per_day' }
+    b.minuteCount++
+    b.dayCount++
+    return { allowed: true }
+  }
+
+  /**
+   * 构造出网 dispatcher：优先环境代理（HTTPS_PROXY 等），回退系统代理；都没有则返回 undefined（直连）。
+   * 与 downloadImageDataUrl 共用同一出网策略。
+   */
+  private createOutboundDispatcher(): Dispatcher | undefined {
+    const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+    const envAgent = safeCreateProxyAgent(envProxy)
+    if (envAgent) return envAgent
+    return safeCreateProxyAgent(getSystemProxy()) || undefined
+  }
+
+  /**
+   * 调用 slip2go 验证slip（QR-Code 字符串模式）。仅服务端调用，apiSecret 不外泄。
+   * 携带 checkReceiver=我方账号 + checkDuplicate=true + checkAmount(gte minAmount)，
+   * 让 slip2go 在其侧也做收款人/重复/金额校验（200200 = 全部通过）。
+   * 返回 slip2go 的 { code, data }；网络/HTTP 错误抛出（调用方 fail closed，不入账）。
+   */
+  private async verifySlipByQrCode(qrCode: string, signal?: AbortSignal): Promise<{ code: number; message?: string; data?: Record<string, unknown> }> {
+    const cfg = this.config.slipTopup
+    if (!cfg || !cfg.apiSecret) throw new Error('slip topup not configured')
+
+    const checkCondition: Record<string, unknown> = { checkDuplicate: true }
+    if (Array.isArray(cfg.receiverAccounts) && cfg.receiverAccounts.length > 0) {
+      checkCondition.checkReceiver = cfg.receiverAccounts
+    }
+    const minAmount = cfg.minAmountThb ?? 1
+    if (minAmount > 0) checkCondition.checkAmount = { type: 'gte', amount: minAmount }
+
+    const body = JSON.stringify({ payload: { qrCode, checkCondition } })
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 15000)
+    const abort = (): void => controller.abort(this.getAbortError(signal))
+    try {
+      if (signal?.aborted) throw this.getAbortError(signal)
+      signal?.addEventListener('abort', abort, { once: true })
+      // 复用系统/环境代理出网模式（与 downloadImageDataUrl 一致）
+      const agent = this.createOutboundDispatcher()
+      const url = 'https://connect.slip2go.com/api/verify-slip/qr-code/info'
+      const opts = {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${cfg.apiSecret}`, 'Content-Type': 'application/json' },
+        body,
+        signal: controller.signal,
+        ...(agent ? { dispatcher: agent } : {})
+      }
+      const response = await undiciFetch(url, opts)
+      // slip2go 业务结果（含拒绝码）走 HTTP 200；非 200 视为系统/鉴权错误 → fail closed
+      const text = await response.text()
+      let parsed: { code?: string | number; message?: string; data?: Record<string, unknown> }
+      try { parsed = JSON.parse(text) } catch { throw new Error(`slip2go bad response (HTTP ${response.status})`) }
+      if (!response.ok && !parsed.code) throw new Error(`slip2go HTTP ${response.status}`)
+      const code = Number(parsed.code)
+      if (!Number.isFinite(code)) throw new Error('slip2go missing result code')
+      return { code, message: parsed.message, data: parsed.data }
+    } finally {
+      clearTimeout(timeout)
+      signal?.removeEventListener('abort', abort)
+    }
+  }
+
+  /**
+   * 入账一笔已验证的slip充值。**同步**完成 check→add→credit→record→persist，中途无 await，
+   * 关闭并发 double-submit 竞态（事件循环只在 await 边界切换）。
+   * 返回 alreadyCredited=true 表示该 transRef 已入过账（不重复加 credit）。
+   */
+  private creditFromSlip(
+    customerId: string,
+    bahtAmount: number,
+    meta: { transRef: string; referenceId: string; code: number; receiverAccount?: string; senderName?: string; slipDateTime?: string }
+  ): { ok: boolean; alreadyCredited?: boolean; creditsAdded?: number; creditBalance?: number; reason?: string } {
+    const transRef = meta.transRef
+    if (!transRef) return { ok: false, reason: 'missing_transRef' }
+    if (this.usedSlipTransRefs.has(transRef)) return { ok: true, alreadyCredited: true }
+
+    const customer = portal.findCustomerById(this.config, customerId)
+    if (!customer) return { ok: false, reason: 'customer_not_found' }
+
+    const { credits, bahtPerCredit } = this.bahtToCredits(bahtAmount)
+    if (credits <= 0) return { ok: false, reason: 'amount_too_small' }
+
+    // —— 关键临界区：先占用 transRef，再改余额，全程无 await ——
+    this.usedSlipTransRefs.add(transRef)
+    customer.creditBalance += credits
+    customer.totalToppedUp = (customer.totalToppedUp || 0) + credits
+    if (!customer.topupHistory) customer.topupHistory = []
+    customer.topupHistory.unshift({ timestamp: Date.now(), amount: credits, note: 'slip2go', by: 'slip', transRef })
+    if (customer.topupHistory.length > 100) customer.topupHistory = customer.topupHistory.slice(0, 100)
+
+    this.recordSlipTopup({
+      transRef, referenceId: meta.referenceId, customerId, bahtAmount,
+      creditsAdded: credits, bahtPerCreditAtTime: bahtPerCredit, code: meta.code,
+      status: 'settled', receiverAccount: meta.receiverAccount, senderName: meta.senderName,
+      slipDateTime: meta.slipDateTime
+    })
+    this.appendAuditLog('customer_topup_slip', { id: customerId, baht: bahtAmount, credits, transRef })
+    this.events.onConfigChanged?.(this.config)
+    return { ok: true, creditsAdded: credits, creditBalance: customer.creditBalance }
+  }
+
+  /** 记录一条slip充值流水（capped 500），含拒绝记录便于排查与对账。不单独 persist（由调用方触发）。 */
+  private recordSlipTopup(rec: Omit<SlipTopupRecord, 'id' | 'verifiedAt'>): void {
+    if (!this.config.slipTopupRecords) this.config.slipTopupRecords = []
+    this.config.slipTopupRecords.unshift({ ...rec, id: uuidv4(), verifiedAt: Date.now() })
+    if (this.config.slipTopupRecords.length > 500) {
+      this.config.slipTopupRecords = this.config.slipTopupRecords.slice(0, 500)
+    }
+  }
+
   /** 启用/停用客户（停用后该客户无法登录门户、名下 Key 全部被拒）。 */
   setCustomerEnabled(customerId: string, enabled: boolean): CustomerView {
     const customer = portal.findCustomerById(this.config, customerId)
@@ -2704,7 +2968,8 @@ export class ProxyServer {
         totalToppedUp: customer.totalToppedUp || 0,
         maxKeys: portal.maxKeysFor(this.config, customer),
         keyCount: portal.customerKeys(this.config, customer.id).length,
-        pricing: this.publicPricing()
+        pricing: this.publicPricing(),
+        slipTopup: this.publicSlipTopupInfo()
       })
     } else if (path === '/portal/keys' && method === 'GET') {
       this.handlePortalListKeys(res, customer)
@@ -2729,6 +2994,23 @@ export class ProxyServer {
       this.handlePortalUsage(res, customer)
     } else if (path === '/portal/rates' && method === 'GET') {
       await this.handlePortalRates(res, signal)
+    } else if (path === '/portal/topup/slip' && method === 'POST') {
+      await this.handlePortalSlipTopup(req, res, customer, signal)
+    } else if (path === '/portal/topup/slip/history' && method === 'GET') {
+      // 仅返回该客户自己的slip充值流水（严格按 customerId 过滤，防越权查看他人）
+      const records = (this.config.slipTopupRecords || [])
+        .filter(r => r.customerId === customer.id)
+        .slice(0, 20)
+        .map(r => ({
+          transRef: r.transRef,
+          bahtAmount: r.bahtAmount,
+          creditsAdded: r.creditsAdded,
+          status: r.status,
+          rejectReason: r.rejectReason,
+          slipDateTime: r.slipDateTime,
+          verifiedAt: r.verifiedAt
+        }))
+      this.sendJson(res, 200, { records })
     } else {
       this.sendJson(res, 404, { error: 'Not found' })
     }
@@ -3068,6 +3350,188 @@ export class ProxyServer {
     this.sendJson(res, 200, { models: rates })
   }
 
+  /**
+   * POST /portal/topup/slip — 客户提交转账slip的 QR-Code 字符串，经 slip2go 验证后自动入账 credit。
+   * 安全要点（详见各 gate 注释）：金额只取 slip2go 返回值；收款人二次核对；transRef 去重；
+   * 并发 in-flight 锁；限流保护 slip2go 配额；任何 slip2go 异常 fail closed（不入账）。
+   */
+  private async handlePortalSlipTopup(req: http.IncomingMessage, res: http.ServerResponse, customer: Customer, signal?: AbortSignal): Promise<void> {
+    const cfg = this.config.slipTopup
+    // 1) 功能开关：未配置/未启用 → 404（对外表现为「该端点不存在」）
+    if (!cfg || !cfg.enabled || !cfg.apiSecret) {
+      this.sendJson(res, 404, { error: 'Not found' })
+      return
+    }
+
+    // 2) 限流（调用 slip2go 之前，保护有限配额）
+    const rl = this.checkSlipSubmitRate(customer.id)
+    if (!rl.allowed) {
+      this.sendJson(res, 429, { error: 'Too many slip submissions, try again later' })
+      return
+    }
+
+    // 3) 读取并校验输入（本地，不耗配额）
+    let body: string
+    try { body = await this.readBody(req, signal) } catch (e) {
+      if (this.isAbortError(e, signal)) return
+      this.sendJson(res, 400, { error: 'Invalid request body' }); return
+    }
+    let parsed: { qrCode?: string }
+    try { parsed = JSON.parse(body) } catch { this.sendJson(res, 400, { error: 'Invalid JSON body' }); return }
+    const qrCode = (parsed.qrCode || '').trim()
+    if (!qrCode || qrCode.length > 1024) {
+      this.sendJson(res, 400, { error: 'Missing or invalid qrCode' }); return
+    }
+
+    // 4) in-flight 锁（同步 check→add，无 await，防同一slip并发触发重复验证/入账）
+    const slipKey = crypto.createHash('sha256').update(qrCode).digest('hex')
+    if (this.inFlightSlipKeys.has(slipKey)) {
+      this.sendJson(res, 409, { error: 'This slip is being processed' }); return
+    }
+    this.inFlightSlipKeys.add(slipKey)
+
+    try {
+      // 5) 调用 slip2go（fail closed：网络/HTTP/鉴权异常 → 502，不入账）
+      let result: { code: number; message?: string; data?: Record<string, unknown> }
+      try {
+        result = await this.verifySlipByQrCode(qrCode, signal)
+      } catch (e) {
+        if (this.isAbortError(e, signal)) return
+        proxyLogger.warn('ProxyServer', `slip2go verify failed: ${(e as Error).message}`)
+        this.sendJson(res, 502, { error: 'Slip verification service unavailable' }); return
+      }
+
+      const code = result.code
+      const data = (result.data || {}) as Record<string, unknown>
+
+      // 6) 结果码 gate：仅 200200（Slip is Valid，含 checkReceiver/checkAmount/checkDuplicate 全通过）才入账
+      if (!portal.isSlipCreditable(code)) {
+        const reason = this.slipRejectReason(code)
+        // 记录拒绝流水（便于客户查询与对账），但不入账、不持久化 transRef
+        this.recordSlipRejection(customer.id, data, code, reason)
+        this.events.onConfigChanged?.(this.config)
+        this.sendJson(res, 200, { ok: false, code, reason })
+        return
+      }
+
+      // 7) 金额 gate：只取 slip2go 的 data.amount（绝不信任客户端），并校验范围
+      const amount = typeof data.amount === 'number' ? data.amount : Number(data.amount)
+      if (!Number.isFinite(amount) || amount <= 0) {
+        this.sendJson(res, 200, { ok: false, code, reason: 'invalid_amount' }); return
+      }
+      const minAmt = cfg.minAmountThb ?? 1
+      const maxAmt = cfg.maxAmountThb ?? 0
+      if (amount < minAmt) { this.sendJson(res, 200, { ok: false, code, reason: 'below_min' }); return }
+      if (maxAmt > 0 && amount > maxAmt) {
+        // 异常大额 → 不自动入账，转人工核对（fail closed）
+        this.recordSlipRejection(customer.id, data, code, 'above_max')
+        this.events.onConfigChanged?.(this.config)
+        this.sendJson(res, 200, { ok: false, code, reason: 'above_max' }); return
+      }
+
+      // 8) 收款人二次核对（defense in depth，不只信 slip2go 的 200200）
+      if (!this.slipReceiverMatchesOurs(data)) {
+        this.recordSlipRejection(customer.id, data, code, 'receiver_mismatch')
+        this.events.onConfigChanged?.(this.config)
+        this.sendJson(res, 200, { ok: false, code, reason: 'receiver_mismatch' }); return
+      }
+
+      // 9) 新鲜度 gate：slip 日期需在 freshnessHours 内，且不可是未来（容忍少量时钟偏移）
+      const freshnessHours = cfg.freshnessHours ?? 48
+      const slipDateTime = typeof data.dateTime === 'string' ? data.dateTime : undefined
+      const freshness = portal.slipFreshness(slipDateTime, freshnessHours, Date.now())
+      if (freshness === 'too_old') { this.sendJson(res, 200, { ok: false, code, reason: 'slip_too_old' }); return }
+      if (freshness === 'future') { this.sendJson(res, 200, { ok: false, code, reason: 'slip_future_date' }); return }
+
+      // 10) transRef gate + 入账（creditFromSlip 内部为同步临界区，去重 + 加余额 + 流水 + persist）
+      const transRef = typeof data.transRef === 'string' ? data.transRef : ''
+      if (!transRef) { this.sendJson(res, 200, { ok: false, code, reason: 'missing_transRef' }); return }
+
+      const credited = this.creditFromSlip(customer.id, amount, {
+        transRef,
+        referenceId: typeof data.referenceId === 'string' ? data.referenceId : '',
+        code,
+        receiverAccount: this.extractReceiverAccount(data),
+        senderName: this.extractSenderName(data),
+        slipDateTime
+      })
+
+      if (credited.alreadyCredited) {
+        this.sendJson(res, 200, { ok: false, code, reason: 'already_credited', transRef }); return
+      }
+      if (!credited.ok) {
+        this.sendJson(res, 200, { ok: false, code, reason: credited.reason || 'credit_failed' }); return
+      }
+
+      // 11) 成功响应（不回传 apiSecret 或任何内部字段）
+      this.sendJson(res, 200, {
+        ok: true,
+        creditsAdded: credited.creditsAdded,
+        bahtAmount: amount,
+        newBalance: credited.creditBalance,
+        transRef
+      })
+    } finally {
+      this.inFlightSlipKeys.delete(slipKey)
+    }
+  }
+
+  /** slip2go 结果码 → 客户可读的拒绝原因（委托 portal 纯函数）。 */
+  private slipRejectReason(code: number): string {
+    return portal.slipRejectReason(code)
+  }
+
+  /** 记录一条slip拒绝流水（不入账、不写 transRef 去重集合）。 */
+  private recordSlipRejection(customerId: string, data: Record<string, unknown>, code: number, reason: string): void {
+    this.recordSlipTopup({
+      transRef: typeof data.transRef === 'string' ? data.transRef : '',
+      referenceId: typeof data.referenceId === 'string' ? data.referenceId : '',
+      customerId,
+      bahtAmount: typeof data.amount === 'number' ? data.amount : Number(data.amount) || 0,
+      creditsAdded: 0,
+      bahtPerCreditAtTime: (this.config.pricing?.enabled ? this.config.pricing.bahtPerCredit : undefined) || 0.47,
+      code,
+      status: 'rejected',
+      rejectReason: reason,
+      receiverAccount: this.extractReceiverAccount(data),
+      senderName: this.extractSenderName(data),
+      slipDateTime: typeof data.dateTime === 'string' ? data.dateTime : undefined
+    })
+  }
+
+  /** 从 slip2go data 提取收款账号（bank.account 优先，回退 proxy.account），用于流水与核对。 */
+  private extractReceiverAccount(data: Record<string, unknown>): string | undefined {
+    const receiver = data.receiver as Record<string, unknown> | undefined
+    const account = receiver?.account as Record<string, unknown> | undefined
+    const bank = account?.bank as Record<string, unknown> | undefined
+    const proxy = account?.proxy as Record<string, unknown> | undefined
+    const bankAcc = typeof bank?.account === 'string' ? bank.account : undefined
+    const proxyAcc = typeof proxy?.account === 'string' ? proxy.account : undefined
+    return bankAcc || proxyAcc
+  }
+
+  /** 从 slip2go data 提取付款人姓名（部分脱敏），用于流水显示。 */
+  private extractSenderName(data: Record<string, unknown>): string | undefined {
+    const sender = data.sender as Record<string, unknown> | undefined
+    const account = sender?.account as Record<string, unknown> | undefined
+    return typeof account?.name === 'string' ? account.name : undefined
+  }
+
+  /**
+   * 服务端二次核对收款人是否为我方账号（委托 portal.slipReceiverMatches 纯函数）。
+   * 这里只负责从 slip2go data 抽出收款账号/姓名。
+   */
+  private slipReceiverMatchesOurs(data: Record<string, unknown>): boolean {
+    const receiver = data.receiver as Record<string, unknown> | undefined
+    const account = receiver?.account as Record<string, unknown> | undefined
+    const recvName = typeof account?.name === 'string' ? account.name : undefined
+    return portal.slipReceiverMatches(
+      this.config.slipTopup?.receiverAccounts || [],
+      this.extractReceiverAccount(data),
+      recvName
+    )
+  }
+
   /** 客户门户静态页面（自包含 HTML，无外部依赖） */
   private handlePortalPage(res: http.ServerResponse): void {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -3248,13 +3712,73 @@ export class ProxyServer {
     if (record.type === 'text' || record.type === 'input_text' || record.type === 'output_text') return this.estimateTokenCount(record.text) + 4
     if (record.type === 'thinking') return this.estimateTokenCount(record.thinking) + this.estimateTokenCount(record.signature) + 4
     if (record.type === 'redacted_thinking') return 8
-    if (record.type === 'image' || record.type === 'input_image') return 170
-    if (record.type === 'document' || record.type === 'input_file') return this.estimateTokenCount(record.title) + this.estimateTokenCount(record.name) + this.estimateTokenCount(record.filename) + this.estimateTokenCount(record.source) + this.estimateTokenCount(record.file_data) + 120
+    if (record.type === 'image' || record.type === 'input_image') return IMAGE_TOKEN_ESTIMATE
+    if (record.type === 'document' || record.type === 'input_file') return this.estimateDocumentTokens(record)
     if (record.type === 'tool_use') return this.estimateTokenCount(record.name) + this.estimateTokenCount(record.input) + 12
     if (record.type === 'tool_result') return this.estimateTokenCount(record.content) + 8
     if (typeof record.role === 'string' && 'content' in record) return this.estimateTokenCount(record.content) + 4
     if (typeof record.name === 'string' && 'input_schema' in record) return this.estimateTokenCount(record.name) + this.estimateTokenCount(record.description) + this.estimateTokenCount(record.input_schema) + 32
     return Object.entries(record).reduce<number>((total, [key, item]) => key === 'cache_control' ? total : total + this.estimateTokenCount(item), 0)
+  }
+
+  /**
+   * 估算 document / input_file 块的 token 数（按 base64 解码后的字节数）。
+   *
+   * 关键：绝不对 base64 字符串本身按 length/4 计 token——一个 3MB 的 PDF 的 base64
+   * 约 400 万字符，会被算成 ~100 万 token，导致 count_tokens / message_start 报出虚高的
+   * 上下文用量，进而打乱 Claude Code 的 autocompact 判断（看起来“超过 1M”）。
+   * 这里把附件按解码字节折算，文件名/标题等元数据再单独计入。
+   */
+  private estimateDocumentTokens(record: Record<string, unknown>): number {
+    // 元数据（标题/文件名）正常按文本估算
+    let meta = this.estimateTokenCount(record.title) + this.estimateTokenCount(record.name) + this.estimateTokenCount(record.filename) + 8
+
+    // 提取 base64 与格式提示，支持 Claude（source.data/media_type）与 OpenAI（file_data）两种结构
+    let b64 = ''
+    let format: string | undefined
+    const source = record.source as Record<string, unknown> | undefined
+    if (source && typeof source === 'object') {
+      if (typeof source.data === 'string') b64 = source.data
+      else if (typeof source.bytes === 'string') b64 = source.bytes
+      if (typeof source.media_type === 'string') format = source.media_type
+      // source.type === 'text'（纯文本附件）：data 不是 base64，按文本估算即可
+      if (source.type === 'text' && typeof source.data === 'string') {
+        return meta + this.estimateTokenCount(source.data)
+      }
+    }
+    if (!b64 && typeof record.file_data === 'string') {
+      // OpenAI: 可能是 data URL（data:application/pdf;base64,xxx）
+      const m = record.file_data.match(/^data:([^;]+);base64,(.+)$/)
+      if (m) { format = format || m[1]; b64 = m[2] } else { b64 = record.file_data }
+    }
+    if (typeof record.filename === 'string' && !format) format = record.filename
+
+    return meta + estimateBase64DocumentTokens(b64, format)
+  }
+
+  /**
+   * 估算 Kiro payload 的 token 数（binary-aware 兜底用）。
+   * 把 images/documents 的 base64 单独按解码字节折算，其余文本走 ~3.5 字符/token，
+   * 避免 JSON.stringify(payload) 把数 MB 的 base64 计成上百万 token。
+   */
+  private estimateKiroPayloadTokens(payload: ReturnType<typeof claudeToKiro>): number {
+    type KiroMsg = ReturnType<typeof claudeToKiro>['conversationState']['currentMessage']
+    type KiroInput = NonNullable<KiroMsg['userInputMessage']>
+    let tokens = 0
+    const accountFor = (input?: KiroInput): void => {
+      if (!input) return
+      const { images, documents, ...rest } = input
+      tokens += Math.ceil(Buffer.byteLength(JSON.stringify(rest), 'utf-8') / 3.5)
+      tokens += (images?.length ?? 0) * IMAGE_TOKEN_ESTIMATE
+      for (const doc of documents ?? []) tokens += estimateBase64DocumentTokens(doc.source?.bytes || '', doc.format)
+    }
+    const cs = payload.conversationState
+    accountFor(cs.currentMessage?.userInputMessage)
+    for (const msg of cs.history ?? []) {
+      if (msg.userInputMessage) accountFor(msg.userInputMessage)
+      else if (msg.assistantResponseMessage) tokens += Math.ceil(Buffer.byteLength(JSON.stringify(msg.assistantResponseMessage), 'utf-8') / 3.5)
+    }
+    return Math.max(1, tokens)
   }
 
   // 健康检查
@@ -3337,8 +3861,8 @@ export class ProxyServer {
     }
     for (const content of geminiReq.contents || []) {
       const role = content.role === 'model' ? 'assistant' : 'user'
-      const text = (content.parts || []).map((p: { text?: string }) => p.text || '').join('')
-      if (text) messages.push({ role: role as 'user' | 'assistant', content: text })
+      const msg = ProxyServer.geminiPartsToOpenAIMessage(role, content.parts || [])
+      if (msg) messages.push(msg)
     }
     if (messages.length === 0) {
       messages.push({ role: 'user', content: 'Hello' })
@@ -3444,7 +3968,44 @@ export class ProxyServer {
     }
   }
 
-  // 模型列表缓存
+  // 把 Gemini parts 转成 OpenAI message，保留 inlineData（图片/PDF 等 base64 附件）。
+  // 旧实现只取 part.text，会把 inlineData 整段丢弃 —— 用户通过 Gemini 接口传 PDF/图片时
+  // 附件被静默吞掉，模型看不到文件却照常作答（结果是“看起来回了但没读文件”）。
+  private static geminiPartsToOpenAIMessage(
+    role: 'user' | 'assistant',
+    parts: Array<{ text?: string; inlineData?: { mimeType?: string; data?: string }; inline_data?: { mime_type?: string; data?: string } }>
+  ): OpenAIMessage | null {
+    const contentParts: OpenAIContentPart[] = []
+    let textOnly = ''
+    let fileIndex = 0
+    for (const p of parts) {
+      if (p.text) {
+        contentParts.push({ type: 'text', text: p.text })
+        textOnly += p.text
+        continue
+      }
+      // 兼容驼峰 inlineData（REST JSON）与下划线 inline_data（部分 SDK）
+      const inline = p.inlineData || p.inline_data
+      const mime = (p.inlineData?.mimeType || p.inline_data?.mime_type || '').toLowerCase()
+      const data = inline?.data
+      if (!data) continue
+      if (mime.startsWith('image/')) {
+        contentParts.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${data}` } })
+      } else {
+        // 文档（PDF 等）：转成 OpenAI file part，由 extractOpenAIContent → KiroDocument 处理
+        const ext = mime === 'application/pdf' ? 'pdf' : (mime.split('/')[1] || 'bin')
+        contentParts.push({ type: 'file', file: { filename: `attachment-${++fileIndex}.${ext}`, file_data: `data:${mime || 'application/octet-stream'};base64,${data}` } })
+      }
+    }
+    if (contentParts.length === 0) return null
+    // 纯文本时退回 string content，保持与旧行为一致（避免下游对单元素数组的差异）
+    if (contentParts.every(cp => cp.type === 'text')) {
+      return { role, content: textOnly }
+    }
+    return { role, content: contentParts }
+  }
+
+
   private modelCache: { models: KiroModel[]; timestamp: number } | null = null
   private readonly MODEL_CACHE_TTL = 5 * 60 * 1000 // 5 分钟缓存
 
@@ -4081,7 +4642,12 @@ export class ProxyServer {
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, useWebTools)
 
       // 构建 prompt cache profile（用于模拟缓存 usage）
-      const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
+      // 用 binary-aware 的 estimateTokenCount（与 count_tokens / message_start 同源），
+      // 不能用 JSON.stringify(kiroPayload).length——payload 里的 base64 附件会让估算虚高数十倍。
+      const estimatedInputTokens = Math.max(1,
+        this.estimateTokenCount(processedRequest.system) +
+        this.estimateTokenCount(processedRequest.messages) +
+        this.estimateTokenCount(processedRequest.tools))
       const cacheProfile = promptCacheTracker.buildClaudeProfile(
         processedRequest.system,
         processedRequest.messages,
@@ -4339,7 +4905,7 @@ export class ProxyServer {
     const cacheCreationStart = simulatedCacheUsage?.cacheCreationInputTokens || 0
     const grossInputTokens = (typeof promptInputTokens === 'number' && promptInputTokens > 0)
       ? promptInputTokens
-      : Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3.5))
+      : this.estimateKiroPayloadTokens(kiroPayload)
     // 扣除缓存命中部分，避免客户端重复计入（与 buildClaudeUsage 的口径保持一致）
     const startInputTokens = Math.max(1, grossInputTokens - cacheReadStart - cacheCreationStart)
 
@@ -4626,7 +5192,10 @@ export class ProxyServer {
    * 触发 BodyTooLarge 错误时上层会发 413 Payload Too Large
    */
   private readBody(req: http.IncomingMessage, signal?: AbortSignal): Promise<string> {
-    const maxBytes = Math.max(1024, this.config.maxRequestBodyBytes ?? 10 * 1024 * 1024)
+    // 默认 50MB：base64 会让二进制膨胀 ~33%，10MB 旧默认会让 ~7.5MB 以上的 PDF/图片
+    // 在 readBody 阶段就被 413 拒掉（用户侧表现为"附件请求直接失败"）。50MB 可容纳
+    // 单个大 PDF 或多张图片；仍由 Content-Length 提前拒绝超大体，避免内存放大攻击。
+    const maxBytes = Math.max(1024, this.config.maxRequestBodyBytes ?? 50 * 1024 * 1024)
 
     // 优先用 Content-Length 提前拒绝（避免分配缓冲）
     const declaredLen = parseInt(req.headers['content-length'] || '0', 10)
@@ -5148,24 +5717,18 @@ const PORTAL_HTML = `<!doctype html>
           <div class="bd">เข้าสู่ระบบเพื่อจัดการ API Key และเครดิต</div>
         </div>
         <div class="card">
-          <!-- Google 登录（主渠道，invite-only） -->
+          <!-- Google 登录（唯一渠道，invite-only） -->
           <div id="googleBlock" class="hide">
             <div id="gsiButton" style="display:flex;justify-content:center"></div>
             <label style="margin-top:14px">รหัสเชิญ (Invite code)</label>
             <input id="inviteCode" type="text" autocomplete="off" placeholder="วางรหัสเชิญที่ได้รับ (เฉพาะผู้ใช้ใหม่)">
             <div class="hint" style="margin-top:6px">ผู้ที่ได้รับเชิญครั้งแรกต้องกรอกรหัสเชิญ ผู้ที่เคยเข้าระบบแล้วเว้นว่างได้</div>
             <div class="err" id="googleErr"></div>
-            <div class="sep"><span>หรือเข้าสู่ระบบด้วยรหัสผ่าน</span></div>
           </div>
 
-          <!-- 密码登录（次要渠道） -->
-          <div id="pwBlock">
-            <label>อีเมล</label>
-            <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
-            <label>รหัสผ่าน</label>
-            <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
-            <div style="margin-top:20px"><button id="loginBtn" style="width:100%">เข้าสู่ระบบ</button></div>
-            <div class="err" id="loginErr"></div>
+          <!-- กรณี Google ยังไม่เปิด/ยังไม่ได้ตั้งค่า → ไม่ให้หน้าว่างเปล่า -->
+          <div id="noAuthBlock" class="hide">
+            <div class="hint" style="text-align:center">ระบบยังไม่เปิดให้เข้าสู่ระบบ กรุณาติดต่อผู้ดูแล</div>
           </div>
         </div>
       </div>
@@ -5199,6 +5762,10 @@ const PORTAL_HTML = `<!doctype html>
           <button class="nav-item" data-tab="pricing">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
             ราคา
+          </button>
+          <button class="nav-item" data-tab="topup">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+            เติมเงิน
           </button>
         </nav>
         <button class="secondary logout" id="logoutBtn">ออกจากระบบ</button>
@@ -5355,6 +5922,31 @@ const PORTAL_HTML = `<!doctype html>
             <div class="empty" id="rateEmpty"></div>
           </div>
         </section>
+
+        <!-- ===== TAB: Top-up (เติมเงินด้วยสลิป) ===== -->
+        <section class="tab hide" data-panel="topup">
+          <h2>เติมเครดิตด้วยสลิปโอนเงิน</h2>
+          <div class="card" id="topupReceiverCard">
+            <div class="muted" style="margin-bottom:10px">โอนเงินมาที่บัญชีด้านล่าง แล้ววางข้อมูล QR ของสลิป — ระบบตรวจกับธนาคารและเติมเครดิตอัตโนมัติ</div>
+            <div id="topupAccounts"></div>
+            <div class="muted" id="topupLimits" style="font-size:12px; margin-top:8px"></div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <label for="slipQr">ข้อมูล QR จากสลิป</label>
+            <textarea id="slipQr" rows="3" placeholder="วางสตริง QR ที่อ่านได้จากสลิป (เช่น 00410006000001010300...)" style="width:100%; resize:vertical; font-family:ui-monospace,Menlo,monospace; font-size:13px"></textarea>
+            <div class="hint">เปิดแอปธนาคาร → สลิป → สแกน/คัดลอกข้อมูล QR แล้ววางที่นี่</div>
+            <div class="row" style="margin-top:10px">
+              <button id="slipSubmitBtn">ตรวจสลิป &amp; เติมเครดิต</button>
+            </div>
+            <div class="err" id="slipErr"></div>
+            <div class="chip" id="slipOk" style="display:none; margin-top:8px"></div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <div class="topbar" style="margin-bottom:10px"><strong style="font-size:15px">ประวัติการเติมล่าสุด</strong></div>
+            <table><tbody id="slipHistRows"></tbody></table>
+            <div class="empty" id="slipHistEmpty" style="display:none">ยังไม่มีประวัติการเติมด้วยสลิป</div>
+          </div>
+        </section>
       </main>
     </div>
   </div>
@@ -5368,6 +5960,7 @@ const PORTAL_HTML = `<!doctype html>
   var lastUsage = null;
   var lastRates = null;
   var pricing = { enabled: false };
+  var slipTopup = { enabled: false };   // ข้อมูลเติมเงินด้วยสลิป (บัญชีรับเงิน/ลิมิต) จาก /portal/me
   var selectedFam = null;   // family ที่กำลังดูในการ์ดเทียบราคา (null = ตาม topFamily())
   var famPinned = false;    // true เมื่อผู้ใช้กดเลือก tab เอง (หยุด auto-follow topFamily)
 
@@ -5388,27 +5981,13 @@ const PORTAL_HTML = `<!doctype html>
     $('dashView').classList.toggle('hide', view !== 'dash');
   }
 
-  // สลับแท็บใน dashboard (overview / keys / usage / pricing)
+  // สลับแท็บใน dashboard (overview / keys / usage / pricing / topup)
   function selectTab(name){
     var items = document.querySelectorAll('.nav-item[data-tab]');
     Array.prototype.forEach.call(items, function(b){ b.classList.toggle('on', b.getAttribute('data-tab') === name); });
     var panels = document.querySelectorAll('.tab[data-panel]');
     Array.prototype.forEach.call(panels, function(p){ p.classList.toggle('hide', p.getAttribute('data-panel') !== name); });
-  }
-
-  function doLogin(){
-    $('loginErr').textContent = '';
-    var email = $('email').value.trim();
-    var password = $('password').value;
-    if (!email || !password){ $('loginErr').textContent = 'กรอกอีเมลและรหัสผ่าน'; return; }
-    $('loginBtn').disabled = true;
-    api('/portal/login', { method:'POST', body:{ email:email, password:password } }).then(function(r){
-      $('loginBtn').disabled = false;
-      if (!r.ok){ $('loginErr').textContent = (r.data && r.data.error) || 'เข้าสู่ระบบไม่สำเร็จ'; return; }
-      token = r.data.token;
-      localStorage.setItem(TOKEN_KEY, token);
-      loadDash();
-    });
+    if (name === 'topup') loadSlipHistory();
   }
 
   // Google 登录回调：拿到 ID token 后连同 invite code 一起发给后端
@@ -5440,7 +6019,11 @@ const PORTAL_HTML = `<!doctype html>
     } catch(e){}
     if (googleInited){ $('googleBlock').classList.remove('hide'); return; }
     api('/portal/config').then(function(r){
-      if (!r.ok || !r.data || !r.data.googleEnabled || !r.data.googleClientId) return;
+      if (!r.ok || !r.data || !r.data.googleEnabled || !r.data.googleClientId){
+        // Google 未启用/未配置：唯一登录渠道不可用，提示联系管理员而非留空白
+        $('noAuthBlock').classList.remove('hide');
+        return;
+      }
       var render = function(){
         if (!window.google || !window.google.accounts || !window.google.accounts.id){
           setTimeout(render, 150); return;
@@ -5487,6 +6070,7 @@ const PORTAL_HTML = `<!doctype html>
       selectTab('overview');
       var c = r.data;
       pricing = (c && c.pricing) || { enabled: false };
+      slipTopup = (c && c.slipTopup) || { enabled: false };
       $('whoami').textContent = c.email || '';
       var who = $('whoName');
       if (who) who.textContent = c.name || (c.email ? c.email.split('@')[0] : 'ลูกค้า');
@@ -5511,11 +6095,129 @@ const PORTAL_HTML = `<!doctype html>
         $('balanceValue').textContent = '';
       }
       $('balanceNote').textContent = c.creditBalance <= 0
-        ? 'เครดิตหมด — ติดต่อแอดมินเพื่อเติม'
-        : 'เติมเครดิตติดต่อแอดมิน';
+        ? (slipTopup.enabled ? 'เครดิตหมด — เติมเงินด้วยสลิปได้ที่แท็บ “เติมเงิน”' : 'เครดิตหมด — ติดต่อแอดมินเพื่อเติม')
+        : (slipTopup.enabled ? 'เติมเครดิตเองได้ที่แท็บ “เติมเงิน”' : 'เติมเครดิตติดต่อแอดมิน');
+      renderSlipTopup();
       loadKeys();
       loadUsage();
       loadRates();
+    });
+  }
+
+  // ====== เติมเงินด้วยสลิป (slip2go) ======
+  var SLIP_REASON_TH = {
+    receiver_not_match: 'บัญชีผู้รับไม่ตรงกับบัญชีของเรา',
+    receiver_mismatch: 'บัญชีผู้รับไม่ตรงกับบัญชีของเรา',
+    amount_not_match: 'ยอดเงินไม่ตรงเงื่อนไข',
+    below_min: 'ยอดโอนต่ำกว่าขั้นต่ำที่กำหนด',
+    above_max: 'ยอดสูงเกินกำหนด — กรุณาติดต่อแอดมิน',
+    date_not_match: 'วันที่โอนไม่ตรงเงื่อนไข',
+    slip_not_found: 'ไม่พบสลิปนี้ในระบบธนาคาร (อาจไม่ถูกต้อง)',
+    duplicate_slip: 'สลิปนี้ถูกใช้ไปแล้ว',
+    already_credited: 'สลิปนี้เติมเครดิตไปแล้ว',
+    slip_too_old: 'สลิปเก่าเกินกำหนด',
+    slip_future_date: 'วันที่บนสลิปผิดปกติ',
+    invalid_amount: 'อ่านยอดเงินจากสลิปไม่ได้',
+    missing_transRef: 'สลิปไม่มีเลขอ้างอิงจากธนาคาร',
+    conditions_not_asserted: 'ตรวจสลิปไม่ผ่านเงื่อนไข',
+    verification_error: 'ตรวจสลิปไม่สำเร็จ',
+    rejected: 'สลิปไม่ผ่านการตรวจสอบ'
+  };
+  function slipReasonTH(code){ return SLIP_REASON_TH[code] || 'ตรวจสลิปไม่สำเร็จ'; }
+
+  // ป้ายชนิดบัญชี slip2go (เฉพาะที่พบบ่อย) — ใช้แสดงให้ลูกค้าอ่านง่าย
+  var SLIP_ACCT_TYPE_TH = {
+    '01002':'ธ.กรุงเทพ','01004':'ธ.กสิกรไทย','01006':'ธ.กรุงไทย','01011':'ธ.ทหารไทยธนชาต',
+    '01014':'ธ.ไทยพาณิชย์','01025':'ธ.กรุงศรีอยุธยา','01030':'ธ.ออมสิน',
+    '02001':'พร้อมเพย์ (เบอร์โทร)','02002':'พร้อมเพย์ (เลขบัญชี)','02003':'พร้อมเพย์ (บัตร ปชช.)',
+    '03000':'ร้านค้า (K+ Shop/แม่มณี ฯลฯ)','04000':'ทรูมันนี่ วอลเล็ท'
+  };
+
+  function renderSlipTopup(){
+    // ซ่อน/แสดงแท็บ "เติมเงิน" ตามสถานะเปิดใช้งาน
+    var navBtn = document.querySelector('.nav-item[data-tab="topup"]');
+    if (navBtn) navBtn.style.display = slipTopup.enabled ? '' : 'none';
+    if (!slipTopup.enabled) return;
+    // แสดงบัญชีรับเงิน
+    var box = $('topupAccounts');
+    if (box){
+      var accts = slipTopup.receiverAccounts || [];
+      if (!accts.length){
+        box.innerHTML = '<div class="muted">ยังไม่ได้กำหนดบัญชีรับเงิน — ติดต่อแอดมิน</div>';
+      } else {
+        box.innerHTML = accts.map(function(a){
+          var typeLabel = a.accountType ? (SLIP_ACCT_TYPE_TH[a.accountType] || ('ชนิด ' + esc(a.accountType))) : '';
+          var name = a.accountNameTH || a.accountNameEN || '';
+          var num = a.accountNumber || '';
+          return '<div class="keybox" style="margin-bottom:8px">'
+            + (typeLabel ? '<div class="muted" style="font-size:12px">'+esc(typeLabel)+'</div>' : '')
+            + (num ? '<div style="font-weight:700; font-size:16px; font-variant-numeric:tabular-nums">'+esc(num)+'</div>' : '')
+            + (name ? '<div>'+esc(name)+'</div>' : '')
+            + '</div>';
+        }).join('');
+      }
+    }
+    var lim = $('topupLimits');
+    if (lim){
+      var parts = [];
+      if (slipTopup.minAmountThb) parts.push('ขั้นต่ำ ฿' + fmtBaht(slipTopup.minAmountThb));
+      if (slipTopup.maxAmountThb) parts.push('สูงสุด ฿' + fmtBaht(slipTopup.maxAmountThb));
+      lim.textContent = parts.join(' · ');
+    }
+  }
+
+  function submitSlip(){
+    $('slipErr').textContent = '';
+    $('slipOk').style.display = 'none';
+    var qr = ($('slipQr').value || '').trim();
+    if (!qr){ $('slipErr').textContent = 'กรุณาวางข้อมูล QR จากสลิป'; return; }
+    $('slipSubmitBtn').disabled = true;
+    $('slipSubmitBtn').textContent = 'กำลังตรวจสอบ…';
+    api('/portal/topup/slip', { method:'POST', body:{ qrCode: qr } }).then(function(r){
+      $('slipSubmitBtn').disabled = false;
+      $('slipSubmitBtn').textContent = 'ตรวจสลิป & เติมเครดิต';
+      if (!r.ok){
+        // ชั้น HTTP error (429/404/502 ฯลฯ)
+        var he = (r.data && r.data.error) || '';
+        if (r.status === 429) he = 'ส่งบ่อยเกินไป กรุณารอสักครู่';
+        else if (r.status === 502) he = 'ระบบตรวจสลิปไม่พร้อมใช้งาน ลองใหม่อีกครั้ง';
+        else if (r.status === 404) he = 'ระบบเติมเงินด้วยสลิปยังไม่เปิดใช้งาน';
+        $('slipErr').textContent = he || 'ส่งสลิปไม่สำเร็จ';
+        return;
+      }
+      var d = r.data || {};
+      if (d.ok){
+        $('slipQr').value = '';
+        var ok = $('slipOk');
+        ok.textContent = '✓ เติมสำเร็จ +' + fmt(d.creditsAdded) + ' credits (฿' + fmtBaht(d.bahtAmount) + ')';
+        ok.style.display = 'inline-block';
+        loadDash();           // รีเฟรชยอดคงเหลือ
+        loadSlipHistory();
+      } else {
+        // ตรวจไม่ผ่าน (ฝั่ง business): แสดงเหตุผลภาษาไทย
+        $('slipErr').textContent = d.reason ? slipReasonTH(d.reason) : 'สลิปไม่ผ่านการตรวจสอบ';
+      }
+    });
+  }
+
+  function loadSlipHistory(){
+    api('/portal/topup/slip/history').then(function(r){
+      if (!r.ok) return;
+      var recs = (r.data && r.data.records) || [];
+      var rows = $('slipHistRows'); if (!rows) return;
+      rows.innerHTML = '';
+      $('slipHistEmpty').style.display = recs.length ? 'none' : '';
+      recs.forEach(function(x){
+        var when = x.verifiedAt ? new Date(x.verifiedAt).toLocaleString('th-TH', { dateStyle:'short', timeStyle:'short' }) : '';
+        var statusCell = x.status === 'settled'
+          ? '<span class="chip">+' + fmt(x.creditsAdded) + ' credits</span>'
+          : '<span class="muted">' + esc(slipReasonTH(x.rejectReason || 'rejected')) + '</span>';
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td style="white-space:nowrap">'+esc(when)+'</td>'
+          + '<td class="num">฿'+esc(fmtBaht(x.bahtAmount||0))+'</td>'
+          + '<td style="text-align:right">'+statusCell+'</td>';
+        rows.appendChild(tr);
+      });
     });
   }
 
@@ -5987,10 +6689,10 @@ const PORTAL_HTML = `<!doctype html>
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 
-  $('loginBtn').addEventListener('click', doLogin);
-  $('password').addEventListener('keydown', function(e){ if (e.key==='Enter') doLogin(); });
   $('logoutBtn').addEventListener('click', logout);
   $('createKeyBtn').addEventListener('click', createKey);
+  var slipBtn = $('slipSubmitBtn');
+  if (slipBtn) slipBtn.addEventListener('click', submitSlip);
 
   // แท็บ sidebar
   Array.prototype.forEach.call(document.querySelectorAll('.nav-item[data-tab]'), function(btn){

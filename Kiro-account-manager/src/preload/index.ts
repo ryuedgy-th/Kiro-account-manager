@@ -28,6 +28,40 @@ interface InviteView {
   usedByCustomerId?: string
 }
 
+// slip2go 自动充值配置/流水视图（preload 独立 bundle，故就地声明；与 SlipTopupConfig/SlipTopupRecord 对应）
+interface SlipTopupReceiverAccount {
+  accountType?: string
+  accountNumber?: string
+  accountNameTH?: string
+  accountNameEN?: string
+}
+interface SlipTopupConfigView {
+  enabled: boolean
+  apiSecret: string
+  receiverAccounts: SlipTopupReceiverAccount[]
+  minAmountThb?: number
+  maxAmountThb?: number
+  freshnessHours?: number
+  dailyMaxSubmitsPerCustomer?: number
+  perMinuteMaxSubmitsPerCustomer?: number
+}
+interface SlipTopupRecordView {
+  id: string
+  transRef: string
+  referenceId: string
+  customerId: string
+  bahtAmount: number
+  creditsAdded: number
+  bahtPerCreditAtTime: number
+  code: number
+  status: 'settled' | 'rejected'
+  rejectReason?: string
+  receiverAccount?: string
+  senderName?: string
+  slipDateTime?: string
+  verifiedAt: number
+}
+
 // Custom APIs for renderer
 const api = {
   // 打开外部链接
@@ -988,6 +1022,19 @@ const api = {
 
   proxyTopupCustomer: (id: string, amount: number, note?: string): Promise<{ success: boolean; creditBalance?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-topup-customer', id, amount, note)
+  },
+
+  // slip2go 自动充值配置 / 流水
+  proxySlipTopupGetConfig: (): Promise<{ success: boolean; config?: SlipTopupConfigView; error?: string }> => {
+    return ipcRenderer.invoke('proxy-slip-topup-get-config')
+  },
+
+  proxySlipTopupSetConfig: (input: Partial<SlipTopupConfigView>): Promise<{ success: boolean; config?: SlipTopupConfigView; error?: string }> => {
+    return ipcRenderer.invoke('proxy-slip-topup-set-config', input)
+  },
+
+  proxySlipTopupRecords: (limit?: number): Promise<{ success: boolean; records?: SlipTopupRecordView[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-slip-topup-records', limit)
   },
 
   proxySetCustomerEnabled: (id: string, enabled: boolean): Promise<{ success: boolean; customer?: CustomerView; error?: string }> => {

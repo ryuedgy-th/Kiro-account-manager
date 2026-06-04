@@ -12,6 +12,7 @@ import { AccountSelectDialog } from './AccountSelectDialog'
 import { ApiKeyManager } from './ApiKeyManager'
 import { CustomerManager } from './CustomerManager'
 import { PricingSettings } from './PricingSettings'
+import { SlipTopupSettings } from './SlipTopupSettings'
 import { ClientConfigDialog } from './ClientConfigDialog'
 import { createPortal } from 'react-dom'
 
@@ -1021,6 +1022,25 @@ export function ProxyPanel() {
                 />
               </div>
               <div className="space-y-1.5">
+                <Label htmlFor="maxRequestBodyMB" className="text-xs" title={isEn ? 'Max request body size. Attachments (PDF/images) are base64-encoded (~33% larger). Raise this if large files return 413. Default 50MB.' : '请求体最大尺寸。附件（PDF/图片）经 base64 编码后约大 33%。大文件返回 413 时请调高。默认 50MB。'}>{isEn ? 'Max Body (MB)' : '请求体上限 (MB)'}</Label>
+                <Input
+                  id="maxRequestBodyMB"
+                  type="number"
+                  min={1}
+                  max={200}
+                  step={1}
+                  value={Math.round((config.maxRequestBodyBytes ?? 50 * 1024 * 1024) / (1024 * 1024))}
+                  onChange={(e) => {
+                    const mb = Math.max(1, Math.min(200, parseInt(e.target.value) || 50))
+                    const bytes = mb * 1024 * 1024
+                    setConfig(prev => ({ ...prev, maxRequestBodyBytes: bytes }))
+                    window.api.proxyUpdateConfig({ maxRequestBodyBytes: bytes })
+                  }}
+                  disabled={isRunning}
+                  className="h-9"
+                />
+              </div>
+              <div className="space-y-1.5">
                 <Label htmlFor="clientDrivenToolExecution" className="text-xs" title={isEn ? 'Recommended for OpenCode and Claude Code. Disable only when the proxy should fabricate tool results.' : '推荐用于 OpenCode 和 Claude Code。仅在需要代理伪造工具结果时关闭。'}>{isEn ? 'Tool Execution' : '工具执行模式'}</Label>
                 <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
                   <span className="text-xs text-muted-foreground">{isEn ? 'Client-driven' : '客户端驱动'}</span>
@@ -1684,6 +1704,7 @@ export function ProxyPanel() {
               <Button variant="ghost" size="icon" onClick={() => setShowCustomerManager(false)}>✕</Button>
             </div>
             <PricingSettings />
+            <SlipTopupSettings />
             <CustomerManager />
           </div>
         </div>,

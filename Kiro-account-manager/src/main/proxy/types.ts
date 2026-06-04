@@ -535,8 +535,65 @@ export interface Customer {
   totalToppedUp?: number
   /** 客户自助创建 Key 的数量上限（undefined = 用全局默认） */
   maxKeys?: number
-  /** 充值流水（人工充值/扣减记录），便于对账 */
-  topupHistory?: Array<{ timestamp: number; amount: number; note?: string; by?: string }>
+  /**
+   * 充值流水（人工充值/扣减记录），便于对账。
+   * by: 'admin' = 后台人工；'slip' = 客户上传转账slip经 slip2go 验证后自动入账。
+   * transRef: 仅 slip 来源有值——银行端唯一交易号，用于对账与防重复入账。
+   */
+  topupHistory?: Array<{ timestamp: number; amount: number; note?: string; by?: 'admin' | 'slip'; transRef?: string }>
+}
+
+/**
+ * 转账slip自动充值记录（slip2go 验证）。
+ * 每条对应一次「客户提交slip → 验证 → （成功入账 / 拒绝）」，便于客户查询与后台对账。
+ * 持久化在 ProxyConfig.slipTopupRecords（capped）；服务端据 status==='settled' 的 transRef 重建去重集合。
+ */
+export interface SlipTopupRecord {
+  id: string                 // uuid
+  transRef: string           // 银行端唯一交易号——去重主键（同一笔真实转账只入账一次）
+  referenceId: string        // slip2go 每次验证的 UUID（可用于 GET 复查，不作去重键）
+  customerId: string
+  bahtAmount: number         // slip2go 返回的转账金额（THB），唯一可信来源
+  creditsAdded: number       // 实际入账 credit（settled 时 > 0；拒绝时 0）
+  bahtPerCreditAtTime: number // 入账时锁定的换算汇率，便于审计
+  code: number               // slip2go 结果码（200200 / 200401 / 200501 ...）
+  status: 'settled' | 'rejected'
+  rejectReason?: string      // status==='rejected' 时的原因（不回传 apiSecret/内部细节）
+  receiverAccount?: string   // slip 上的收款账号（部分脱敏），核对用
+  senderName?: string        // 付款人姓名（部分脱敏），核对用
+  slipDateTime?: string      // slip2go data.dateTime（ISO/GMT）
+  verifiedAt: number         // 本地处理时间戳
+}
+
+/**
+ * 转账slip自动充值配置。仅本地 IPC 可写（含 apiSecret），
+ * 绝不进 filterAdminConfigUpdate 白名单，也不可经 HTTP /portal/* 读出。
+ */
+export interface SlipTopupConfig {
+  /** 总开关。false（默认）= 不暴露 /portal/topup/slip 端点。 */
+  enabled: boolean
+  /** slip2go API Secret（Bearer）。仅主进程持有，不序列化到任何 HTTP 响应/HTML/日志。 */
+  apiSecret: string
+  /**
+   * 我方收款账号白名单——传给 slip2go checkReceiver，且服务端二次核对 data.receiver。
+   * 任一条匹配即视为收款人正确（slip2go 语义：matched only 1 condition = valid）。
+   */
+  receiverAccounts: Array<{
+    accountType?: string      // slip2go account type code，如 "01004"=กสิกร、"02001"=PromptPay 手机号
+    accountNumber?: string    // 账号/手机号/citizenID（部分匹配；本地核对存后缀）
+    accountNameTH?: string
+    accountNameEN?: string
+  }>
+  /** 单笔最低入账金额（THB）；低于则拒绝（避免微额slip耗 slip2go 配额）。默认 1。 */
+  minAmountThb?: number
+  /** 单笔最高入账金额（THB）；高于则拒绝（防异常大额误入账，转人工）。0/未设 = 不限制。 */
+  maxAmountThb?: number
+  /** slip 有效期（小时）：data.dateTime 超过此时长则拒绝，防囤旧slip。默认 48。 */
+  freshnessHours?: number
+  /** 单客户每日最多提交次数（防刷耗配额）。默认 20，0 = 不限制。 */
+  dailyMaxSubmitsPerCustomer?: number
+  /** 单客户每分钟最多提交次数。默认 5，0 = 不限制。 */
+  perMinuteMaxSubmitsPerCustomer?: number
 }
 
 /**
@@ -735,6 +792,15 @@ export interface ProxyConfig {
    * 并支持按模型设定加价倍率。enabled !== true 时一切按原样运行（零行为变更）。
    */
   pricing?: PricingConfig
+
+  // ============ 转账slip自动充值（slip2go） ============
+  /**
+   * slip2go 验证配置（含 apiSecret）。仅本地 IPC 可写，不进 admin config 白名单。
+   * 未设或 enabled !== true 时 /portal/topup/slip 返回 404（功能不存在）。
+   */
+  slipTopup?: SlipTopupConfig
+  /** slip 自动充值流水（capped，最近 N 条）。服务端据此重建 transRef 去重集合。 */
+  slipTopupRecords?: SlipTopupRecord[]
 }
 
 export interface PricingConfig {

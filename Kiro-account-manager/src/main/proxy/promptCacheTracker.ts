@@ -4,6 +4,7 @@
 
 import { createHash } from 'crypto'
 import { estimateTokens } from './kiroApi'
+import { estimateBase64DocumentTokens, IMAGE_TOKEN_ESTIMATE } from './tokenCounter'
 
 // 常量
 const DEFAULT_CACHE_TTL = 5 * 60 * 1000       // 5 分钟（Anthropic 默认 ephemeral TTL）
@@ -253,6 +254,33 @@ export class PromptCacheTracker {
     }
   }
 
+  // 估算单个 content block 的 token 数（binary-aware）。
+  // 关键：image/document block 含 base64（PDF 可达数 MB），绝不能 estimateTokens(JSON.stringify(block))——
+  // 那会把 tiktoken 跑在几 MB 字符串上阻塞事件循环（服务器卡死），且把附件算成上百万 token。
+  private estimateBlockTokens(block: Record<string, unknown>): number {
+    const type = block.type
+    if (type === 'image' || type === 'input_image') return IMAGE_TOKEN_ESTIMATE
+    if (type === 'document' || type === 'input_file') {
+      const source = block.source as Record<string, unknown> | undefined
+      // 纯文本附件按文本估算
+      if (source?.type === 'text' && typeof source.data === 'string') return estimateTokens(source.data)
+      let b64 = ''
+      let format: string | undefined
+      if (source && typeof source === 'object') {
+        if (typeof source.data === 'string') b64 = source.data
+        else if (typeof source.bytes === 'string') b64 = source.bytes
+        if (typeof source.media_type === 'string') format = source.media_type
+      }
+      if (!b64 && typeof block.file_data === 'string') {
+        const m = block.file_data.match(/^data:([^;]+);base64,(.+)$/)
+        if (m) { format = format || m[1]; b64 = m[2] } else { b64 = block.file_data }
+      }
+      return estimateBase64DocumentTokens(b64, format)
+    }
+    const text = (block.text as string) || (block.thinking as string) || ''
+    return estimateTokens(text || JSON.stringify(block))
+  }
+
   private appendMessageBlocks(
     blocks: CacheableBlock[],
     msg: { role: string; content: unknown; cache_control?: { type: string; ttl?: string } },
@@ -271,11 +299,10 @@ export class PromptCacheTracker {
       const lastIdx = content.length - 1
       for (let i = 0; i < content.length; i++) {
         const block = content[i] as Record<string, unknown>
-        const text = (block.text as string) || (block.thinking as string) || ''
         const value = this.canonicalize({ kind: 'message', role: msg.role, index: messageIndex, blockIndex: i, block })
         blocks.push({
           value,
-          tokens: estimateTokens(text || JSON.stringify(block)),
+          tokens: this.estimateBlockTokens(block),
           ttl: this.extractTTL(block),
           isMessageEnd: i === lastIdx
         })

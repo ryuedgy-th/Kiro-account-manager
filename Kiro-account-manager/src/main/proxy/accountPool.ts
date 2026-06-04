@@ -209,7 +209,10 @@ export class AccountPool {
     // isSuspended 已返回 false 但仍残留 suspendedAt → 临时封禁已自动过期。
     // 此时 markSuspended 设置的 isAvailable=false / 旧 errorCount 都应被视为已失效，
     // 否则下面的检查会错误地把"已解封"的账号判为不可用。
-    const expiredTempSuspend = typeof account.suspendedAt === 'number' && account.suspendedAt > 0
+    //
+    // 关键修正：必须同时满足 (1) suspendedAt 字段仍存在 且 (2) isSuspended() 返回 false
+    // 原代码只检查 suspendedAt 存在，导致"仍在封禁期内"的账号也被误判为已过期！
+    const expiredTempSuspend = !this.isSuspended(account) && typeof account.suspendedAt === 'number' && account.suspendedAt > 0
 
     // 检查配额是否耗尽
     if (this.isQuotaExhausted(account, now)) {

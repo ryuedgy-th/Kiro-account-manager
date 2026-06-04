@@ -5786,6 +5786,38 @@ app.whenReady().then(async () => {
     }
   })
 
+  // IPC: 读取slip自动充值配置（脱敏，apiSecret 不返回明文）
+  ipcMain.handle('proxy-slip-topup-get-config', () => {
+    try {
+      const server = initProxyServer()
+      return { success: true, config: server.slipTopupConfigView() }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to read slip topup config' }
+    }
+  })
+
+  // IPC: 设置slip自动充值配置（含 apiSecret；仅本地，apiSecret 传空=不修改）
+  ipcMain.handle('proxy-slip-topup-set-config', (_event, input: Partial<import('./proxy/types').SlipTopupConfig>) => {
+    try {
+      const server = initProxyServer()
+      const config = server.setSlipTopupConfig(input || {})
+      persistProxyConfig(server)
+      return { success: true, config }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to set slip topup config' }
+    }
+  })
+
+  // IPC: slip充值流水（后台对账）
+  ipcMain.handle('proxy-slip-topup-records', (_event, limit?: number) => {
+    try {
+      const server = initProxyServer()
+      return { success: true, records: server.listSlipTopupRecords(typeof limit === 'number' ? limit : 50) }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to list slip topup records' }
+    }
+  })
+
   // IPC: 启用/停用客户
   ipcMain.handle('proxy-set-customer-enabled', (_event, id: string, enabled: boolean) => {
     try {

@@ -22,12 +22,22 @@ function getEncoder(): Tiktoken | null {
   }
 }
 
+// 对超长文本跳过 tiktoken 的阈值（字符数）。
+// tiktoken 是同步且 O(n) 的：对几 MB 的 base64（PDF/图片附件）跑 encode 会阻塞 event loop，
+// 让整个反代“卡死”。超过此长度时改用字节系数估算（足够触发裁剪阈值，且不阻塞）。
+const TIKTOKEN_MAX_CHARS = 200_000
+
 /**
  * 使用 tiktoken cl100k_base 精确计算 token 数。
  * 兜底：UTF-8 字节数 / 3.0（针对 payload JSON 经验值，误差 ±10%）。
+ * 超长文本（> TIKTOKEN_MAX_CHARS）直接走字节系数，避免同步 encode 阻塞 event loop。
  */
 export function countTokens(text: string): number {
   if (!text) return 0
+  // 超长内容（典型是 base64 附件）跳过 tiktoken，防止同步 encode 卡死事件循环
+  if (text.length > TIKTOKEN_MAX_CHARS) {
+    return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.0)
+  }
   const enc = getEncoder()
   if (enc) {
     try {
@@ -37,6 +47,55 @@ export function countTokens(text: string): number {
     }
   }
   return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.0)
+}
+
+// ============ 二进制附件（base64 文档 / 图片）token 估算 ============
+// 关键：base64 字符串本身不能按 length/4 或 tiktoken 计 token——一个 3MB 的 PDF
+// 会被误算成 ~100 万 token，导致：
+//   1) 反代把 tiktoken 跑在几 MB 字符串上 → 同步阻塞 → 服务器卡死
+//   2) 客户端（Claude Code）按这个虚高数字判断上下文用量 → autocompact 逻辑被打乱
+// 这里按“解码后的真实字节数”做保守估算，贴近模型对 PDF/图片的实际计费量级。
+
+// PDF/二进制文档：每 token 对应的解码后字节数（经验值，偏保守）
+const DOCUMENT_BYTES_PER_TOKEN = 8
+// 单个文档 token 上限：即便附件巨大，也不让单个块支配整个上下文统计
+const DOCUMENT_MAX_TOKENS = 64_000
+// 纯文本类文档（md/csv/txt/html）：每 token 字节数（贴近自然语言）
+const TEXT_DOCUMENT_BYTES_PER_TOKEN = 4
+// 单张图片的固定 token 估算（与 Anthropic 视觉 token 量级一致的保守值）
+export const IMAGE_TOKEN_ESTIMATE = 1600
+
+/** 估算 base64 字符串解码后的字节数（不实际解码，O(1)）。 */
+export function base64DecodedByteLength(b64: string): number {
+  if (!b64) return 0
+  // 去掉可能的 data URL 前缀与空白
+  const comma = b64.indexOf(',')
+  const raw = (comma >= 0 && comma < 64 && b64.slice(0, comma).includes('base64')) ? b64.slice(comma + 1) : b64
+  const len = raw.length
+  if (len === 0) return 0
+  let padding = 0
+  if (raw.endsWith('==')) padding = 2
+  else if (raw.endsWith('=')) padding = 1
+  return Math.max(0, Math.floor(len * 3 / 4) - padding)
+}
+
+/** 文档格式是否为“纯文本类”（按字节折算更接近自然语言 token）。 */
+function isTextDocumentFormat(format?: string): boolean {
+  if (!format) return false
+  const f = format.toLowerCase()
+  return f === 'txt' || f === 'md' || f === 'markdown' || f === 'csv' || f === 'html' || f === 'htm' || f.startsWith('text')
+}
+
+/**
+ * 估算一个 base64 文档块的 token 数（按解码字节数，绝不 tiktoken/按 length 计）。
+ * 文本类文档用较小的字节系数，二进制（PDF 等）用较大系数并封顶。
+ */
+export function estimateBase64DocumentTokens(b64: string, format?: string): number {
+  const bytes = base64DecodedByteLength(b64)
+  if (bytes === 0) return 0
+  const perToken = isTextDocumentFormat(format) ? TEXT_DOCUMENT_BYTES_PER_TOKEN : DOCUMENT_BYTES_PER_TOKEN
+  const est = Math.ceil(bytes / perToken)
+  return Math.min(est, DOCUMENT_MAX_TOKENS)
 }
 
 // ============ 模型 context 窗口缓存 ============
