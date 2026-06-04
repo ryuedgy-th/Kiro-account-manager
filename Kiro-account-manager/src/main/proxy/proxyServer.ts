@@ -5628,8 +5628,40 @@ const PORTAL_HTML = `<!doctype html>
   .main { padding:30px 34px 48px; min-width:0; }
   .topgreet { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:24px; flex-wrap:wrap; }
   .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:18px; align-items:start; }
-  @media (max-width:1080px){ .shell { grid-template-columns:1fr; margin:0; border-radius:0; min-height:100vh; } .sidebar { flex-direction:row; flex-wrap:wrap; border-right:none; border-bottom:1px solid var(--border); align-items:center; gap:10px; } .profile { flex-direction:row; border:none; padding:0; margin:0; gap:10px; text-align:left; } .profile .avatar { width:40px; height:40px; font-size:16px; } .nav { flex-direction:row; flex-wrap:wrap; flex:1 1 100%; } .nav-item { width:auto; } .main { padding:22px 18px 60px; } }
-  @media (max-width:720px){ .grid2 { grid-template-columns:1fr; } }
+  @media (max-width:1080px){
+    .shell { grid-template-columns:1fr; margin:0; border-radius:0; min-height:100vh; }
+    .sidebar {
+      flex-direction:row; flex-wrap:nowrap; border-right:none; border-bottom:1px solid var(--border);
+      align-items:center; gap:12px; padding:14px 16px; position:sticky; top:0; z-index:20;
+      background:#fbfdfc; -webkit-backdrop-filter:saturate(180%) blur(8px); backdrop-filter:saturate(180%) blur(8px);
+    }
+    .brand-row { display:none; }
+    .profile { flex-direction:row; border:none; padding:0; margin:0; gap:10px; text-align:left; flex:0 0 auto; }
+    .profile .avatar { width:38px; height:38px; font-size:15px; }
+    .profile .pname, .profile .pmail { display:none; }
+    /* nav becomes a horizontal scroll strip — no messy wrapping */
+    .nav {
+      flex-direction:row; flex-wrap:nowrap; flex:1 1 auto; gap:6px;
+      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch;
+      scrollbar-width:none; padding-bottom:2px;
+    }
+    .nav::-webkit-scrollbar { display:none; }
+    .nav-item { width:auto; flex:0 0 auto; white-space:nowrap; padding:9px 13px; }
+    .logout { margin-top:0; flex:0 0 auto; padding:9px 14px; }
+    .main { padding:20px 16px 64px; }
+    h1 { font-size:22px; }
+    .balance { font-size:40px; }
+    .hero { padding:22px; }
+  }
+  @media (max-width:720px){
+    .grid2 { grid-template-columns:1fr; }
+    /* iOS zooms in on focus when input font < 16px — bump it up on phones */
+    input, button { font-size:16px; }
+    .stat .v { font-size:20px; }
+    .row > button { flex:1 1 auto; }
+    .card { padding:16px; border-radius:14px; }
+    th, td { padding:9px 6px; }
+  }
 
   /* ===== per-model price compare (MaxPlus line items) ===== */
   .price-row { display:grid; grid-template-columns:84px 1fr auto; align-items:center; gap:12px; padding:13px 4px; border-bottom:1px solid var(--border); }
@@ -5964,16 +5996,16 @@ const PORTAL_HTML = `<!doctype html>
           </div>
           <div class="card" style="margin-top:14px">
             <label>แนบรูปสลิปโอนเงิน</label>
-            <input id="slipFile" type="file" accept="image/png,image/jpeg,image/webp" capture="environment" style="display:none">
-            <div id="slipDrop" style="margin-top:6px; border:2px dashed var(--border,#cbd5e1); border-radius:10px; padding:22px; text-align:center; cursor:pointer">
+            <input id="slipFile" type="file" accept="image/png,image/jpeg,image/webp" style="display:none">
+            <div id="slipDrop" style="margin-top:6px; border:2px dashed var(--border,#cbd5e1); border-radius:12px; padding:26px 18px; text-align:center; cursor:pointer">
               <div id="slipDropHint">
-                <div style="font-size:32px; line-height:1">🧾</div>
-                <div style="margin-top:6px">แตะเพื่อถ่ายรูป หรือเลือกรูปสลิป</div>
-                <div class="muted" style="font-size:12px; margin-top:4px">รองรับ JPG / PNG / WEBP (ไม่เกิน ~6MB)</div>
+                <div style="font-size:34px; line-height:1">🧾</div>
+                <div style="margin-top:8px; font-weight:600">แตะเพื่อแนบรูปสลิป</div>
+                <div class="muted" style="font-size:12px; margin-top:4px">เลือกจากคลังภาพหรือไฟล์ในเครื่อง · JPG / PNG / WEBP (ไม่เกิน ~6MB)</div>
               </div>
               <img id="slipPreview" style="display:none; max-width:100%; max-height:280px; border-radius:8px">
             </div>
-            <div class="hint">เปิดแอปธนาคาร → บันทึก/แคปรูปสลิป แล้วแนบที่นี่</div>
+            <div class="hint">เปิดแอปธนาคาร → บันทึก/แคปรูปสลิปไว้ในเครื่อง แล้วกดแนบที่นี่</div>
             <div class="row" style="margin-top:10px">
               <button id="slipSubmitBtn" disabled>ตรวจสลิป &amp; เติมเครดิต</button>
               <button id="slipClearBtn" class="secondary" style="display:none">เลือกรูปใหม่</button>
