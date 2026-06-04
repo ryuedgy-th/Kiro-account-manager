@@ -41,7 +41,7 @@ import { estimateBase64DocumentTokens, IMAGE_TOKEN_ESTIMATE } from './tokenCount
 import { isServerWebTool, type WebToolConfig } from './webTools'
 import * as portal from './portal'
 import type { Customer, CustomerView, SlipTopupRecord } from './types'
-import { fetch as undiciFetch, type Dispatcher } from 'undici'
+import { fetch as undiciFetch, FormData as UndiciFormData, type Dispatcher } from 'undici'
 import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
 
 
@@ -384,7 +384,7 @@ export class ProxyServer {
    */
   private usedSlipTransRefs: Set<string> = new Set()
   /**
-   * 正在验证中的slip指纹（sha256(qrCode)）。check→add 之间无 await，
+   * 正在验证中的slip指纹（sha256(图片字节)）。check→add 之间无 await，
    * 防同一slip并发提交触发重复 slip2go 调用与重复入账竞态。
    */
   private inFlightSlipKeys: Set<string> = new Set()
@@ -2674,49 +2674,66 @@ export class ProxyServer {
   }
 
   /**
-   * 调用 slip2go 验证slip（QR-Code 字符串模式）。仅服务端调用，apiSecret 不外泄。
-   * 携带 checkReceiver=我方账号 + checkDuplicate=true + checkAmount(gte minAmount)，
-   * 让 slip2go 在其侧也做收款人/重复/金额校验（200200 = 全部通过）。
+   * 构造 slip2go 校验条件（checkDuplicate + checkReceiver=我方账号 + checkAmount(gte minAmount)）。
+   * qr-code 模式包到 payload.checkCondition，qr-image 模式直接作为 payload JSON——两者条件口径一致。
+   */
+  private buildSlipCheckCondition(): Record<string, unknown> {
+    const cfg = this.config.slipTopup
+    const checkCondition: Record<string, unknown> = { checkDuplicate: true }
+    if (cfg && Array.isArray(cfg.receiverAccounts) && cfg.receiverAccounts.length > 0) {
+      checkCondition.checkReceiver = cfg.receiverAccounts
+    }
+    const minAmount = cfg?.minAmountThb ?? 1
+    if (minAmount > 0) checkCondition.checkAmount = { type: 'gte', amount: minAmount }
+    return checkCondition
+  }
+
+  /** 解析 slip2go 响应：业务结果（含拒绝码）走 HTTP 200，非 200 且无 code 视为系统/鉴权错误 → 抛出（调用方 fail closed）。 */
+  private async parseSlipResponse(response: globalThis.Response): Promise<{ code: number; message?: string; data?: Record<string, unknown> }> {
+    const text = await response.text()
+    let parsed: { code?: string | number; message?: string; data?: Record<string, unknown> }
+    try { parsed = JSON.parse(text) } catch { throw new Error(`slip2go bad response (HTTP ${response.status})`) }
+    if (!response.ok && !parsed.code) throw new Error(`slip2go HTTP ${response.status}`)
+    const code = Number(parsed.code)
+    if (!Number.isFinite(code)) throw new Error('slip2go missing result code')
+    return { code, message: parsed.message, data: parsed.data }
+  }
+
+  /**
+   * 调用 slip2go 验证slip（QR-Image 图片模式）。仅服务端调用，apiSecret 不外泄。
+   * 客户上传的slip图片由 slip2go 侧解码 QR，再按相同条件（buildSlipCheckCondition）校验。
+   * 用 multipart/form-data：file=图片，payload=条件 JSON（图片模式条件不包 checkCondition 层）。
    * 返回 slip2go 的 { code, data }；网络/HTTP 错误抛出（调用方 fail closed，不入账）。
    */
-  private async verifySlipByQrCode(qrCode: string, signal?: AbortSignal): Promise<{ code: number; message?: string; data?: Record<string, unknown> }> {
+  private async verifySlipByQrImage(image: Buffer, mimeType: string, signal?: AbortSignal): Promise<{ code: number; message?: string; data?: Record<string, unknown> }> {
     const cfg = this.config.slipTopup
     if (!cfg || !cfg.apiSecret) throw new Error('slip topup not configured')
 
-    const checkCondition: Record<string, unknown> = { checkDuplicate: true }
-    if (Array.isArray(cfg.receiverAccounts) && cfg.receiverAccounts.length > 0) {
-      checkCondition.checkReceiver = cfg.receiverAccounts
-    }
-    const minAmount = cfg.minAmountThb ?? 1
-    if (minAmount > 0) checkCondition.checkAmount = { type: 'gte', amount: minAmount }
-
-    const body = JSON.stringify({ payload: { qrCode, checkCondition } })
+    // file 字段名 + payload 条件 JSON（图片模式下条件直接是 payload，不再包一层 checkCondition）。
+    // 用 undici 的 FormData/Blob（与 undiciFetch 同源），并以 Uint8Array 包裹避免 Buffer→BlobPart 类型不匹配。
+    const ext = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg'
+    const form = new UndiciFormData()
+    form.append('file', new Blob([new Uint8Array(image)], { type: mimeType }), `slip.${ext}`)
+    form.append('payload', JSON.stringify(this.buildSlipCheckCondition()))
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 15000)
+    const timeout = setTimeout(() => controller.abort(), 20000)
     const abort = (): void => controller.abort(this.getAbortError(signal))
     try {
       if (signal?.aborted) throw this.getAbortError(signal)
       signal?.addEventListener('abort', abort, { once: true })
-      // 复用系统/环境代理出网模式（与 downloadImageDataUrl 一致）
       const agent = this.createOutboundDispatcher()
-      const url = 'https://connect.slip2go.com/api/verify-slip/qr-code/info'
+      const url = 'https://connect.slip2go.com/api/verify-slip/qr-image/info'
+      // 不手动设 Content-Type：交给 FormData 生成带 boundary 的 multipart 头
       const opts = {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${cfg.apiSecret}`, 'Content-Type': 'application/json' },
-        body,
+        headers: { 'Authorization': `Bearer ${cfg.apiSecret}` },
+        body: form,
         signal: controller.signal,
         ...(agent ? { dispatcher: agent } : {})
-      }
+      } as Parameters<typeof undiciFetch>[1]
       const response = await undiciFetch(url, opts)
-      // slip2go 业务结果（含拒绝码）走 HTTP 200；非 200 视为系统/鉴权错误 → fail closed
-      const text = await response.text()
-      let parsed: { code?: string | number; message?: string; data?: Record<string, unknown> }
-      try { parsed = JSON.parse(text) } catch { throw new Error(`slip2go bad response (HTTP ${response.status})`) }
-      if (!response.ok && !parsed.code) throw new Error(`slip2go HTTP ${response.status}`)
-      const code = Number(parsed.code)
-      if (!Number.isFinite(code)) throw new Error('slip2go missing result code')
-      return { code, message: parsed.message, data: parsed.data }
+      return await this.parseSlipResponse(response as unknown as globalThis.Response)
     } finally {
       clearTimeout(timeout)
       signal?.removeEventListener('abort', abort)
@@ -3351,7 +3368,7 @@ export class ProxyServer {
   }
 
   /**
-   * POST /portal/topup/slip — 客户提交转账slip的 QR-Code 字符串，经 slip2go 验证后自动入账 credit。
+   * POST /portal/topup/slip — 客户上传转账slip图片，经 slip2go（qr-image）验证后自动入账 credit。
    * 安全要点（详见各 gate 注释）：金额只取 slip2go 返回值；收款人二次核对；transRef 去重；
    * 并发 in-flight 锁；限流保护 slip2go 配额；任何 slip2go 异常 fail closed（不入账）。
    */
@@ -3370,21 +3387,35 @@ export class ProxyServer {
       return
     }
 
-    // 3) 读取并校验输入（本地，不耗配额）
+    // 3) 读取并校验输入（本地，不耗配额）：JSON { imageBase64, mimeType }
     let body: string
     try { body = await this.readBody(req, signal) } catch (e) {
       if (this.isAbortError(e, signal)) return
       this.sendJson(res, 400, { error: 'Invalid request body' }); return
     }
-    let parsed: { qrCode?: string }
+    let parsed: { imageBase64?: string; mimeType?: string }
     try { parsed = JSON.parse(body) } catch { this.sendJson(res, 400, { error: 'Invalid JSON body' }); return }
-    const qrCode = (parsed.qrCode || '').trim()
-    if (!qrCode || qrCode.length > 1024) {
-      this.sendJson(res, 400, { error: 'Missing or invalid qrCode' }); return
+
+    const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp']
+    const mimeType = (parsed.mimeType || '').toLowerCase()
+    if (!ALLOWED_MIME.includes(mimeType)) {
+      this.sendJson(res, 400, { error: 'Unsupported image type (jpeg/png/webp only)' }); return
     }
+    // 去掉可能的 data URL 前缀（data:image/...;base64,），仅保留 base64 主体
+    const rawB64 = (parsed.imageBase64 || '').replace(/^data:[^,]*,/, '').trim()
+    if (!rawB64) { this.sendJson(res, 400, { error: 'Missing image' }); return }
+    // base64 体积上限 ~8MB（解码后约 6MB），足够手机截图；过大直接拒，保护内存与上游
+    if (rawB64.length > 8 * 1024 * 1024) {
+      this.sendJson(res, 413, { error: 'Image too large (max ~6MB)' }); return
+    }
+    let image: Buffer
+    try {
+      image = Buffer.from(rawB64, 'base64')
+    } catch { this.sendJson(res, 400, { error: 'Invalid image data' }); return }
+    if (image.length < 100) { this.sendJson(res, 400, { error: 'Invalid image data' }); return }
 
     // 4) in-flight 锁（同步 check→add，无 await，防同一slip并发触发重复验证/入账）
-    const slipKey = crypto.createHash('sha256').update(qrCode).digest('hex')
+    const slipKey = crypto.createHash('sha256').update(image).digest('hex')
     if (this.inFlightSlipKeys.has(slipKey)) {
       this.sendJson(res, 409, { error: 'This slip is being processed' }); return
     }
@@ -3394,7 +3425,7 @@ export class ProxyServer {
       // 5) 调用 slip2go（fail closed：网络/HTTP/鉴权异常 → 502，不入账）
       let result: { code: number; message?: string; data?: Record<string, unknown> }
       try {
-        result = await this.verifySlipByQrCode(qrCode, signal)
+        result = await this.verifySlipByQrImage(image, mimeType, signal)
       } catch (e) {
         if (this.isAbortError(e, signal)) return
         proxyLogger.warn('ProxyServer', `slip2go verify failed: ${(e as Error).message}`)
@@ -5927,16 +5958,25 @@ const PORTAL_HTML = `<!doctype html>
         <section class="tab hide" data-panel="topup">
           <h2>เติมเครดิตด้วยสลิปโอนเงิน</h2>
           <div class="card" id="topupReceiverCard">
-            <div class="muted" style="margin-bottom:10px">โอนเงินมาที่บัญชีด้านล่าง แล้ววางข้อมูล QR ของสลิป — ระบบตรวจกับธนาคารและเติมเครดิตอัตโนมัติ</div>
+            <div class="muted" style="margin-bottom:10px">โอนเงินมาที่บัญชีด้านล่าง แล้วแนบรูปสลิป — ระบบตรวจกับธนาคารและเติมเครดิตอัตโนมัติ</div>
             <div id="topupAccounts"></div>
             <div class="muted" id="topupLimits" style="font-size:12px; margin-top:8px"></div>
           </div>
           <div class="card" style="margin-top:14px">
-            <label for="slipQr">ข้อมูล QR จากสลิป</label>
-            <textarea id="slipQr" rows="3" placeholder="วางสตริง QR ที่อ่านได้จากสลิป (เช่น 00410006000001010300...)" style="width:100%; resize:vertical; font-family:ui-monospace,Menlo,monospace; font-size:13px"></textarea>
-            <div class="hint">เปิดแอปธนาคาร → สลิป → สแกน/คัดลอกข้อมูล QR แล้ววางที่นี่</div>
+            <label>แนบรูปสลิปโอนเงิน</label>
+            <input id="slipFile" type="file" accept="image/png,image/jpeg,image/webp" capture="environment" style="display:none">
+            <div id="slipDrop" style="margin-top:6px; border:2px dashed var(--border,#cbd5e1); border-radius:10px; padding:22px; text-align:center; cursor:pointer">
+              <div id="slipDropHint">
+                <div style="font-size:32px; line-height:1">🧾</div>
+                <div style="margin-top:6px">แตะเพื่อถ่ายรูป หรือเลือกรูปสลิป</div>
+                <div class="muted" style="font-size:12px; margin-top:4px">รองรับ JPG / PNG / WEBP (ไม่เกิน ~6MB)</div>
+              </div>
+              <img id="slipPreview" style="display:none; max-width:100%; max-height:280px; border-radius:8px">
+            </div>
+            <div class="hint">เปิดแอปธนาคาร → บันทึก/แคปรูปสลิป แล้วแนบที่นี่</div>
             <div class="row" style="margin-top:10px">
-              <button id="slipSubmitBtn">ตรวจสลิป &amp; เติมเครดิต</button>
+              <button id="slipSubmitBtn" disabled>ตรวจสลิป &amp; เติมเครดิต</button>
+              <button id="slipClearBtn" class="secondary" style="display:none">เลือกรูปใหม่</button>
             </div>
             <div class="err" id="slipErr"></div>
             <div class="chip" id="slipOk" style="display:none; margin-top:8px"></div>
@@ -6166,36 +6206,73 @@ const PORTAL_HTML = `<!doctype html>
     }
   }
 
+  var slipImage = null;   // { base64, mimeType } ของรูปที่เลือกไว้ (null = ยังไม่เลือก)
+
+  // เลือก/ถ่ายรูปสลิป → อ่านเป็น data URL ทำ preview และเก็บ base64 ไว้ส่ง
+  function onSlipFile(file){
+    $('slipErr').textContent = '';
+    $('slipOk').style.display = 'none';
+    if (!file){ return; }
+    var okType = ['image/jpeg','image/png','image/webp'].indexOf(file.type) >= 0;
+    if (!okType){ $('slipErr').textContent = 'รองรับเฉพาะรูป JPG / PNG / WEBP'; return; }
+    if (file.size > 6 * 1024 * 1024){ $('slipErr').textContent = 'รูปใหญ่เกินไป (ไม่เกิน 6MB)'; return; }
+    var reader = new FileReader();
+    reader.onload = function(){
+      var dataUrl = String(reader.result || '');
+      slipImage = { base64: dataUrl, mimeType: file.type };
+      var img = $('slipPreview');
+      img.src = dataUrl; img.style.display = 'block';
+      $('slipDropHint').style.display = 'none';
+      $('slipSubmitBtn').disabled = false;
+      $('slipClearBtn').style.display = '';
+    };
+    reader.onerror = function(){ $('slipErr').textContent = 'อ่านไฟล์รูปไม่สำเร็จ'; };
+    reader.readAsDataURL(file);
+  }
+
+  // ล้างรูปที่เลือก กลับสู่สถานะเริ่มต้น
+  function clearSlipImage(){
+    slipImage = null;
+    var fi = $('slipFile'); if (fi) fi.value = '';
+    $('slipPreview').style.display = 'none';
+    $('slipPreview').src = '';
+    $('slipDropHint').style.display = '';
+    $('slipSubmitBtn').disabled = true;
+    $('slipClearBtn').style.display = 'none';
+    $('slipErr').textContent = '';
+  }
+
   function submitSlip(){
     $('slipErr').textContent = '';
     $('slipOk').style.display = 'none';
-    var qr = ($('slipQr').value || '').trim();
-    if (!qr){ $('slipErr').textContent = 'กรุณาวางข้อมูล QR จากสลิป'; return; }
+    if (!slipImage || !slipImage.base64){ $('slipErr').textContent = 'กรุณาแนบรูปสลิปก่อน'; return; }
     $('slipSubmitBtn').disabled = true;
     $('slipSubmitBtn').textContent = 'กำลังตรวจสอบ…';
-    api('/portal/topup/slip', { method:'POST', body:{ qrCode: qr } }).then(function(r){
-      $('slipSubmitBtn').disabled = false;
+    api('/portal/topup/slip', { method:'POST', body:{ imageBase64: slipImage.base64, mimeType: slipImage.mimeType } }).then(function(r){
       $('slipSubmitBtn').textContent = 'ตรวจสลิป & เติมเครดิต';
       if (!r.ok){
-        // ชั้น HTTP error (429/404/502 ฯลฯ)
+        // ชั้น HTTP error (429/404/502/413 ฯลฯ)
         var he = (r.data && r.data.error) || '';
         if (r.status === 429) he = 'ส่งบ่อยเกินไป กรุณารอสักครู่';
         else if (r.status === 502) he = 'ระบบตรวจสลิปไม่พร้อมใช้งาน ลองใหม่อีกครั้ง';
         else if (r.status === 404) he = 'ระบบเติมเงินด้วยสลิปยังไม่เปิดใช้งาน';
+        else if (r.status === 413) he = 'รูปใหญ่เกินไป (ไม่เกิน 6MB)';
         $('slipErr').textContent = he || 'ส่งสลิปไม่สำเร็จ';
+        $('slipSubmitBtn').disabled = false;   // ให้ลองส่งซ้ำได้
         return;
       }
       var d = r.data || {};
       if (d.ok){
-        $('slipQr').value = '';
+        clearSlipImage();
         var ok = $('slipOk');
         ok.textContent = '✓ เติมสำเร็จ +' + fmt(d.creditsAdded) + ' credits (฿' + fmtBaht(d.bahtAmount) + ')';
         ok.style.display = 'inline-block';
         loadDash();           // รีเฟรชยอดคงเหลือ
         loadSlipHistory();
       } else {
-        // ตรวจไม่ผ่าน (ฝั่ง business): แสดงเหตุผลภาษาไทย
+        // ตรวจไม่ผ่าน (ฝั่ง business): แสดงเหตุผลภาษาไทย, ให้แนบรูปใหม่
         $('slipErr').textContent = d.reason ? slipReasonTH(d.reason) : 'สลิปไม่ผ่านการตรวจสอบ';
+        $('slipSubmitBtn').disabled = false;
       }
     });
   }
@@ -6693,6 +6770,13 @@ const PORTAL_HTML = `<!doctype html>
   $('createKeyBtn').addEventListener('click', createKey);
   var slipBtn = $('slipSubmitBtn');
   if (slipBtn) slipBtn.addEventListener('click', submitSlip);
+  // แนบรูปสลิป: คลิกกล่อง drop เพื่อเปิด file picker, เลือกไฟล์, และปุ่มเลือกใหม่
+  var slipDrop = $('slipDrop'); var slipFileInput = $('slipFile'); var slipClearBtn = $('slipClearBtn');
+  if (slipDrop && slipFileInput){
+    slipDrop.addEventListener('click', function(){ slipFileInput.click(); });
+    slipFileInput.addEventListener('change', function(e){ onSlipFile(e.target.files && e.target.files[0]); });
+  }
+  if (slipClearBtn) slipClearBtn.addEventListener('click', function(e){ e.stopPropagation(); clearSlipImage(); });
 
   // แท็บ sidebar
   Array.prototype.forEach.call(document.querySelectorAll('.nav-item[data-tab]'), function(btn){
