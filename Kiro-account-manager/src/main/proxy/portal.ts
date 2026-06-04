@@ -408,11 +408,47 @@ export interface SlipReceiverMatcher {
   accountNameEN?: string
 }
 
+/** 去掉常见姓名前缀（泰/英），便于与 slip2go 返回的带前缀/被截断姓名比对。 */
+export function stripNamePrefix(name: string): string {
+  let s = (name || '').trim()
+  // 泰文前缀：นาย / นาง / นางสาว / น.ส. / ด.ช. / ด.ญ. ；英文：Mr/Mrs/Ms/Miss（带可选点与空格）
+  s = s.replace(/^(นาย|นางสาว|นาง|น\.ส\.|ด\.ช\.|ด\.ญ\.)\s*/u, '')
+  s = s.replace(/^(mr|mrs|ms|miss)\.?\s+/i, '')
+  return s.trim()
+}
+
+/**
+ * 姓名容错匹配：应对 slip2go 把收款人姓名「加前缀」或「截断」（如全名 "ธนกฤต วรรธกะเศรษฐี"
+ * 返回为 "นาย ธนกฤต ว"）。先剥前缀，再逐 token 做「短名是长名前缀」的位置匹配；
+ * 同时保留整串子串匹配以兼容公司名（"สลิปทูโก" ⊂ "บริษัท สลิปทูโก จํากัด"）。
+ */
+export function slipNameMatches(ourName: string | undefined, recvName: string | undefined): boolean {
+  const our = (ourName || '').toLowerCase().trim()
+  const recv = (recvName || '').toLowerCase().trim()
+  if (!our || !recv) return false
+  // 1) 整串子串（任一方向）——兼容公司名内嵌、对方未截断的情形
+  if (recv.includes(our) || our.includes(recv)) return true
+  // 2) 逐 token 位置匹配（剥前缀后），处理截断姓名
+  const aTok = stripNamePrefix(our).split(/\s+/).filter(Boolean)
+  const bTok = stripNamePrefix(recv).split(/\s+/).filter(Boolean)
+  const n = Math.min(aTok.length, bTok.length)
+  if (n === 0) return false
+  for (let i = 0; i < n; i++) {
+    const longer = aTok[i].length >= bTok[i].length ? aTok[i] : bTok[i]
+    const shorter = aTok[i].length >= bTok[i].length ? bTok[i] : aTok[i]
+    if (!longer.startsWith(shorter)) return false
+  }
+  // 首 token（名）需足够具体，避免单字误匹配
+  if (Math.min(aTok[0].length, bTok[0].length) < 2) return false
+  return true
+}
+
 /**
  * 服务端二次核对收款人是否为我方账号（不只信 slip2go 的 200200，defense in depth）。
- * slip2go 返回账号常部分脱敏（如 "xxx-x-x5366-x"），故用「数字后缀匹配」：
- * 我方账号末 4 位数字需出现在 slip 返回账号的数字串中；或姓名 TH/EN 任一部分匹配。
- * ours 为空 = 未配置 checkReceiver（运营自担）→ 返回 true。
+ * slip2go 返回账号部分脱敏，且各行掩码位置不同（如开泰露末4 "xxx-x-x3666-x"，
+ * 而krungsri 露中段 "xxx-x-x0514-x"），故账号做「双向数字子串」匹配：
+ * slip 露出的数字串（≥4 位）出现在我方完整账号中，或我方末4 出现在 slip 数字串中。
+ * 姓名走 slipNameMatches（容错前缀/截断）。ours 为空 = 未配置 → 返回 true。
  */
 export function slipReceiverMatches(
   ours: SlipReceiverMatcher[],
@@ -421,14 +457,16 @@ export function slipReceiverMatches(
 ): boolean {
   if (!Array.isArray(ours) || ours.length === 0) return true
   const recvDigits = (receiverAccount || '').replace(/\D/g, '')
-  const recvName = (receiverName || '').toLowerCase()
   for (const o of ours) {
     if (o.accountNumber) {
       const od = o.accountNumber.replace(/\D/g, '')
-      if (od.length >= 4 && recvDigits.length >= 4 && recvDigits.includes(od.slice(-4))) return true
+      if (od.length >= 4 && recvDigits.length >= 4) {
+        // 双向：slip 露出的数字段 ⊂ 我方完整账号；或我方末4 ⊂ slip 数字段
+        if (od.includes(recvDigits) || recvDigits.includes(od.slice(-4))) return true
+      }
     }
-    if (o.accountNameTH && recvName && recvName.includes(o.accountNameTH.toLowerCase())) return true
-    if (o.accountNameEN && recvName && recvName.includes(o.accountNameEN.toLowerCase())) return true
+    if (slipNameMatches(o.accountNameTH, receiverName)) return true
+    if (slipNameMatches(o.accountNameEN, receiverName)) return true
   }
   return false
 }
