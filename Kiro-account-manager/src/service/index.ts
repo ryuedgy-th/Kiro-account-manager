@@ -5,6 +5,8 @@
 //     KIRO_PROXY_PORT / KIRO_PROXY_HOST   override port/host
 import { ProxyServer } from '../main/proxy/proxyServer'
 import { refreshTokenByMethod } from '../main/auth/tokenRefresh'
+import { proxyLogStore } from '../main/proxy/logger'
+import * as fs from 'fs'
 import {
   loadServiceData, mapAccounts, ServicePersist, resolveDataFile, resolveDataDir
 } from './dataStore'
@@ -21,6 +23,8 @@ process.on('unhandledRejection', (reason) => {
 async function main(): Promise<void> {
   const dataDir = resolveDataDir()
   const dataFile = resolveDataFile()
+  // ตั้ง log store ให้เขียนลง dataDir/proxy-logs.json (กัน ENOENT จาก storePath ว่าง)
+  try { fs.mkdirSync(dataDir, { recursive: true }); proxyLogStore.initialize(dataDir) } catch { /* ignore */ }
   const data = loadServiceData(dataFile)
   const persist = new ServicePersist(dataFile, data)
 

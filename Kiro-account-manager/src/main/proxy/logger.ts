@@ -293,6 +293,8 @@ class ProxyLogStore {
   private writePending = false
 
   async save(): Promise<void> {
+    // headless/未初始化时 storePath 为空，跳过磁盘写入（避免 ENOENT 刷屏）
+    if (!this.storePath) return
     if (this.writeInFlight) {
       // 已有写盘进行中：标记 pending，让其完成后立即重写最新数据
       this.writePending = true
