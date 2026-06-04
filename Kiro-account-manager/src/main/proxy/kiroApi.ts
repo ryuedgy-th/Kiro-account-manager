@@ -17,7 +17,7 @@ import type {
 } from './types'
 import { proxyLogger } from './logger'
 import { getKProxyService } from '../kproxy'
-import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
+import { getSystemProxy, getDirectPoolAgent, getCachedProxyAgent } from './systemProxy'
 import { isServerWebTool, executeWebToolStructured, type WebToolConfig } from './webTools'
 import {
   countTokens,
@@ -135,9 +135,12 @@ function stringifyWithoutBinary(input: KiroUserInputMessage): string {
  * 传入 account 让账号级代理覆盖全局；不传则走全局逻辑。
  */
 function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
+  // Kiro 服务路径全程走 getCachedProxyAgent：同一 proxyUrl 复用连接池（keep-alive），
+  // 既加速又稳定走同一出口 IP（与「N 账号 ↔ 1 IP」分桶一致）。
+  // 注：注册流程不经此函数，仍用 safeCreateProxyAgent 每次新建，保证注册期 IP 轮换不受影响。
   // 1. 账号专属代理：实现"N 个账号共用 1 个 IP"的分桶反代
   if (account?.proxyUrl) {
-    const agent = safeCreateProxyAgent(account.proxyUrl)
+    const agent = getCachedProxyAgent(account.proxyUrl)
     if (agent) {
       proxyLogger.debug('KiroAPI', `Using account-bound proxy for ${account.email || account.id}`)
       return agent
@@ -149,16 +152,22 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = getCachedProxyAgent(proxyUrl)
       if (agent) return agent
     }
   }
   // 3. 环境变量
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  const envAgent = safeCreateProxyAgent(envProxy)
+  const envAgent = getCachedProxyAgent(envProxy)
   if (envAgent) return envAgent
   // 4. 系统代理
-  return safeCreateProxyAgent(getSystemProxy())
+  const sysAgent = getCachedProxyAgent(getSystemProxy())
+  if (sysAgent) return sysAgent
+  // 5. 直连：返回共享的池化 Agent（keep-alive 复用连接），而非 undefined。
+  //    undefined 会回退到 undici 全局 dispatcher——其 keepAliveTimeout 默认仅 4s，
+  //    稍有请求间隔就要重做 TCP+TLS 握手，正是反代比 kiro-cli 慢的主因。
+  //    复用连接是普通 HTTP 客户端的标准行为，不会增加被识别的风险（反而更像真实客户端）。
+  return getDirectPoolAgent()
 }
 
 /**
@@ -376,8 +385,16 @@ export function mapModelId(model: string): string {
   return MODEL_ID_MAP.default
 }
 
+// payload 深拷贝：每次请求/重试前隔离一份，避免改动污染调用方原对象。
+// structuredClone（Node 17+，结构化克隆算法）比 JSON.parse(JSON.stringify()) 快得多，
+// 且不会把 base64 附件再 serialize+parse 一遍（payload 可能含数 MB 附件，旧做法在此明显阻塞）。
+// 兜底：万一未来 payload 混入不可结构化克隆的字段（函数等），回退到 JSON 深拷贝保证不崩。
 function clonePayload(payload: KiroPayload): KiroPayload {
-  return JSON.parse(JSON.stringify(payload)) as KiroPayload
+  try {
+    return structuredClone(payload)
+  } catch {
+    return JSON.parse(JSON.stringify(payload)) as KiroPayload
+  }
 }
 
 function normalizeModelKey(value: string): string {
@@ -1321,19 +1338,23 @@ export async function callKiroApiStream(
       const headers = getAuthHeaders(account, endpoint)
       const currentUserInput = requestPayload.conversationState.currentMessage.userInputMessage
       const historyMessages = requestPayload.conversationState.history ?? []
-      const historyToolUseCount = historyMessages.reduce((count, message) => count + (message.assistantResponseMessage?.toolUses?.length ?? 0), 0)
-      const historyToolResultCount = historyMessages.reduce((count, message) => count + (message.userInputMessage?.userInputMessageContext?.toolResults?.length ?? 0), 0)
-      console.log(`[KiroAPI] Request to ${endpoint.name}:`)
-      console.log(`[KiroAPI]   - Content length: ${currentUserInput?.content?.length || 0}`)
-      console.log(`[KiroAPI]   - Tools count: ${currentUserInput?.userInputMessageContext?.tools?.length || 0}`)
-      console.log(`[KiroAPI]   - Current tool results: ${currentUserInput?.userInputMessageContext?.toolResults?.length || 0}`)
-      console.log(`[KiroAPI]   - History messages: ${historyMessages.length}`)
-      console.log(`[KiroAPI]   - History tool uses/results: ${historyToolUseCount}/${historyToolResultCount}`)
-      console.log(`[KiroAPI]   - Model ID: ${currentUserInput?.modelId || 'default'}`)
-      console.log(`[KiroAPI]   - Has profileArn: ${requestPayload.profileArn !== undefined}`)
-      console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
-      console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
-      
+      // 单条结构化 debug 日志取代原先 10 行 console.log。
+      // 原实现每个请求都打印 10 行 raw console.log，而 console.log 已被 logger 拦截
+      //（见 logger.ts）——每行都要 redact + buildEntry + 写 proxyLogStore，24/7 下是持续的同步开销。
+      // 改为单条 debug：仅在 DEBUG 级别真正需要时记录，且重活（toolUse/toolResult 统计）只在记录时才算。
+      proxyLogger.debug('KiroAPI', `Request to ${endpoint.name}`, {
+        contentLength: currentUserInput?.content?.length || 0,
+        toolsCount: currentUserInput?.userInputMessageContext?.tools?.length || 0,
+        currentToolResults: currentUserInput?.userInputMessageContext?.toolResults?.length || 0,
+        historyMessages: historyMessages.length,
+        historyToolUses: historyMessages.reduce((c, m) => c + (m.assistantResponseMessage?.toolUses?.length ?? 0), 0),
+        historyToolResults: historyMessages.reduce((c, m) => c + (m.userInputMessage?.userInputMessageContext?.toolResults?.length ?? 0), 0),
+        modelId: currentUserInput?.modelId || 'default',
+        hasProfileArn: requestPayload.profileArn !== undefined,
+        agentMode: headers['x-amzn-kiro-agent-mode'],
+        payloadSize: payloadStr.length
+      })
+
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
       const response = agent
@@ -1458,6 +1479,7 @@ async function parseEventStream(
     reader.cancel(getAbortError(signal)).catch(() => undefined)
   }
   let buffer = new Uint8Array(0)
+  let bufStart = 0   // 读取游标：已消费数据的边界，避免每条消息 slice 整个 buffer（O(n²)→O(n)）
   let usage = { 
     inputTokens: 0, 
     outputTokens: 0, 
@@ -1501,14 +1523,20 @@ async function parseEventStream(
         break
       }
 
-      // 合并缓冲区
-      const newBuffer = new Uint8Array(buffer.length + value.length)
-      newBuffer.set(buffer)
-      newBuffer.set(value, buffer.length)
+      // 合并缓冲区（O(n) 累积，避免 O(n²)）
+      // bufStart 是已消费数据的读取游标：解析完一条消息只前移游标，不 slice 整个 buffer。
+      // 收到新 chunk 时，先把「游标之后的未消费残片」搬到头部再追加新数据——
+      // 这样每个字节最多被搬运一次，整段响应总成本是 O(n)，而非旧实现「每 chunk/每消息都
+      // 重新分配并拷贝整个 buffer」的 O(n²)（长响应会明显拖慢主进程、卡住 UI）。
+      const unconsumed = buffer.length - bufStart
+      const newBuffer = new Uint8Array(unconsumed + value.length)
+      if (unconsumed > 0) newBuffer.set(buffer.subarray(bufStart), 0)
+      newBuffer.set(value, unconsumed)
       buffer = newBuffer
+      bufStart = 0
 
-      // 尝试解析消息
-      while (buffer.length >= 16) {
+      // 尝试解析消息（所有偏移均相对 bufStart，不再 slice 推进）
+      while (buffer.length - bufStart >= 16) {
         // AWS Event Stream 格式：
         // - 4 bytes: total length
         // - 4 bytes: headers length
@@ -1517,23 +1545,24 @@ async function parseEventStream(
         // - payload
         // - 4 bytes: message CRC
 
-        const totalLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(0, false)
-        
-        if (buffer.length < totalLength) {
+        const view = new DataView(buffer.buffer, buffer.byteOffset + bufStart)
+        const totalLength = view.getUint32(0, false)
+
+        if (buffer.length - bufStart < totalLength) {
           break // 等待更多数据
         }
 
-        const headersLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(4, false)
-        
-        // 从 headers 中提取 event type
-        const headersStart = 12
-        const headersEnd = 12 + headersLength
+        const headersLength = view.getUint32(4, false)
+
+        // 从 headers 中提取 event type（偏移相对 bufStart）
+        const headersStart = bufStart + 12
+        const headersEnd = bufStart + 12 + headersLength
         const eventType = extractEventType(buffer.slice(headersStart, headersEnd))
-        
-        // 提取 payload
-        const payloadStart = 12 + headersLength
-        const payloadEnd = totalLength - 4 // 减去 message CRC
-        
+
+        // 提取 payload（偏移相对 bufStart）
+        const payloadStart = bufStart + 12 + headersLength
+        const payloadEnd = bufStart + totalLength - 4 // 减去 message CRC
+
         if (payloadStart < payloadEnd) {
           const payloadBytes = buffer.slice(payloadStart, payloadEnd)
           
@@ -1906,8 +1935,8 @@ async function parseEventStream(
           }
         }
         
-        // 移动到下一条消息
-        buffer = buffer.slice(totalLength)
+        // 移动到下一条消息：只前移读取游标（O(1)），不再 slice 拷贝剩余 buffer
+        bufStart += totalLength
       }
     }
     

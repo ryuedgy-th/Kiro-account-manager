@@ -27,10 +27,45 @@ function getEncoder(): Tiktoken | null {
 // 让整个反代“卡死”。超过此长度时改用字节系数估算（足够触发裁剪阈值，且不阻塞）。
 const TIKTOKEN_MAX_CHARS = 200_000
 
+// ============ tiktoken 编码结果记忆化（memoization）============
+// 对话是 append-only 的：每个 turn 只在尾部追加新消息，历史 block 的内容完全不变。
+// 但 promptCacheTracker.buildClaudeProfile 每次请求都会对「整段历史的每个 block」重跑 tiktoken，
+// 而 encode 是同步、O(n)、且常数极大的 BPE 过程——会随对话变长而线性加重，阻塞 main 进程造成 UI 卡顿
+//（这正是“cache 一多就像卡住”的根因：cache 多 ≈ 上下文长 ≈ 每个 turn 重编码的历史更多）。
+// 这里用「内容 → token 数」的有界 LRU 缓存：相同内容只编码一次，后续直接命中。
+// 结果对相同输入完全确定，不改变任何对外 usage 数值，只省掉重复的同步计算。
+const MEMO_MIN_CHARS = 128       // 低于此长度 encode 极快，缓存键开销不划算
+const MEMO_MAX_ENTRIES = 1024    // 有界，超出后按 LRU 淘汰最久未用，防止内存无限增长
+const tokenMemo = new Map<string, number>()
+
+function memoGet(text: string): number | undefined {
+  const hit = tokenMemo.get(text)
+  if (hit === undefined) return undefined
+  // LRU 命中：删除后重新插入到末尾，标记为“最近使用”
+  tokenMemo.delete(text)
+  tokenMemo.set(text, hit)
+  return hit
+}
+
+function memoSet(text: string, tokens: number): void {
+  tokenMemo.set(text, tokens)
+  if (tokenMemo.size > MEMO_MAX_ENTRIES) {
+    // Map 迭代顺序 = 插入/更新顺序，首个即最久未使用，淘汰之
+    const oldest = tokenMemo.keys().next().value
+    if (oldest !== undefined) tokenMemo.delete(oldest)
+  }
+}
+
+/** 清空 token 记忆缓存（供测试或 prompt cache 整体清理时调用）。 */
+export function clearTokenMemo(): void {
+  tokenMemo.clear()
+}
+
 /**
  * 使用 tiktoken cl100k_base 精确计算 token 数。
  * 兜底：UTF-8 字节数 / 3.0（针对 payload JSON 经验值，误差 ±10%）。
  * 超长文本（> TIKTOKEN_MAX_CHARS）直接走字节系数，避免同步 encode 阻塞 event loop。
+ * 中等长度文本走 LRU 记忆化：append-only 对话里重复出现的历史 block 只编码一次。
  */
 export function countTokens(text: string): number {
   if (!text) return 0
@@ -38,10 +73,18 @@ export function countTokens(text: string): number {
   if (text.length > TIKTOKEN_MAX_CHARS) {
     return Math.ceil(Buffer.byteLength(text, 'utf-8') / 3.0)
   }
+  // 记忆化：相同内容（典型是 append-only 对话里反复出现的历史 block）只编码一次
+  const memoable = text.length >= MEMO_MIN_CHARS
+  if (memoable) {
+    const cached = memoGet(text)
+    if (cached !== undefined) return cached
+  }
   const enc = getEncoder()
   if (enc) {
     try {
-      return enc.encode(text).length
+      const n = enc.encode(text).length
+      if (memoable) memoSet(text, n)
+      return n
     } catch (err) {
       console.warn('[TokenCounter] encode failed, using fallback:', err)
     }

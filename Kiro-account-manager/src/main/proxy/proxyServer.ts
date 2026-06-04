@@ -593,6 +593,10 @@ export class ProxyServer {
       })
 
       this.server.on('connection', (socket: Socket) => {
+        // 关闭 Nagle 算法：SSE 是大量小 chunk 的流式输出，Nagle 会把小包攒一会儿再发，
+        // 导致 token 一顿一顿地到（TTFT 变差、看起来卡）。关掉后每个 delta 立即发出，更顺滑。
+        // 这是流式客户端的标准做法，不影响正确性，也不构成异常网络指纹。
+        socket.setNoDelay(true)
         this.sockets.add(socket)
         socket.on('close', () => this.sockets.delete(socket))
         // P1-10 backpressure 监控：socket 写入缓冲区超过 1MB 时记录警告
@@ -656,6 +660,7 @@ export class ProxyServer {
         fallback.headersTimeout = Math.max(headersMs, keepAliveMs + 1000)
         fallback.requestTimeout = 0
         fallback.on('connection', (socket) => {
+          socket.setNoDelay(true)
           this.sockets.add(socket)
           socket.on('close', () => this.sockets.delete(socket))
         })
@@ -2395,10 +2400,12 @@ export class ProxyServer {
       // 获取最近日志
       this.handleAdminLogs(res)
     } else if (path === '/admin/cache/clear' && method === 'POST') {
-      // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
+      // 清除内存缓存（conversationId 映射、模型缓存、prompt cache、tiktoken 记忆缓存）
       const { clearAllCaches } = require('./kiroApi')
+      const { clearTokenMemo } = require('./tokenCounter')
       const cleared = clearAllCaches()
       const promptCacheCleared = promptCacheTracker.clear()
+      clearTokenMemo()
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
     } else if (path === '/admin/customers' && method === 'GET') {
@@ -4721,12 +4728,10 @@ export class ProxyServer {
         )
       } else if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        // 按 Claude 原始请求结构算 input token（与 /v1/messages/count_tokens 同源），
-        // 让 message_start 的用量与客户端 pre-flight count_tokens 的结果一致，避免上下文统计偏差。
-        const promptInputTokens = Math.max(1,
-          this.estimateTokenCount(processedRequest.system) +
-          this.estimateTokenCount(processedRequest.messages) +
-          this.estimateTokenCount(processedRequest.tools))
+        // input token 复用上方为 cacheProfile 算出的 estimatedInputTokens——二者口径完全相同
+        //（estimateTokenCount system+messages+tools，与 /v1/messages/count_tokens 同源）。
+        // 重新计算只是把同一棵 payload 树再遍历一遍，对长对话纯属浪费，会加重 main 进程阻塞。
+        const promptInputTokens = estimatedInputTokens
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
           cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined, promptInputTokens, ProxyServer.deriveEffortLevel(request))
       } else {

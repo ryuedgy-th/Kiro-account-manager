@@ -8,6 +8,49 @@ let _cachedSystemProxy: string | null = null
 let _systemProxyCacheTime = 0
 const SYSTEM_PROXY_CACHE_TTL = 30_000 // 30秒缓存
 
+// ============ 出站连接池（keep-alive 复用）============
+// 背景：旧实现每次 API 调用都 new ProxyAgent / new Agent，等于丢弃所有已建立的 keep-alive
+// 连接，每个请求都要重做 TCP + TLS 握手（到 us-east-1 往返 ~100-300ms）。kiro-cli 走的是
+// 复用连接，所以反代会显得明显更慢。这里把出站 dispatcher 池化并按身份缓存：
+//   - 直连（无代理）：单例 _directAgent，跨请求复用同一连接池
+//   - 代理：按 proxyUrl 缓存，保证「同一账号 ↔ 同一 IP」绑定不变（不同 proxyUrl 各自独立池）
+//
+// keep-alive 调参说明（贴近普通 HTTP 客户端的常见默认，不制造异常指纹）：
+//   keepAliveTimeout    空闲连接保活 30s（undici 默认仅 4s，导致稍有间隔就重新握手）
+//   keepAliveMaxTimeout 单连接最长存活 10min 后强制轮换（避免 NAT/LB 静默断连后用到死连接）
+//   connections         每个 origin 最多 64 条连接，足够并发又不至于过量
+//   pipelining          1（HTTP/1.1，不跨请求复用同一管道，避免多账号请求互相串扰/指纹异常）
+const POOL_OPTS = {
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 600_000,
+  connections: 64,
+  pipelining: 1
+} as const
+
+let _directAgent: Agent | null = null
+const _proxyAgentCache = new Map<string, Dispatcher>()
+
+/**
+ * 直连（无代理）共享 dispatcher——跨请求复用 keep-alive 连接池。
+ * 不调 setGlobalDispatcher：保持全局 dispatcher 不变，避免影响注册/邮件/webTools 等其他出站逻辑，
+ * 仅 Kiro API 调用显式传入此 agent。
+ */
+export function getDirectPoolAgent(): Agent {
+  if (!_directAgent) _directAgent = new Agent(POOL_OPTS)
+  return _directAgent
+}
+
+/** 释放所有池化出站连接（供反代停止/重置时清理，防止句柄泄漏）。 */
+export function destroyOutboundPools(): void {
+  try { _directAgent?.close().catch(() => undefined) } catch { /* ignore */ }
+  _directAgent = null
+  for (const agent of _proxyAgentCache.values()) {
+    try { (agent as { close?: () => Promise<void> }).close?.()?.catch(() => undefined) } catch { /* ignore */ }
+  }
+  _proxyAgentCache.clear()
+}
+
+
 /**
  * 检查 URL 是否为 undici ProxyAgent 支持的协议（http / https）
  */
@@ -147,10 +190,13 @@ export function safeCreateProxyAgent(
 
   const protocol = u.protocol
 
-  // http / https 走原生 ProxyAgent
+  // http / https 走原生 ProxyAgent（带 keep-alive 池化参数）
+  // 注意：这里是「纯工厂」——每次调用都返回新 dispatcher，不跨调用缓存。
+  // 注册流程（registrar.ts）依赖这一点：每次注册用全新连接/出口 IP，避免多账号被关联。
+  // 需要跨请求复用连接的是 Kiro API 服务路径，那条路径走 getCachedProxyAgent（见下）。
   if (protocol === 'http:' || protocol === 'https:') {
     try {
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false }, ...POOL_OPTS })
     } catch (err) {
       console.warn(`[Proxy] 创建 HTTP ProxyAgent 失败，回退直连: ${proxyUrl}`, err)
       return undefined
@@ -172,6 +218,25 @@ export function safeCreateProxyAgent(
 }
 
 /**
+ * Kiro API 服务路径专用：按 proxyUrl 缓存并复用池化 dispatcher。
+ * 与 safeCreateProxyAgent（纯工厂）区分：
+ *   - 这里跨请求复用同一连接池，让「同一账号/同一 proxyUrl」的流量稳定从同一出口 IP 走，
+ *     既复用 keep-alive（快），也符合「N 账号 ↔ 1 IP」分桶设计（更像真实客户端，不增加被识别风险）。
+ *   - 不同 proxyUrl 各自独立缓存，绑定关系互不串扰。
+ * 仅供 kiroApi.getNetworkAgent 调用；注册流程不要用本函数（需要每次新 IP）。
+ */
+export function getCachedProxyAgent(
+  proxyUrl: string | null | undefined
+): Dispatcher | undefined {
+  if (!proxyUrl) return undefined
+  const cached = _proxyAgentCache.get(proxyUrl)
+  if (cached) return cached
+  const agent = safeCreateProxyAgent(proxyUrl)
+  if (agent) _proxyAgentCache.set(proxyUrl, agent)
+  return agent
+}
+
+/**
  * 通过 undici Agent 的 connect 钩子实现 SOCKS5/4 隧道
  * 流程：socks.createConnection 建立 TCP 隧道 → 如目标是 https 再 TLS 升级 → 把 socket 交给 undici
  */
@@ -186,6 +251,7 @@ function createSocksDispatcher(u: URL): Agent {
   // undici Agent.connect callback 的类型签名是 (err: Error, socket: null) | (err: null, socket: Socket)
   // 用宽松 any 包装避免严格类型不匹配，运行时行为完全正确
   return new Agent({
+    ...POOL_OPTS,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     connect: ((options: any, callback: any): void => {
       const targetHost = options.hostname || options.host || ''
