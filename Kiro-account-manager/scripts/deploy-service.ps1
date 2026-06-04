@@ -1,6 +1,6 @@
 # One-shot deploy + run Kiro headless proxy service (Windows)
-# ใช้: เปิด PowerShell ในโฟลเดอร์แอป (ที่มี package.json) แล้วรัน:
-#   .\scripts\deploy-service.ps1 -DataFile C:\path\to\kiro-service-data.json -Port 5581
+# Usage (run in the app folder that contains package.json):
+#   .\scripts\deploy-service.ps1 -DataFile .\kiro-service-data.json -Port 5581
 param(
   [string]$DataFile = "$PSScriptRoot\..\kiro-service-data.json",
   [string]$DataDir  = "$env:USERPROFILE\.kiro-proxy-service",
@@ -21,12 +21,12 @@ Write-Host "[deploy] build service bundle..." -ForegroundColor Cyan
 npm run build:service
 
 if (-not (Test-Path $DataFile)) {
-  Write-Host "[deploy] ไม่พบ $DataFile — แปลงจาก electron-store เดิมอัตโนมัติ..." -ForegroundColor Yellow
+  Write-Host "[deploy] data file not found, auto-converting from electron-store..." -ForegroundColor Yellow
   node "scripts\export-service-data.mjs" --out $DataFile
 }
 if (-not (Test-Path $DataFile)) {
-  Write-Warning "ยังไม่มีไฟล์ข้อมูล: $DataFile"
-  Write-Warning "ลองรันเอง: node scripts\export-service-data.mjs --store <path ของ kiro-accounts.json> --out $DataFile"
+  Write-Warning "Data file missing: $DataFile"
+  Write-Warning "Run manually: node scripts\export-service-data.mjs --store PATH_TO_kiro-accounts.json --out $DataFile"
   exit 1
 }
 
