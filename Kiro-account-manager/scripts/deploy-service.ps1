@@ -21,8 +21,12 @@ Write-Host "[deploy] build service bundle..." -ForegroundColor Cyan
 npm run build:service
 
 if (-not (Test-Path $DataFile)) {
-  Write-Warning "ไม่พบไฟล์ข้อมูล: $DataFile"
-  Write-Warning "ให้ Export Service Data จากแอป GUI ก่อน แล้วชี้ -DataFile มาที่ไฟล์นั้น"
+  Write-Host "[deploy] ไม่พบ $DataFile — แปลงจาก electron-store เดิมอัตโนมัติ..." -ForegroundColor Yellow
+  node "scripts\export-service-data.mjs" --out $DataFile
+}
+if (-not (Test-Path $DataFile)) {
+  Write-Warning "ยังไม่มีไฟล์ข้อมูล: $DataFile"
+  Write-Warning "ลองรันเอง: node scripts\export-service-data.mjs --store <path ของ kiro-accounts.json> --out $DataFile"
   exit 1
 }
 
