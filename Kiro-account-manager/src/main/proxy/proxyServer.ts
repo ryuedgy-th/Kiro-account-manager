@@ -5628,38 +5628,84 @@ const PORTAL_HTML = `<!doctype html>
   .main { padding:30px 34px 48px; min-width:0; }
   .topgreet { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:24px; flex-wrap:wrap; }
   .grid2 { display:grid; grid-template-columns:1.4fr 1fr; gap:18px; align-items:start; }
+  /* ===== tablet / small-laptop: stacked, scrollable top bar ===== */
+  /* minmax(0,1fr) lets the single column shrink below its min-content, so a
+     nowrap nav can scroll instead of forcing the whole .main wider than the
+     viewport (the horizontal-overflow bug). */
   @media (max-width:1080px){
-    .shell { grid-template-columns:1fr; margin:0; border-radius:0; min-height:100vh; }
+    .shell { grid-template-columns:minmax(0,1fr); margin:0; border-radius:0; min-height:100vh; }
     .sidebar {
-      flex-direction:row; flex-wrap:nowrap; border-right:none; border-bottom:1px solid var(--border);
-      align-items:center; gap:12px; padding:14px 16px; position:sticky; top:0; z-index:20;
-      background:#fbfdfc; -webkit-backdrop-filter:saturate(180%) blur(8px); backdrop-filter:saturate(180%) blur(8px);
+      flex-direction:row; flex-wrap:nowrap; align-items:center; gap:10px; min-width:0;
+      border-right:none; border-bottom:1px solid var(--border); padding:12px 16px;
+      position:sticky; top:0; z-index:20;
+      background:rgba(251,253,252,.92); -webkit-backdrop-filter:saturate(180%) blur(8px); backdrop-filter:saturate(180%) blur(8px);
     }
     .brand-row { display:none; }
     .profile { flex-direction:row; border:none; padding:0; margin:0; gap:10px; text-align:left; flex:0 0 auto; }
-    .profile .avatar { width:38px; height:38px; font-size:15px; }
+    .profile .avatar { width:36px; height:36px; font-size:15px; }
     .profile .pname, .profile .pmail { display:none; }
-    /* nav becomes a horizontal scroll strip — no messy wrapping */
     .nav {
-      flex-direction:row; flex-wrap:nowrap; flex:1 1 auto; gap:6px;
-      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch;
-      scrollbar-width:none; padding-bottom:2px;
+      flex-direction:row; flex-wrap:nowrap; flex:1 1 auto; min-width:0; gap:6px;
+      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; scrollbar-width:none;
     }
     .nav::-webkit-scrollbar { display:none; }
     .nav-item { width:auto; flex:0 0 auto; white-space:nowrap; padding:9px 13px; }
-    .logout { margin-top:0; flex:0 0 auto; padding:9px 14px; }
-    .main { padding:20px 16px 64px; }
-    h1 { font-size:22px; }
-    .balance { font-size:40px; }
-    .hero { padding:22px; }
+    .logout { margin:0; flex:0 0 auto; padding:9px 14px; }
+    .main { padding:22px 18px 60px; min-width:0; }
+    h1 { font-size:23px; }
   }
-  @media (max-width:720px){
+
+  /* ===== phone: compact top bar + fixed bottom tab bar (wallet-app style) =====
+     .shell→block kills the grid min-width trap entirely; the bottom nav is
+     position:fixed so it contributes zero width and cannot cause overflow. */
+  @media (max-width:860px){
+    html, body { overflow-x:hidden; }
+    .shell { display:block; min-height:100vh; }
+    .sidebar { display:contents; }   /* dissolve the sidebar box; promote its children */
+    .brand-row { display:none; }
+
+    /* top bar: avatar + name (logout pinned top-right) */
+    .profile {
+      position:fixed; top:0; left:0; right:0; z-index:40; height:54px; margin:0;
+      display:flex; flex-direction:row; align-items:center; gap:10px; padding:0 16px;
+      background:rgba(251,253,252,.94); -webkit-backdrop-filter:saturate(180%) blur(10px); backdrop-filter:saturate(180%) blur(10px);
+      border-bottom:1px solid var(--border);
+    }
+    .profile .avatar { width:34px; height:34px; font-size:14px; }
+    .profile .pname {
+      display:block; font-size:14px; font-weight:700; margin:0;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:calc(100vw - 190px);
+    }
+    .profile .pmail { display:none; }
+    .logout { position:fixed; top:10px; right:12px; z-index:41; margin:0; padding:7px 12px; font-size:13px; }
+
+    /* bottom tab bar */
+    .nav {
+      position:fixed; left:0; right:0; bottom:0; z-index:40; min-width:0;
+      flex-direction:row; flex-wrap:nowrap; gap:0; overflow:visible;
+      background:rgba(251,253,252,.97); -webkit-backdrop-filter:saturate(180%) blur(12px); backdrop-filter:saturate(180%) blur(12px);
+      border-top:1px solid var(--border);
+      padding:4px 4px calc(4px + env(safe-area-inset-bottom));
+    }
+    .nav-item {
+      flex:1 1 0; min-width:0; width:auto; flex-direction:column; align-items:center; justify-content:center;
+      gap:3px; padding:7px 2px; border-radius:12px; font-size:10px; font-weight:600; line-height:1.15;
+      white-space:nowrap; color:var(--muted); -webkit-tap-highlight-color:transparent;
+    }
+    .nav-item svg { width:22px; height:22px; opacity:1; }
+    .nav-item.on { background:transparent; color:var(--accent-d); }
+    .nav-item:hover { background:transparent; }
+
+    .main { padding:66px 14px calc(84px + env(safe-area-inset-bottom)); min-width:0; }
+    .topgreet { gap:10px; margin-bottom:18px; }
     .grid2 { grid-template-columns:1fr; }
-    /* iOS zooms in on focus when input font < 16px — bump it up on phones */
-    input, button { font-size:16px; }
-    .stat .v { font-size:20px; }
-    .row > button { flex:1 1 auto; }
+    input, button { font-size:16px; }   /* stop iOS focus auto-zoom (<16px triggers it) */
+    h1 { font-size:22px; }
+    .balance { font-size:42px; }
+    .hero { padding:22px; }
+    .stat .v { font-size:21px; }
     .card { padding:16px; border-radius:14px; }
+    .row > button { flex:1 1 auto; }
     th, td { padding:9px 6px; }
   }
 
