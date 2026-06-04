@@ -15,6 +15,11 @@ const MAX_CACHE_RATIO = 0.85                   // 最新内容不可能 100% 缓
 const MAX_ENTRIES_PER_ACCOUNT = 200            // 每个账号最大缓存条目数
 const PRUNE_INTERVAL = 60 * 1000              // 清理间隔 1 分钟
 
+// 历史 string block 记忆化参数（append-only 对话里重复出现的历史消息只 canonicalize 一次）
+const BLOCK_MEMO_MIN_CHARS = 128               // 太短：canonicalize 极快，缓存不划算
+const BLOCK_MEMO_MAX_CHARS = 8192              // 太长：key 占内存大且罕见，跳过缓存
+const BLOCK_MEMO_MAX_ENTRIES = 1024            // 有界 LRU，防止内存无限增长
+
 // ============ 类型定义 ============
 
 interface CacheBreakpoint {
@@ -234,6 +239,32 @@ export class PromptCacheTracker {
     return blocks
   }
 
+  // 历史 block 的 {value, tokens} 记忆化。对话是 append-only：历史消息的 content 与 index 不变，
+  // 每个 turn 都会重复出现。命中即跳过 canonicalize 的 JSON.stringify（及包装对象分配）。
+  // key 含 role|index|content（精确字符串相等，无碰撞）；仅缓存中等长度 string content：
+  // 太短不划算、太长则 key 占内存大（且罕见）。有界 LRU，输出与未缓存完全一致。
+  private blockMemo = new Map<string, { value: string; tokens: number }>()
+
+  private memoStringMessageBlock(role: string, index: number, content: string): { value: string; tokens: number } {
+    if (content.length < BLOCK_MEMO_MIN_CHARS || content.length > BLOCK_MEMO_MAX_CHARS) {
+      return { value: this.canonicalize({ kind: 'message', role, index, type: 'text', text: content }), tokens: estimateTokens(content) }
+    }
+    const key = `${role}\u0000${index}\u0000${content}`
+    const hit = this.blockMemo.get(key)
+    if (hit !== undefined) {
+      this.blockMemo.delete(key)
+      this.blockMemo.set(key, hit)
+      return hit
+    }
+    const entry = { value: this.canonicalize({ kind: 'message', role, index, type: 'text', text: content }), tokens: estimateTokens(content) }
+    this.blockMemo.set(key, entry)
+    if (this.blockMemo.size > BLOCK_MEMO_MAX_ENTRIES) {
+      const oldest = this.blockMemo.keys().next().value
+      if (oldest !== undefined) this.blockMemo.delete(oldest)
+    }
+    return entry
+  }
+
   private appendSystemBlocks(blocks: CacheableBlock[], system: unknown): void {
     if (!system) return
     if (typeof system === 'string') {
@@ -288,10 +319,10 @@ export class PromptCacheTracker {
   ): void {
     const content = msg.content
     if (typeof content === 'string') {
-      const value = this.canonicalize({ kind: 'message', role: msg.role, index: messageIndex, type: 'text', text: content })
+      const { value, tokens } = this.memoStringMessageBlock(msg.role, messageIndex, content)
       blocks.push({
         value,
-        tokens: estimateTokens(content),
+        tokens,
         ttl: this.extractTTL(msg),
         isMessageEnd: true
       })

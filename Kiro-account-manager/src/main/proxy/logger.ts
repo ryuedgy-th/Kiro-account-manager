@@ -18,13 +18,15 @@ export interface LoggerConfig {
   maxFileSize?: number // 最大文件大小 (bytes)
   maxFiles?: number // 最大文件数量
   logToConsole?: boolean
+  logDebug?: boolean // 是否处理 DEBUG 级日志（默认 false：热路径上的 debug 直接丢弃，省去 redact+存储开销）
 }
 
 const DEFAULT_CONFIG: LoggerConfig = {
   enabled: false,
   maxFileSize: 10 * 1024 * 1024, // 10MB
   maxFiles: 5,
-  logToConsole: true
+  logToConsole: true,
+  logDebug: false
 }
 
 class ProxyLogger {
@@ -108,6 +110,9 @@ class ProxyLogger {
 
   private isWriting = false
   private write(rawEntry: LogEntry): void {
+    // 热路径优化：默认丢弃 DEBUG（省去 redact + JSON + proxyLogStore 的逐请求开销）。
+    // 需要排查时通过 configure({ logDebug: true }) 打开。
+    if (rawEntry.level === 'DEBUG' && !this.config.logDebug) return
     // 统一脱敏：message + data 里的代理账密 / token / password 等，避免明文落盘或上屏
     const entry: LogEntry = {
       ...rawEntry,

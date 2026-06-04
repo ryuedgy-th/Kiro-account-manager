@@ -664,7 +664,8 @@ export interface ProxyConfig {
   maxRetries?: number
   retryDelayMs?: number
   // 首选端点配置
-  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
+  // kiro-runtime: runtime.kiro.dev（官方 kiro-cli 当前主端点）；其余为旧 amazonaws.com 端点
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli' | 'kiro-runtime'
   // Token 刷新提前量（秒）
   tokenRefreshBeforeExpiry?: number
   // TLS/HTTPS 配置

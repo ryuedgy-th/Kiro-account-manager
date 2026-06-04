@@ -92,6 +92,37 @@ function heuristicSupportsThinking(modelId: string): boolean {
 // 不含 xhigh——它仅 opus 接受，对 sonnet 下发会触发 enumeration 400。模型列表拉取后改以真实枚举为准。
 const SAFE_THINKING_EFFORTS = new Set(['low', 'medium', 'high', 'max'])
 
+// 从 Claude 请求推导 effort 档位（供 additionalModelRequestFields.output_config.effort 下发）。
+//
+// 背景（经抓包 + 真机验证）：标准 Claude Code 按 Anthropic API 规范用 thinking.budget_tokens
+// 表达推理强度，并不发送 Kiro 私有的 output_config.effort。若只读 output_config.effort，
+// 标准 Claude Code 的「思考预算」永远落空——Opus 始终跑默认 effort，客户付了 budget 却拿不到对应算力。
+// 因此这里做映射：显式 effort 优先，否则把 budget_tokens 折算成档位。
+// 阈值与 ProxyServer.deriveEffortLevel（用量统计用）保持一致，确保「下发的 effort」与「dashboard 显示的 effort」口径相同。
+// 注：仅决定「请求哪个档位」；该档位是否被真正下发，仍由 buildAdditionalModelRequestFields 按后端枚举校验。
+export function deriveClaudeEffort(request: {
+  output_config?: { effort?: string }
+  thinking?: { type?: string; budget_tokens?: number }
+}): string | undefined {
+  // 1. 显式 effort（Kiro 私有字段，若客户端已知 Kiro 协议会直接发）→ 直接采用
+  const explicit = request.output_config?.effort
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim().toLowerCase()
+
+  // 2. 标准 Claude Code：从 thinking.budget_tokens 折算
+  const thinking = request.thinking
+  if (!thinking || thinking.type === 'disabled') return undefined
+  const budget = typeof thinking.budget_tokens === 'number' ? thinking.budget_tokens : undefined
+  // enabled/adaptive 但未给 budget → 视为中档（开启了思考但未指定强度）
+  if (budget === undefined) {
+    return thinking.type === 'enabled' || thinking.type === 'adaptive' ? 'medium' : undefined
+  }
+  if (budget <= 0) return undefined
+  if (budget < 6000) return 'low'
+  if (budget < 16000) return 'medium'
+  if (budget < 32000) return 'high'
+  return 'max'
+}
+
 // 统一构建 additionalModelRequestFields（thinking + reasoning effort）
 // effort 走 additionalModelRequestFields.output_config.effort（与 /v1/models 暴露的 schema 对齐，
 // 见 proxyServer.ts extractThinkingEfforts：output_config 与 thinking 同级，位于 additionalModelRequestFields 下）。
@@ -1060,7 +1091,7 @@ export function claudeToKiro(
   const additionalModelRequestFields = buildAdditionalModelRequestFields(
     modelId,
     undefined,
-    request.output_config?.effort
+    deriveClaudeEffort(request)
   )
 
   return buildKiroPayload(

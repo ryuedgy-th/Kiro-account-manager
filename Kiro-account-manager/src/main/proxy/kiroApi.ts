@@ -184,7 +184,27 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
 }
 
 // Kiro API 端点配置
+// 端点字段：
+//   - regional: true  → url 含 {region} 占位符，按账号 region 替换（kiro.dev 新端点）
+//   - rpc: true       → AWS JSON-1.0 RPC 协议：path '/' + x-amz-target 头 + content-type application/x-amz-json-1.0
+//                       （旧 amazonaws.com 端点用 REST path 风格，不带 x-amz-target）
+//   - identity: 'cli' → 使用 aws-sdk-rust + KIRO_CLI 身份；'ide' → KiroIDE 身份（IDE-only 订阅兼容）
+//
+// runtime.{region}.kiro.dev 为官方 kiro-cli 当前主端点（经 MITM 抓包确认 2026-06）：
+//   POST https://runtime.us-east-1.kiro.dev/  x-amz-target: ...GenerateAssistantResponse
+//   返回 application/vnd.amazon.eventstream，事件格式与旧端点一致（assistantResponseEvent 等）。
+// 放在首位作为 failover 首选；403（如 IdC 订阅不支持 CLI 应用）会自动回退到旧 codewhisperer/q 端点。
 const KIRO_ENDPOINTS = [
+  {
+    url: 'https://runtime.{region}.kiro.dev/',
+    origin: 'KIRO_CLI',
+    amzTarget: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
+    name: 'KiroRuntime',
+    protocol: 'generateAssistantResponse' as const,
+    regional: true,
+    rpc: true,
+    identity: 'cli' as const
+  },
   {
     url: 'https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse',
     origin: 'AI_EDITOR',
@@ -207,6 +227,15 @@ const KIRO_ENDPOINTS = [
   }
 ]
 
+type KiroEndpoint = typeof KIRO_ENDPOINTS[number]
+
+// 按账号 region 解析端点 URL（仅 regional 端点替换 {region}）
+function resolveEndpointUrl(endpoint: KiroEndpoint, account: ProxyAccount): string {
+  if (!('regional' in endpoint) || !endpoint.regional) return endpoint.url
+  const region = account.region?.startsWith('eu') ? 'eu-central-1' : 'us-east-1'
+  return endpoint.url.replace('{region}', region)
+}
+
 // Kiro 版本号（跟随官方 IDE 更新）
 const KIRO_VERSION = '0.12.155'
 const AWS_SDK_VERSION = '1.0.34'
@@ -227,8 +256,16 @@ function getKiroAmzUserAgent(machineId?: string): string {
 }
 
 const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
-const KIRO_CLI_USER_AGENT = `aws-sdk-rust/1.3.9 os/${KIRO_CLI_OS} lang/rust/1.87.0`
-const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/${KIRO_CLI_OS} lang/rust/1.87.0 m/E app/AmazonQ-For-CLI`
+// kiro-cli 当前真实 UA（MITM 抓包确认 2026-06，runtime.kiro.dev 请求头）：
+//   user-agent:   aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.5.1 app/AmazonQ-For-CLI
+//   x-amz-user-agent: aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI
+const KIRO_CLI_SDK_VERSION = '1.3.15'
+const KIRO_CLI_API_VERSION = '0.1.16551'
+const KIRO_CLI_RUST_VERSION = '1.92.0'
+const KIRO_CLI_APP_VERSION = '2.5.1'
+const KIRO_CLI_USER_AGENT = `aws-sdk-rust/${KIRO_CLI_SDK_VERSION} ua/2.1 api/codewhispererstreaming/${KIRO_CLI_API_VERSION} os/${KIRO_CLI_OS} lang/rust/${KIRO_CLI_RUST_VERSION} md/appVersion-${KIRO_CLI_APP_VERSION} app/AmazonQ-For-CLI`
+// x-amz-user-agent：抓包确认与 user-agent 基本一致，差异为 m/F（metric flag）替代 md/appVersion
+const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/${KIRO_CLI_SDK_VERSION} ua/2.1 api/codewhispererstreaming/${KIRO_CLI_API_VERSION} os/${KIRO_CLI_OS} lang/rust/${KIRO_CLI_RUST_VERSION} m/F app/AmazonQ-For-CLI`
 
 // Agent 模式
 const AGENT_MODE_SPEC = 'spec' // IDE 模式
@@ -1242,47 +1279,60 @@ function getAccountMachineId(accountId: string, accountMachineId?: string): stri
 }
 
 // 获取认证方式对应的请求头
-function getAuthHeaders(account: ProxyAccount, endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
+function getAuthHeaders(account: ProxyAccount, endpoint: KiroEndpoint): Record<string, string> {
   // 应用身份(application identity)由"端点"决定，而非账号的 authMethod。
   // 关键修复：旧代码对所有 IdC 账号强制使用 Amazon Q CLI 身份(vibe + aws-sdk-rust UA)，
   // 但很多 IdC/Enterprise 订阅只授权 Kiro IDE 应用，CLI 身份会被后端拒绝：
   //   403 "Your subscription does not support this application"
   // 已用真实 token 验证：IDE 身份(spec + KiroIDE UA) 返回 200，CLI 身份返回 403。
-  // 仅当用户显式选择 AmazonQCLI 端点时才使用 CLI 身份。
-  const isCliEndpoint = endpoint.name === 'AmazonQCLI'
+  // CLI 身份用于 AmazonQCLI 端点与新的 KiroRuntime(runtime.kiro.dev) 端点（identity:'cli'）。
+  const useCliIdentity = endpoint.name === 'AmazonQCLI' || ('identity' in endpoint && endpoint.identity === 'cli')
   const machineId = getAccountMachineId(account.id, account.machineId)
-  const agentMode = isCliEndpoint ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
+  const agentMode = useCliIdentity ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
+  // RPC 端点（runtime.kiro.dev）：AWS JSON-1.0 协议——path '/' + x-amz-target 头 + 专用 content-type。
+  // 抓包确认 runtime.kiro.dev 即用此风格，与旧 REST 端点（path 含动词）不同。
+  const isRpc = 'rpc' in endpoint && endpoint.rpc === true
 
   const headers: Record<string, string> = {
-    'content-type': 'application/json',
+    'content-type': isRpc ? 'application/x-amz-json-1.0' : 'application/json',
     'x-amzn-kiro-agent-mode': agentMode,
-    'x-amz-user-agent': isCliEndpoint ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
-    'user-agent': isCliEndpoint ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
+    'x-amz-user-agent': useCliIdentity ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
+    'user-agent': useCliIdentity ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${account.accessToken}`
+  }
+  if (isRpc) {
+    // x-amz-target 把目标 operation 放进 header（RPC 风格的核心），抓包确认必带
+    headers['x-amz-target'] = endpoint.amzTarget
+    headers['x-amzn-codewhisperer-optout'] = 'false'
   }
   return headers
 }
 
 // 获取排序后的端点列表（根据首选端点配置）
-function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): typeof KIRO_ENDPOINTS {
+// 默认 failover 链：KiroRuntime(runtime.kiro.dev) → CodeWhisperer → AmazonQ
+// runtime.kiro.dev 为官方 kiro-cli 当前主端点，置于首位；若该账号订阅不支持 CLI 应用
+// 返回 403，会自动回退到旧 codewhisperer/q 端点（IDE 身份）。
+function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli' | 'kiro-runtime'): KiroEndpoint[] {
   if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
-  
+
   // AmazonQ CLI 模式：只用这一个端点，失败不回退
   if (preferredEndpoint === 'amazonq-cli') {
     return KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI')
   }
-  
-  const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
-  
+
+  const preferredName = preferredEndpoint === 'kiro-runtime' ? 'KiroRuntime'
+    : preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer'
+    : 'AmazonQ'
+
   const sorted = KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
   sorted.sort((a, b) => {
     if (a.name === preferredName) return -1
     if (b.name === preferredName) return 1
     return 0
   })
-  
+
   return sorted
 }
 
@@ -1304,7 +1354,7 @@ export async function callKiroApiStream(
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   signal?: AbortSignal,
-  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli' | 'kiro-runtime'
 ): Promise<void> {
   const endpoints = getSortedEndpoints(preferredEndpoint)
   let lastError: Error | null = null
@@ -1322,6 +1372,9 @@ export async function callKiroApiStream(
         delete requestPayload.profileArn
       }
       const requestedModelId = getPayloadModelId(requestPayload)
+      // CodeWhisperer 与 KiroRuntime 端点都需把别名（claude-sonnet-4.5 等）解析为后端真实 modelId。
+      // 注：runtime.kiro.dev 经 ListAvailableModels 返回的就是 claude-sonnet-4.5 这类点号规范名，
+      // 但 CodeWhisperer 旧端点要 CLAUDE_SONNET_4_..._V1_0 格式——保持各自既有解析逻辑。
       if (endpoint.name === 'CodeWhisperer') {
         applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId, signal))
       }
@@ -1334,6 +1387,7 @@ export async function callKiroApiStream(
         delete (requestPayload.conversationState as unknown as Record<string, unknown>).agentTaskType
       }
 
+      const endpointUrl = resolveEndpointUrl(endpoint, account)
       const payloadStr = JSON.stringify(requestPayload)
       const headers = getAuthHeaders(account, endpoint)
       const currentUserInput = requestPayload.conversationState.currentMessage.userInputMessage
@@ -1358,8 +1412,8 @@ export async function callKiroApiStream(
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
       const response = agent
-        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal } as UndiciRequestInit) as unknown as Response
+        ? await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+        : await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal } as UndiciRequestInit) as unknown as Response
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)

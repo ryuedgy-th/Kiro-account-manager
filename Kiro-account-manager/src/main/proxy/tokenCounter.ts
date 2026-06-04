@@ -4,6 +4,7 @@
  * 以便从 Kiro 后端的 contextUsagePercentage 反推真实 input tokens。
  */
 import { getEncoding, type Tiktoken } from 'js-tiktoken'
+import { createHash } from 'crypto'
 
 let encoder: Tiktoken | null = null
 let encoderInitFailed = false
@@ -38,17 +39,24 @@ const MEMO_MIN_CHARS = 128       // 低于此长度 encode 极快，缓存键开
 const MEMO_MAX_ENTRIES = 1024    // 有界，超出后按 LRU 淘汰最久未用，防止内存无限增长
 const tokenMemo = new Map<string, number>()
 
-function memoGet(text: string): number | undefined {
-  const hit = tokenMemo.get(text)
+// key 用 sha256 摘要而非原文：原文可达 TIKTOKEN_MAX_CHARS(20万) 字符，1024 条全存原文
+// 最坏可占数百 MB。sha256 抗碰撞（与 promptCacheTracker 的指纹同等可信），故 token 数仍与按
+// 原文缓存完全一致，只是把无界的 key 体积压成定长 64 hex。
+function memoKey(text: string): string {
+  return createHash('sha256').update(text).digest('hex')
+}
+
+function memoGet(key: string): number | undefined {
+  const hit = tokenMemo.get(key)
   if (hit === undefined) return undefined
   // LRU 命中：删除后重新插入到末尾，标记为“最近使用”
-  tokenMemo.delete(text)
-  tokenMemo.set(text, hit)
+  tokenMemo.delete(key)
+  tokenMemo.set(key, hit)
   return hit
 }
 
-function memoSet(text: string, tokens: number): void {
-  tokenMemo.set(text, tokens)
+function memoSet(key: string, tokens: number): void {
+  tokenMemo.set(key, tokens)
   if (tokenMemo.size > MEMO_MAX_ENTRIES) {
     // Map 迭代顺序 = 插入/更新顺序，首个即最久未使用，淘汰之
     const oldest = tokenMemo.keys().next().value
@@ -75,15 +83,16 @@ export function countTokens(text: string): number {
   }
   // 记忆化：相同内容（典型是 append-only 对话里反复出现的历史 block）只编码一次
   const memoable = text.length >= MEMO_MIN_CHARS
+  const key = memoable ? memoKey(text) : ''
   if (memoable) {
-    const cached = memoGet(text)
+    const cached = memoGet(key)
     if (cached !== undefined) return cached
   }
   const enc = getEncoder()
   if (enc) {
     try {
       const n = enc.encode(text).length
-      if (memoable) memoSet(text, n)
+      if (memoable) memoSet(key, n)
       return n
     } catch (err) {
       console.warn('[TokenCounter] encode failed, using fallback:', err)
