@@ -85,6 +85,28 @@ function estimateTokensFromString(str: string): number {
 }
 
 /**
+ * 估算单条消息的 token 数（binary-aware）。从 estimatePayloadTokens 抽出为独立纯函数，
+ * 使裁剪逻辑能按「单条消息」算增量（O(1) per cut），无需每次重算整个 payload（避免 O(n²)）。
+ */
+function estimateMessageTokens(msg?: KiroHistoryMessage): number {
+  if (!msg) return 0
+  let tokens = 0
+  const input = msg.userInputMessage
+  if (input) {
+    // 文本/上下文：把 base64 字段剥离后再按字符估算
+    tokens += estimateTokensFromString(stringifyWithoutBinary(input))
+    tokens += (input.images?.length ?? 0) * IMAGE_TOKEN_ESTIMATE
+    for (const doc of input.documents ?? []) {
+      tokens += estimateBase64DocumentTokens(doc.source?.bytes || '', doc.format)
+    }
+  }
+  if (msg.assistantResponseMessage) {
+    tokens += estimateTokensFromString(JSON.stringify(msg.assistantResponseMessage))
+  }
+  return tokens
+}
+
+/**
  * 估算整个 payload 的 token 数（binary-aware）。
  *
  * 关键：不能直接 JSON.stringify(payload) 再按长度估算，否则 images/documents 里的
@@ -93,23 +115,8 @@ function estimateTokensFromString(str: string): number {
  */
 function estimatePayloadTokens(payload: KiroPayload): number {
   let tokens = 0
-  const accountForMessage = (msg?: KiroHistoryMessage): void => {
-    if (!msg) return
-    const input = msg.userInputMessage
-    if (input) {
-      // 文本/上下文：把 base64 字段剥离后再按字符估算
-      tokens += estimateTokensFromString(stringifyWithoutBinary(input))
-      tokens += (input.images?.length ?? 0) * IMAGE_TOKEN_ESTIMATE
-      for (const doc of input.documents ?? []) {
-        tokens += estimateBase64DocumentTokens(doc.source?.bytes || '', doc.format)
-      }
-    }
-    if (msg.assistantResponseMessage) {
-      tokens += estimateTokensFromString(JSON.stringify(msg.assistantResponseMessage))
-    }
-  }
-  accountForMessage(payload.conversationState.currentMessage)
-  for (const msg of payload.conversationState.history ?? []) accountForMessage(msg)
+  tokens += estimateMessageTokens(payload.conversationState.currentMessage)
+  for (const msg of payload.conversationState.history ?? []) tokens += estimateMessageTokens(msg)
   // profileArn / inferenceConfig / additionalModelRequestFields 等其余字段开销很小，忽略不计
   return Math.max(1, tokens)
 }
@@ -1009,7 +1016,9 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
   let totalTrimmed = 0
   let iterations = 0
+  // 增量记账：baseline 算一次，之后每轮按「被裁掉的消息」做减法，避免每轮重算整个 payload（O(n²)→O(n)）
   let currentTokens = estimatePayloadTokens(payload)
+  const helloTokens = estimateMessageTokens(HELLO_MESSAGE)
   const MAX_ITERATIONS = 100 // 防止极端情况死循环
 
   while (currentTokens > maxTokens && history.length >= 4 && iterations < MAX_ITERATIONS) {
@@ -1029,13 +1038,18 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
     if (cutAt === 0) break // 无法继续裁剪
 
+    // 先算被裁掉这段的 token，从 currentTokens 减去（含可能存在于 history[0] 的旧 HELLO）
+    let removedTokens = 0
+    for (let i = 0; i < cutAt; i++) removedTokens += estimateMessageTokens(history[i])
     history = history.slice(cutAt)
     totalTrimmed += cutAt
+    currentTokens -= removedTokens
 
-    // 裁剪后 history 可能以 assistant 起头 → 补 HELLO 重新规范
+    // 裁剪后 history 可能以 assistant 起头 → 补 HELLO 重新规范（补则加回 HELLO 的 token）
+    const needsHello = history.length > 0 && !isUserInputMessage(history[0])
     history = ensureStartsWithUserMessage(history)
+    if (needsHello) currentTokens += helloTokens
     payload.conversationState.history = history
-    currentTokens = estimatePayloadTokens(payload)
   }
 
   return { trimmed: totalTrimmed, finalTokens: currentTokens, iterations }
@@ -1199,6 +1213,8 @@ export function buildKiroPayload(
   // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
   const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
   const TOOL_RESULT_TRUNCATE_LENGTH = 4000
+  // 基线算一次，之后每截一段按「字符长度差」做减法（与原先 JSON.stringify().length 同口径：
+  // UTF-16 code units），避免每截一次就 stringify 整个 1.5MB payload（O(n²)→O(n)）。
   let initialPayloadSize = JSON.stringify(payload).length
   if (initialPayloadSize > PAYLOAD_SIZE_LIMIT && payload.conversationState.history) {
     const historyMessages = payload.conversationState.history
@@ -1216,13 +1232,14 @@ export function buildKiroPayload(
             const originalLen = contentItem.text.length
             contentItem.text = `${contentItem.text.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${originalLen} chars]`
             truncatedCount++
-            initialPayloadSize = JSON.stringify(payload).length
+            // 增量更新：减去本次截断省下的字符数（原长 - 新长），不再重算整个 payload
+            initialPayloadSize -= (originalLen - contentItem.text.length)
           }
         }
       }
     }
     if (truncatedCount > 0) {
-      console.log(`[KiroPayload] Truncated ${truncatedCount} large tool results to fit payload size limit (final size: ${initialPayloadSize} bytes)`)
+      console.log(`[KiroPayload] Truncated ${truncatedCount} large tool results to fit payload size limit (final size: ~${initialPayloadSize} bytes)`)
     }
   }
 
@@ -1236,27 +1253,32 @@ export function buildKiroPayload(
     const tokenBudget = getEffectiveTokenLimit(trimModelId) // 模型 ctx - buffer（ListAvailableModels 失败时回退 opus 200k → 180k）
     let estTokens = estimatePayloadTokens(payload)
     if (estTokens > tokenBudget) {
-      const collectTexts = (msg?: { userInputMessage?: { userInputMessageContext?: { toolResults?: Array<{ content?: Array<{ text?: string }> }> } } }): Array<{ text?: string }> => {
-        const out: Array<{ text?: string }> = []
+      // 收集「超长 tool_result 文本」连同其所属消息，便于截断后按「单条消息」算 token 增量
+      // （与 estimatePayloadTokens 同口径：用 estimateMessageTokens，结果精确且 O(msg) 而非 O(payload)）。
+      type Candidate = { parent: KiroHistoryMessage; item: { text?: string } }
+      const collectFrom = (msg?: KiroHistoryMessage): Candidate[] => {
+        const out: Candidate[] = []
         const trs = msg?.userInputMessage?.userInputMessageContext?.toolResults
         if (trs) for (const tr of trs) for (const c of (tr.content || [])) {
-          if (c.text && c.text.length > TOOL_RESULT_TRUNCATE_LENGTH) out.push(c)
+          if (c.text && c.text.length > TOOL_RESULT_TRUNCATE_LENGTH) out.push({ parent: msg!, item: c })
         }
         return out
       }
-      const candidates: Array<{ text?: string }> = [
-        ...collectTexts(payload.conversationState.currentMessage),
-        ...(payload.conversationState.history || []).flatMap(m => collectTexts(m as { userInputMessage?: { userInputMessageContext?: { toolResults?: Array<{ content?: Array<{ text?: string }> }> } } }))
+      const candidates: Candidate[] = [
+        ...collectFrom(payload.conversationState.currentMessage as KiroHistoryMessage),
+        ...(payload.conversationState.history || []).flatMap(m => collectFrom(m))
       ]
       // 大块优先截断
-      candidates.sort((a, b) => (b.text?.length || 0) - (a.text?.length || 0))
+      candidates.sort((a, b) => (b.item.text?.length || 0) - (a.item.text?.length || 0))
       let truncated = 0
-      for (const c of candidates) {
+      for (const { parent, item } of candidates) {
         if (estTokens <= tokenBudget) break
-        const orig = c.text!.length
-        c.text = `${c.text!.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${orig} chars, trimmed to fit ~${tokenBudget} token limit]`
+        const before = estimateMessageTokens(parent)
+        const orig = item.text!.length
+        item.text = `${item.text!.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${orig} chars, trimmed to fit ~${tokenBudget} token limit]`
         truncated++
-        estTokens = estimatePayloadTokens(payload)
+        // 增量更新：只重算被改的那条消息的 token 差，不再重算整个 payload
+        estTokens += estimateMessageTokens(parent) - before
       }
       if (truncated > 0) {
         console.log(`[KiroPayload] Token-budget truncated ${truncated} large tool results → est ${estTokens.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens (prevents CONTENT_LENGTH 400)`)
