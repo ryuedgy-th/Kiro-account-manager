@@ -479,9 +479,14 @@ export function ProxyPanel() {
       .join('|')
   }, [accounts])
 
-  // 账号集合变化时同步（防抖 600ms + 仅签名变化才触发）
+  // 账号集合变化时同步（防抖 600ms + 仅签名变化才触发；跳过首次 mount 避免每次进页面都同步）
+  const syncMountedRef = useRef(false)
   useEffect(() => {
     if (!isRunning) return
+    if (!syncMountedRef.current) {
+      syncMountedRef.current = true
+      return
+    }
     const timer = setTimeout(() => { void syncAccountsRef.current() }, 600)
     return () => clearTimeout(timer)
   }, [accountsSyncSignature, isRunning])
@@ -514,7 +519,7 @@ export function ProxyPanel() {
   return (
     <div className="space-y-4">
       {/* 状态卡片 */}
-      <Card className="hover-lift">
+      <Card className="hover-lift relative z-10">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -977,13 +982,13 @@ export function ProxyPanel() {
           </div>
 
           {/* 高级配置 — 3 列紧凑布局，描述移到 Label 的 title tooltip */}
-          <div className="border-t border-border pt-3">
+          <div className="border-t border-border pt-3 overflow-visible">
             <h4 className="text-xs font-medium mb-2 text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
               <Settings2 className="h-3.5 w-3.5" />
               {isEn ? 'Advanced Settings' : '高级配置'}
             </h4>
-            <div className="grid grid-cols-3 gap-x-3 gap-y-3 items-start">
-              <div className="space-y-1.5">
+            <div className="grid grid-cols-3 gap-x-3 gap-y-3 items-start overflow-visible">
+              <div className="space-y-1.5 relative z-20">
                 <Label htmlFor="preferredEndpoint" className="text-xs">{isEn ? 'Preferred Endpoint' : '首选端点'}</Label>
                 <Select
                   value={config.preferredEndpoint || ''}

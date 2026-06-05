@@ -271,38 +271,46 @@ const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/${KIRO_CLI_SDK_VERSION} ua/2.1 api
 const AGENT_MODE_SPEC = 'spec' // IDE 模式
 const AGENT_MODE_VIBE = 'vibe' // CLI 模式
 
-const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
-const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+// profileArn 决策中心已迁移到 ../kiroAuthSync，反代和账号管理器主进程共用同一份定义，
+// 防止多处常量漂移。注意 KIRO_BUILDER_ID_PLACEHOLDER_ARN 仍以本模块为出口 re-export，
+// 这样 main/index.ts 等老 import 路径不需要改。
+import {
+  KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
+  KIRO_SOCIAL_PROFILE_ARN,
+  isPlaceholderProfileArn as _isPlaceholderProfileArn
+} from '../kiroAuthSync'
 
-// 占位符 profileArn（历史遗留的假值）——视为"无 profileArn"
-// IdC/Enterprise 账号的真实 profileArn 因 org 而异，必须经 ListAvailableProfiles 获取
-const PLACEHOLDER_PROFILE_ARN = KIRO_BUILDER_ID_PROFILE_ARN
+export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
+export const isPlaceholderProfileArn = _isPlaceholderProfileArn
 
-function isRealProfileArn(arn?: string): arn is string {
-  return !!arn && arn !== PLACEHOLDER_PROFILE_ARN && !arn.includes('AAAACCCCXXXX')
-}
-
-// 解析请求应携带的 profileArn：
-// - 账号已有真实 profileArn → 使用它（IdC/Enterprise 经 ListAvailableProfiles 写入）
-// - 社交登录(Github/Google) → 共享 ARN（真实可用）
-// - 其余无真实值 → 返回 undefined（不携带 profileArn），绝不回退到占位符
-//
-// ⚠️ 仅用于「流式端点」（generateAssistantResponse / SendMessageStreaming）：
-//    这些端点收到占位符 ARN 会返回 403，所以 BuilderId 必须返回 undefined（不携带）。
+/**
+ * 反代调 Kiro API 时使用的 profileArn 决策（流式端点用）。
+ * BuilderId 使用占位符 ARN，Social 使用固定 ARN。常量统一来自 ../kiroAuthSync 防漂移。
+ * 注意：流式端点（generateAssistantResponse / SendMessageStreaming）对占位符 ARN 会 403，
+ * 需在 callKiroApiStream 中额外用 isPlaceholderProfileArn 剥离。
+ */
 function resolveProfileArn(account: ProxyAccount): string | undefined {
-  if (isRealProfileArn(account.profileArn)) return account.profileArn
-  if (account.provider === 'Github' || account.provider === 'Google') return KIRO_SOCIAL_PROFILE_ARN
-  return undefined
+  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
+    return account.profileArn
+  }
+  if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
+    return KIRO_SOCIAL_PROFILE_ARN
+  }
+  return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
 
-// 解析「非流式/只读端点」应携带的 profileArn：
+// 「非流式/只读端点」应携带的 profileArn：
 //   ListAvailableModels / ListAvailableSubscriptions / CreateSubscriptionToken / setUserPreference
 // 这些 AWS 端点要求 profileArn 不能缺省，否则返回 400 "Invalid profileArn."。
 // 与流式端点相反：没有真实 ARN 的 BuilderId 账号必须回退到占位符 ARN（这些端点接受占位符），
-// 否则 BuilderId 账号的模型列表 / 订阅查询会持续 400 失败。
+// 否则 BuilderId 账号的模型列表/订阅查询会持续 400 失败（进而 ctx-window 缓存填不上 → opus 误判 200K）。
+// resolveProfileArn 对 BuilderId 已返回占位符，这里仅兜底（理论上不会命中 ?? 分支）。
 function resolveProfileArnForRead(account: ProxyAccount): string {
-  return resolveProfileArn(account) ?? KIRO_BUILDER_ID_PROFILE_ARN
+  return resolveProfileArn(account) ?? KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
+
+// 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
+export { KIRO_SOCIAL_PROFILE_ARN }
 
 // Agentic 模式系统提示 - 防止大文件写入超时
 const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
@@ -492,7 +500,7 @@ function isCodeWhispererModelId(modelId: string): boolean {
 }
 
 function getModelCacheKey(account: ProxyAccount): string {
-  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account)}`
+  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account) ?? 'no-arn'}`
 }
 
 async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
@@ -1449,10 +1457,9 @@ export async function callKiroApiStream(
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
-      // 仅在解析出真实 profileArn 时才设置；否则保留 payload 原值（可能为空）
-      // 关键修复：旧代码无条件用 resolveProfileArn 覆盖，IdC 账号会被写入占位符导致 403
+      // 流式端点对 BuilderId 占位符 ARN 返回 403，仅传真实 ARN 或 Social ARN
       const resolvedArn = resolveProfileArn(account)
-      if (resolvedArn !== undefined) {
+      if (resolvedArn && !isPlaceholderProfileArn(resolvedArn)) {
         requestPayload.profileArn = resolvedArn
       } else {
         delete requestPayload.profileArn
@@ -2492,7 +2499,8 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   const body = JSON.stringify({ profileArn })
 
   console.log(`[KiroAPI] ListAvailableSubscriptions [${account.email || account.id.slice(0, 8)}]`, {
-    url
+    url,
+    hasProfileArn: profileArn !== undefined
   })
 
   try {
@@ -2539,11 +2547,13 @@ export async function fetchSubscriptionToken(
 
   const profileArn = resolveProfileArnForRead(account)
 
-  // clientToken 是必需参数，需要生成 UUID
+  // clientToken 是必需参数；profileArn 仅在解析出有效值时附带
   const payload: Record<string, string> = {
     clientToken: uuidv4(),
-    profileArn,
     provider: 'STRIPE'
+  }
+  if (profileArn) {
+    payload.profileArn = profileArn
   }
   if (subscriptionType) {
     payload.subscriptionType = subscriptionType
