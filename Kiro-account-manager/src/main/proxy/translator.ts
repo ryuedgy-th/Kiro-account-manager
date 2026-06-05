@@ -606,7 +606,8 @@ export function openaiToKiro(
       conversationId: request.conversation_id,
       context: request.kiro_context
     },
-    additionalModelRequestFields
+    additionalModelRequestFields,
+    request.model // clientModelId：保留 [1m] 等后缀，供裁剪预算按正确 context window 计算
   )
 }
 
@@ -1114,7 +1115,8 @@ export function claudeToKiro(
       conversationId: request.conversation_id,
       context: request.kiro_context
     },
-    additionalModelRequestFields
+    additionalModelRequestFields,
+    request.model // clientModelId：保留 [1m] 等后缀，供裁剪预算按正确 context window 计算
   )
 }
 

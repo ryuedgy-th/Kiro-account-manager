@@ -14,13 +14,23 @@ const SENSITIVE_KEYS = [
   'accesstoken', 'access_token',
   'refreshtoken', 'refresh_token',
   'idtoken', 'id_token',
-  'token', 'bearertoken', 'bearer',
+  'bearertoken', 'bearer',
   'authorization', 'auth',
   'apikey', 'api_key', 'x-api-key',
   'clientsecret', 'client_secret',
   'secret', 'epin', 'cookie', 'set-cookie',
   'proxyauthorization', 'proxy-authorization'
 ]
+
+/** 白名单：这些键虽然名字里含 token 等子串，但本身是安全的计量/统计字段，不应被打码 */
+const SAFE_KEYS = new Set([
+  'inputtokens', 'outputtokens', 'cachetokens',
+  'cachereadtokens', 'cachewritetokens', 'reasoningtokens',
+  'totaltokens', 'maxtokens', 'tokensused', 'tokencount',
+  // fork 专有：Kiro tokenUsage / 内部计量字段
+  'uncachedinputtokens', 'cachereadinputtokens', 'cachewriteinputtokens',
+  'bootstrapinputtokens', 'finaltokens'
+])
 
 /** 仅保留头尾少量字符，中间打码；过短直接全打码 */
 function maskMiddle(value: string, head = 3, tail = 2): string {
@@ -56,6 +66,7 @@ export function redactString(input: string): string {
 
 function isSensitiveKey(key: string): boolean {
   const k = key.toLowerCase().replace(/[_-]/g, '')
+  if (SAFE_KEYS.has(k)) return false
   return SENSITIVE_KEYS.some((s) => k === s.replace(/[_-]/g, '') || k.includes(s.replace(/[_-]/g, '')))
 }
 

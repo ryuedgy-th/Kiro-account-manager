@@ -401,33 +401,54 @@ class IMAPClient {
     })
   }
 
-  private readLine(): Promise<string> {
+  private readLine(timeoutMs = 30000): Promise<string> {
     return new Promise((resolve, reject) => {
       if (!this.socket) return reject(new Error('未连接'))
 
-      const check = (): void => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        this.socket?.removeListener('data', onData)
+        this.socket?.removeListener('error', onError)
+        reject(new Error('IMAP readLine 超时'))
+      }, timeoutMs)
+
+      const done = (line: string): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.socket?.removeListener('data', onData)
+        this.socket?.removeListener('error', onError)
+        resolve(line)
+      }
+
+      const onError = (err: Error): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.socket?.removeListener('data', onData)
+        reject(err)
+      }
+
+      const check = (): boolean => {
         const idx = this.buffer.indexOf('\r\n')
         if (idx >= 0) {
           const line = this.buffer.slice(0, idx)
           this.buffer = this.buffer.slice(idx + 2)
-          resolve(line)
-          return
+          done(line)
+          return true
         }
+        return false
       }
-      check()
+      if (check()) return
 
       const onData = (chunk: Buffer): void => {
         this.buffer += chunk.toString()
-        const idx = this.buffer.indexOf('\r\n')
-        if (idx >= 0) {
-          this.socket!.removeListener('data', onData)
-          const line = this.buffer.slice(0, idx)
-          this.buffer = this.buffer.slice(idx + 2)
-          resolve(line)
-        }
+        check()
       }
       this.socket.on('data', onData)
-      this.socket.once('error', reject)
+      this.socket.once('error', onError)
     })
   }
 

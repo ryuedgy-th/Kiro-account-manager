@@ -426,8 +426,9 @@ export class Registrar {
     this.moduleClient = null
   }
 
-  /** 公共销毁方法，供外部调用释放资源 */
+  /** 公共销毁方法，供外部调用释放资源。同时 abort 所有进行中的异步操作。 */
   async destroy(): Promise<void> {
+    this.abortController.abort()
     await this.cleanup()
   }
 

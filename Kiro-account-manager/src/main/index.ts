@@ -20,6 +20,7 @@ import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, s
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
+import { installCrashDiagnostics, attachWindowDiagnostics, writeCrashLog, getCrashLogPath } from './crashLog'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -1714,6 +1715,20 @@ function createWindow(): void {
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximize-changed', true))
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximize-changed', false))
 
+  // 24/7：renderer/GPU 崩溃落盘 + 自动重载界面（代理服务在主进程，界面崩溃不应让用户看到白屏/空窗）
+  attachWindowDiagnostics(mainWindow, (reason) => {
+    // 'clean-exit' 是正常退出，不重载；其余（crashed/oom/killed 等）尝试重建界面
+    if (reason === 'clean-exit' || isQuitting) return
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        writeCrashLog('RENDERER', `auto-reloading after ${reason}`)
+        mainWindow.webContents.reload()
+      }
+    } catch (e) {
+      writeCrashLog('RENDERER', 'auto-reload failed', e)
+    }
+  })
+
   mainWindow.on('ready-to-show', () => {
     // 设置带版本号的标题（HTML 加载后会覆盖初始标题）
     mainWindow?.setTitle(`Kiro 账号管理器 v${app.getVersion()}`)
@@ -1965,9 +1980,12 @@ process.on('unhandledRejection', (reason) => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  // 24/7 诊断：尽早安装崩溃 / 退出 / 电源事件落盘（main-crash.log），用于排查"应用自己消失"
+  installCrashDiagnostics()
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
+  console.log(`[Main] crash/exit diagnostics → ${getCrashLogPath()}`)
 
   // 注册自定义协议
   registerProtocol()

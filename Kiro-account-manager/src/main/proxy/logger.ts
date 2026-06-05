@@ -386,6 +386,42 @@ export const proxyLogStore = new ProxyLogStore()
 // 单例导出
 export const proxyLogger = new ProxyLogger()
 
+// 把任意错误（含 undici/fetch 的 TypeError）格式化为可诊断的字符串。
+// 背景：网络层错误常见两种"信息黑洞"：
+//   1) `new TypeError('fetch failed')` —— message 只有 'fetch failed'，真正原因在 .cause（ECONNRESET/ETIMEDOUT/证书等）
+//   2) 非 Error 抛出物（如 {}）—— message 为空，console.error 直接打出 "{}"
+// 该 helper 会一并提取 name/code/cause，避免日志里只剩 "{}" 或 "fetch failed" 而无从排查。
+export function formatError(error: unknown): string {
+  if (error == null) return String(error)
+  if (error instanceof Error) {
+    const parts: string[] = []
+    parts.push(`${error.name}: ${error.message || '(empty message)'}`)
+    // Node 网络错误把 errno/code 挂在错误对象上
+    const code = (error as { code?: string }).code
+    if (code) parts.push(`code=${code}`)
+    // undici 'fetch failed' 的真实原因在 cause 里
+    const cause = (error as { cause?: unknown }).cause
+    if (cause !== undefined && cause !== null) {
+      if (cause instanceof Error) {
+        const causeCode = (cause as { code?: string }).code
+        parts.push(`cause=${cause.name}: ${cause.message}${causeCode ? ` (code=${causeCode})` : ''}`)
+      } else {
+        parts.push(`cause=${typeof cause === 'object' ? JSON.stringify(cause) : String(cause)}`)
+      }
+    }
+    return parts.join(' | ')
+  }
+  if (typeof error === 'object') {
+    try {
+      const json = JSON.stringify(error)
+      return json === '{}' ? `[non-Error object: ${Object.prototype.toString.call(error)}]` : json
+    } catch {
+      return Object.prototype.toString.call(error)
+    }
+  }
+  return String(error)
+}
+
 // 拦截主进程 console 输出，自动转发到 proxyLogStore
 // 这样所有 console.log/warn/error 都能在日志页面显示
 let consoleIntercepted = false
