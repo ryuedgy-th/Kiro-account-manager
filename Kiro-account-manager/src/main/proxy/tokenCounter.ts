@@ -203,15 +203,44 @@ function guessContextFromCache(modelId: string): number | undefined {
 }
 
 /**
+ * 解析客户端附加的 context-window 能力后缀，如 "claude-opus-4-8[1m]" → 1_000_000。
+ *
+ * 背景：部分客户端会用 "[1m]" 后缀显式声明本次会话启用了 1M 上下文（beta），并据此用 1M
+ * 作为「分母」计算 autocompact 阈值。多数情况下后端 ListAvailableModels 已对 opus 上报
+ * 1,000,000（经 setModelContextWindow 填进 cache），不必依赖后缀；但有两种场景仍需后缀兜底：
+ *   (1) 冷启动 / ListAvailableModels 403 时 cache 尚未填充，关键词兜底只会给 200K；
+ *   (2) 客户端用 200K 名义模型但显式声明 [1m]。
+ * 此时若 strip 掉 "[1m]" 再查 cache/关键词得到 200K——比客户端分母小 5 倍，导致
+ * contextUsagePercentage 反推出的 inputTokens 偏低 5 倍，客户端永远到不了 autocompact
+ * 阈值（"不 compact 直到撑爆"）。因此后缀必须在 strip 前优先解析。
+ *
+ * 支持 "[1m]" / "[200k]" 等形式（数字 + k/m 单位，大小写不敏感）。
+ */
+function parseCapabilityContextSuffix(modelId: string): number | undefined {
+  const m = modelId.match(/\[(\d+)\s*([km])\]\s*$/i)
+  if (!m) return undefined
+  const value = parseInt(m[1], 10)
+  if (!Number.isFinite(value) || value <= 0) return undefined
+  const unit = m[2].toLowerCase()
+  return unit === 'm' ? value * 1_000_000 : value * 1_000
+}
+
+/**
  * 根据 model ID 返回 context 窗口大小（用于 contextUsagePercentage 反推 inputTokens）。
  *
  * 优先级：
+ *   0. 客户端能力后缀（如 [1m]）——客户端据此算 autocompact 分母，必须最优先且不被 cache 覆盖
  *   1. 直接命中 cache（Kiro 真实拉取的 maxInputTokens，最准确）
  *   2. 模糊匹配 cache（处理 alias ↔ CW 内部 ID 映射）
  *   3. 关键词匹配兜底（cache 未填充时）
  */
 export function getModelContextLength(modelId: string | undefined | null): number {
   if (!modelId) return 200000
+
+  // 0. 客户端能力后缀（[1m] 等）优先于一切：这是客户端用来算 autocompact 阈值的分母，
+  //    必须与之口径一致；cache/关键词得到的后端 200K 在此场景下是错的（见函数注释）。
+  const suffixCtx = parseCapabilityContextSuffix(modelId)
+  if (suffixCtx) return suffixCtx
 
   // 1. 优先用 Kiro 后端真实返回的 maxInputTokens
   const cached = modelContextWindowCache.get(modelId)
@@ -221,10 +250,12 @@ export function getModelContextLength(modelId: string | undefined | null): numbe
   const guessed = guessContextFromCache(modelId)
   if (guessed && guessed > 0) return guessed
 
-  // 3. 关键词匹配兜底（首次请求 cache 未填充时使用）
+  // 3. 关键词匹配兜底（cache 未填充时使用：冷启动 / ListAvailableModels 403）
   const id = modelId.toLowerCase()
 
-  // Claude 系列（默认 200K）
+  // Claude 系列保守兜底 200K。注意：opus 等模型的真实 context window 由 ListAvailableModels
+  // 上报（现为 1,000,000）并经 setModelContextWindow 填进 cache，命中 cache 时走上面的分支；
+  // 这里 200K 仅是 cache 未填充时的下限兜底（宁可偏小，避免反推 inputTokens 虚高触发过早裁剪）。
   if (id.includes('claude-opus-4') || id.includes('claude-sonnet-4') || id.includes('claude-haiku-4')) return 200000
   if (id.includes('claude-3-7') || id.includes('claude-3.7')) return 200000
   if (id.includes('claude-3-5') || id.includes('claude-3.5')) return 200000

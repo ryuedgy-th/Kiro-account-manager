@@ -460,6 +460,21 @@ export interface ApiKeyUsageRecord {
    */
   cacheReadTokens?: number
   cacheWriteTokens?: number
+  /**
+   * 实际向客户扣减的 credit（= credits × 当时的 modelMarkup）。
+   * credits 字段存的是 Kiro 原始计量值；当 markup≠1 时两者不同。
+   * 存这个是为了让 session/历史成本视图与真实 creditBalance 扣减对账一致，
+   * 且事后调整 modelMarkup 不会改写历史显示成本。旧记录无此字段 → 前端回退到 credits。
+   */
+  effectiveCredits?: number
+  /** 记录该 request 时使用的 modelMarkup 倍率（用于审计 / 重算）。旧记录无 → 视为 1。 */
+  markupAtTime?: number
+  /**
+   * 会话分组键（= kiroPayload.conversationState.conversationId，已含 API Key hash 前缀隔离）。
+   * 同一会话的多轮 request 共享同一值，用于把 usageHistory 分组成 session 视图（MaxPlus 风格）。
+   * 旧记录无此字段 → 前端按「单条 = 单 session」或按时间分桶兜底。
+   */
+  sessionId?: string
 }
 
 // API Key 类型
@@ -729,6 +744,19 @@ export interface ProxyConfig {
   deniedIPs?: string[]
   /** 当绑定 host 是 0.0.0.0/外网接口时，是否允许无 API Key 启动（默认 false 拒绝） */
   allowExternalWithoutApiKey?: boolean
+  /**
+   * 是否对外暴露 /admin/* HTTP 管理接口（默认 false = 关闭，返回 404）。
+   * 应用自身的管理界面走 Electron IPC，不依赖此 HTTP 接口；当反代经公共 tunnel 暴露时，
+   * /admin/* 默认开放会让运营方管理面（充值/删客户/改配置）暴露在公网，仅靠 operator key 一道防线。
+   * 仅在确有外部脚本/工具需要远程管理时显式开启，并务必配合强 operator key + tunnel access policy。
+   */
+  adminApiExposed?: boolean
+  /**
+   * /portal/* 与 /admin/* 的 CORS 允许来源白名单（精确 origin，如 "https://kiro.example.com"）。
+   * 留空 = 不对这两条路径发送 Access-Control-Allow-Origin（浏览器跨站脚本无法读取响应）。
+   * 注意：LLM 代理路径（/v1/*）不受此限制，仍发 "*" 以兼容各类客户端 SDK。
+   */
+  portalAllowedOrigins?: string[]
   /** 按 API Key（或匿名时按 IP）的请求频率限制：每分钟最大请求数。0=不限制 */
   rateLimitPerKeyPerMinute?: number
   /** 客户端会话粘性：true 时同一 session hint 总路由到同一账号子集 */

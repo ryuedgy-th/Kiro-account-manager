@@ -15,7 +15,7 @@ import type {
   KiroUsage,
   ProxyAccount
 } from './types'
-import { proxyLogger } from './logger'
+import { proxyLogger, formatError } from './logger'
 import { getKProxyService } from '../kproxy'
 import { getSystemProxy, getDirectPoolAgent, getCachedProxyAgent } from './systemProxy'
 import { isServerWebTool, executeWebToolStructured, type WebToolConfig } from './webTools'
@@ -286,10 +286,22 @@ function isRealProfileArn(arn?: string): arn is string {
 // - 账号已有真实 profileArn → 使用它（IdC/Enterprise 经 ListAvailableProfiles 写入）
 // - 社交登录(Github/Google) → 共享 ARN（真实可用）
 // - 其余无真实值 → 返回 undefined（不携带 profileArn），绝不回退到占位符
+//
+// ⚠️ 仅用于「流式端点」（generateAssistantResponse / SendMessageStreaming）：
+//    这些端点收到占位符 ARN 会返回 403，所以 BuilderId 必须返回 undefined（不携带）。
 function resolveProfileArn(account: ProxyAccount): string | undefined {
   if (isRealProfileArn(account.profileArn)) return account.profileArn
   if (account.provider === 'Github' || account.provider === 'Google') return KIRO_SOCIAL_PROFILE_ARN
   return undefined
+}
+
+// 解析「非流式/只读端点」应携带的 profileArn：
+//   ListAvailableModels / ListAvailableSubscriptions / CreateSubscriptionToken / setUserPreference
+// 这些 AWS 端点要求 profileArn 不能缺省，否则返回 400 "Invalid profileArn."。
+// 与流式端点相反：没有真实 ARN 的 BuilderId 账号必须回退到占位符 ARN（这些端点接受占位符），
+// 否则 BuilderId 账号的模型列表 / 订阅查询会持续 400 失败。
+function resolveProfileArnForRead(account: ProxyAccount): string {
+  return resolveProfileArn(account) ?? KIRO_BUILDER_ID_PROFILE_ARN
 }
 
 // Agentic 模式系统提示 - 防止大文件写入超时
@@ -382,13 +394,24 @@ function normalizeClaudeVersion(modelId: string): string {
 }
 
 /**
- * 规范化模型 ID，用于白名单/费率表比对：剥离客户端能力后缀（如 [1m]）+ 版本短横转点号 + 转小写。
+ * 规范化模型 ID，用于白名单/费率表比对：剥离客户端能力后缀（如 [1m]）+ 版本短横转点号 +
+ * 剥离日期快照后缀（-YYYYMMDD）+ 转小写。
  * 与 mapModelId 不同：不做 alias 映射、也不 fallback 到 default，仅把「同一模型的不同写法」归一，
  * 这样 Claude Code 发来的 "claude-opus-4-8[1m]" 能匹配白名单里的规范名 "claude-opus-4.8"。
+ *
+ * 关键：必须与 mapModelId 的归一口径一致（含日期后缀剥离，见 mapModelId 1b）。否则 Claude Code
+ * 子代理/workflow 默认携带的日期后缀模型（如 "claude-haiku-4-5-20251001"）会 canonicalize 成
+ * 带日期的串，与 allowlist 里勾选的规范名 "claude-haiku-4.5" 比不上 → isModelAllowed 误判 403，
+ * 表现为「勾了 allowlist 后主请求正常、但 subagent/workflow 调模型就被拦」。
  */
 export function canonicalizeModelId(model: string): string {
   const stripped = (model || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
-  return normalizeClaudeVersion(stripped).toLowerCase()
+  let id = normalizeClaudeVersion(stripped).toLowerCase()
+  // 剥离 Claude 日期快照后缀（-YYYYMMDD），仅对 Claude 家族，避免误伤其他模型命名
+  if (/^claude-(sonnet|haiku|opus)-/.test(id)) {
+    id = id.replace(/-\d{8}$/, '')
+  }
+  return id
 }
 
 export function mapModelId(model: string): string {
@@ -1023,8 +1046,13 @@ export function buildKiroPayload(
   profileArn?: string,
   inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number },
   messageOptions?: { cachePoint?: KiroCachePoint | undefined; clientCacheConfig?: unknown; documents?: KiroDocument[]; conversationId?: string; context?: KiroRequestContext },
-  additionalModelRequestFields?: Record<string, unknown>
+  additionalModelRequestFields?: Record<string, unknown>,
+  // 客户端原始 model（含能力后缀如 "[1m]"）。仅用于按正确的 context window 算裁剪预算——
+  // 后端 modelId 已被剥掉后缀，会让 1M 会话误用 200K 预算而过早裁剪 history。
+  clientModelId?: string
 ): KiroPayload {
+  // 裁剪预算按「客户端声明的 context window」算（含 [1m] 后缀），回退到后端 modelId
+  const trimModelId = clientModelId || modelId
   // 构建当前消息
   const finalContent = content.trim() || (toolResults.length > 0 ? '' : 'Continue')
   
@@ -1150,10 +1178,10 @@ export function buildKiroPayload(
   // 例：sonnet-4.5 (200K) → 180K, sonnet-4.5 with 1M beta → 980K
   // 开关关闭时完全跳过，超出 context window 由 Kiro 后端原样返回错误
   if (enableTokenBufferReserve) {
-    const effectiveTokenLimit = getEffectiveTokenLimit(modelId)
+    const effectiveTokenLimit = getEffectiveTokenLimit(trimModelId)
     const tokenTrimResult = trimHistoryByTokens(payload, effectiveTokenLimit)
     if (tokenTrimResult.trimmed > 0) {
-      const modelCtx = getModelContextLength(modelId)
+      const modelCtx = getModelContextLength(trimModelId)
       console.log(`[KiroPayload] Trimmed ${tokenTrimResult.trimmed} oldest history messages by token estimate (≈${tokenTrimResult.finalTokens.toLocaleString()} / ${effectiveTokenLimit.toLocaleString()} tokens [model ctx ${modelCtx.toLocaleString()} - buffer ${tokenBufferReserve.toLocaleString()}], ${tokenTrimResult.iterations} iter)`)
     }
   }
@@ -1197,7 +1225,7 @@ export function buildKiroPayload(
   // → 流式无重试 → 客户端(Claude Code)中断。这里按 token 预算把最大的 tool_result 文本
   // 逐个截断（当前轮 + history 都纳入），直到估算 token 落入预算内。
   {
-    const tokenBudget = getEffectiveTokenLimit(modelId) // 模型 ctx - buffer（ListAvailableModels 失败时回退 opus 200k → 180k）
+    const tokenBudget = getEffectiveTokenLimit(trimModelId) // 模型 ctx - buffer（ListAvailableModels 失败时回退 opus 200k → 180k）
     let estTokens = estimatePayloadTokens(payload)
     if (estTokens > tokenBudget) {
       const collectTexts = (msg?: { userInputMessage?: { userInputMessageContext?: { toolResults?: Array<{ content?: Array<{ text?: string }> }> } } }): Array<{ text?: string }> => {
@@ -1384,15 +1412,35 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw getAbortError(signal)
 }
 
+/**
+ * 判断是否为「连接阶段」的瞬时网络错误（值得在同一 endpoint 重试一次，而非立刻 failover）。
+ * 这些错误发生在 fetch 建连/发送阶段，此时 stream 尚未向客户端写出任何字节，重试是安全的
+ * （parseEventStream 一旦开始就只经 onError 回调、绝不向上抛，故 callKiroApiStream 的 catch
+ * 只会捕获 stream 开始前的错误）。涵盖 undici 的 socket 提前关闭 / EPIPE / 连接重置 / DNS 抖动。
+ */
+export function isTransientNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const codes = ['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT']
+  const cause = (error as { cause?: { code?: string; message?: string } }).cause
+  const code = cause?.code
+  if (code && codes.includes(code)) return true
+  const hay = `${error.message} ${cause?.message || ''}`
+  return /other side closed|socket hang up|terminated|fetch failed|network|ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(hay)
+}
+
 // 调用 Kiro API（流式）
 export async function callKiroApiStream(
   account: ProxyAccount,
   payload: KiroPayload,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
   onComplete: (usage: KiroUsage) => void,
-  onError: (error: Error) => void,
+  onError: (error: Error, partialUsage?: KiroUsage) => void,
   signal?: AbortSignal,
-  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli' | 'kiro-runtime'
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli' | 'kiro-runtime',
+  // 客户端原始 model（含能力后缀如 "[1m]"）。payload 里的 modelId 已被 mapModelId 剥掉后缀
+  // 并映射成 Kiro 后端规范名，无法还原客户端声明的 1M 上下文，故单独透传给 contextUsageEvent
+  // 反推使用——保证「分母」与客户端算 autocompact 阈值时一致（见 getModelContextLength）。
+  clientModelId?: string
 ): Promise<void> {
   const endpoints = getSortedEndpoints(preferredEndpoint)
   let lastError: Error | null = null
@@ -1449,9 +1497,29 @@ export async function callKiroApiStream(
 
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      const response = agent
-        ? await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal } as UndiciRequestInit) as unknown as Response
+      // 同 endpoint 瞬时网络错误重试：Kiro 偶尔在建连阶段提前关 socket（UND_ERR_SOCKET / EPIPE）。
+      // 立刻 failover 到下一个 endpoint 往往切到 format 不同的 CodeWhisperer 或根本没有备用端点；
+      // 对「连接阶段」的瞬时错误先就地重试 1 次（短 backoff）更稳。仅在 stream 尚未开始时安全（见上）。
+      let response: Response | undefined
+      const MAX_CONNECT_ATTEMPTS = 2
+      for (let attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS; attempt++) {
+        try {
+          response = agent
+            ? await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+            : await undiciFetch(endpointUrl, { method: 'POST', headers, body: payloadStr, signal } as UndiciRequestInit) as unknown as Response
+          break
+        } catch (fetchErr) {
+          if (signal?.aborted) throw fetchErr
+          if (attempt < MAX_CONNECT_ATTEMPTS && isTransientNetworkError(fetchErr)) {
+            proxyLogger.warn('KiroAPI', `Endpoint ${endpoint.name} transient connect error (attempt ${attempt}/${MAX_CONNECT_ATTEMPTS}), retrying same endpoint: ${formatError(fetchErr)}`)
+            await new Promise(r => setTimeout(r, 300 * attempt))
+            throwIfAborted(signal)
+            continue
+          }
+          throw fetchErr
+        }
+      }
+      if (!response) throw lastError || new Error(`Endpoint ${endpoint.name} produced no response`)
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
@@ -1478,7 +1546,9 @@ export async function callKiroApiStream(
       // 数 MB 的 base64 附件，对其同步 encode 会阻塞 event loop 让反代卡死。
       // 改为在此用 binary-aware 估算先算好 input token 兜底值（base64 按解码字节折算）。
       const bootstrapInputTokens = estimatePayloadTokens(requestPayload)
-      await parseEventStream(response.body!, onChunk, onComplete, onError, bootstrapInputTokens, signal, requestedModelId)
+      // 反推 inputTokens 用的 model：优先用客户端原始 model（含 [1m] 等能力后缀），
+      // 缺失时回退到 payload 里的后端 modelId。后缀决定 context 分母，必须与客户端一致。
+      await parseEventStream(response.body!, onChunk, onComplete, onError, bootstrapInputTokens, signal, clientModelId || requestedModelId)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1486,7 +1556,7 @@ export async function callKiroApiStream(
         return
       }
       lastError = error as Error
-      console.error(`[KiroAPI] Endpoint ${endpoint.name} failed: ${(error as Error)?.message || String(error)}`)
+      console.error(`[KiroAPI] Endpoint ${endpoint.name} failed: ${formatError(error)}`)
       
       // 如果是认证错误，不继续尝试其他端点
       if ((error as Error).message.includes('Auth error')) {
@@ -1561,7 +1631,7 @@ async function parseEventStream(
   body: ReadableStream<Uint8Array>,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
   onComplete: (usage: KiroUsage) => void,
-  onError: (error: Error) => void,
+  onError: (error: Error, partialUsage?: KiroUsage) => void,
   bootstrapInputTokens: number = 0,  // 调用方预先用 binary-aware 估算的 input token 兜底值
   signal?: AbortSignal,
   modelId?: string         // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
@@ -2071,7 +2141,10 @@ async function parseEventStream(
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     onComplete(usage)
   } catch (error) {
-    onError(signal?.aborted ? getAbortError(signal) : error as Error)
+    // 把已累计的 usage 透传给 onError：流中途断开/报错时，Kiro 可能已发过 meteringEvent
+    // （credits 已产生）。上层据此对已消耗用量结算计费，避免「中途断 = 白嫖」的漏计费。
+    // 注意：onComplete 与此 catch 互斥（onComplete 成功则不进 catch），故不会与正常结算重复计费。
+    onError(signal?.aborted ? getAbortError(signal) : error as Error, usage)
   } finally {
     signal?.removeEventListener('abort', abort)
     reader.releaseLock()
@@ -2330,8 +2403,8 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      const modelsProfileArn = resolveProfileArn(account)
-      if (modelsProfileArn) params.set('profileArn', modelsProfileArn)
+      const modelsProfileArn = resolveProfileArnForRead(account)
+      params.set('profileArn', modelsProfileArn)
       if (nextToken) params.set('nextToken', nextToken)
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
@@ -2342,6 +2415,11 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       if (!response.ok) {
         const body = await response.text().catch(() => '')
         console.error(`[KiroAPI] ListAvailableModels failed: ${response.status} ${body.slice(0, 300)}`)
+        // 401/403：token 被撤销/轮换。抛出可识别的 Auth error，让上层 refresh + 重试一次
+        // （否则静默 return [] 会让 ctx-window 缓存填不上 → opus 误判 200K，且 /v1/models 变空）。
+        if (response.status === 401 || response.status === 403) {
+          throw new Error(`Auth error ${response.status}: ${body.slice(0, 200)}`)
+        }
         break
       }
 
@@ -2353,6 +2431,8 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     return allModels
   } catch (error) {
     if (signal?.aborted) throw getAbortError(signal)
+    // Auth error 需上抛给调用方做 refresh + 重试（见 ProxyServer.fetchKiroModelsWithRefresh）
+    if (error instanceof Error && error.message.startsWith('Auth error')) throw error
     console.error('[KiroAPI] ListAvailableModels error:', error)
     return allModels.length > 0 ? allModels : []
   }
@@ -2408,7 +2488,7 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
     'amz-sdk-request': 'attempt=1; max=1'
   }
 
-  const profileArn = resolveProfileArn(account)
+  const profileArn = resolveProfileArnForRead(account)
   const body = JSON.stringify({ profileArn })
 
   console.log(`[KiroAPI] ListAvailableSubscriptions [${account.email || account.id.slice(0, 8)}]`, {
@@ -2457,12 +2537,12 @@ export async function fetchSubscriptionToken(
     'amz-sdk-request': 'attempt=1; max=1'
   }
 
-  const profileArn = resolveProfileArn(account)
+  const profileArn = resolveProfileArnForRead(account)
 
   // clientToken 是必需参数，需要生成 UUID
   const payload: Record<string, string> = {
     clientToken: uuidv4(),
-    ...(profileArn ? { profileArn } : {}),
+    profileArn,
     provider: 'STRIPE'
   }
   if (subscriptionType) {
@@ -2504,7 +2584,7 @@ export async function setUserPreference(
     'amz-sdk-request': 'attempt=1; max=1'
   }
 
-  const profileArn = resolveProfileArn(account)
+  const profileArn = resolveProfileArnForRead(account)
   const body = JSON.stringify({
     overageConfiguration: { overageStatus },
     profileArn

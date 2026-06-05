@@ -21,7 +21,7 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, canonicalizeModelId, type KiroModel, type WebToolSearchRecord } from './kiroApi'
-import { proxyLogger } from './logger'
+import { proxyLogger, formatError } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -85,7 +85,7 @@ function buildWebSearchContentBlocks(searches: WebToolSearchRecord[]): ClaudeCon
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
-  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void
+  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; sessionId?: string }) => void
   onError?: (error: Error) => void
   onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
@@ -399,6 +399,8 @@ export class ProxyServer {
   private webhookTrigger?: (event: string, payload: Record<string, unknown>) => void
   /** 定期清理 timer */
   private cleanupTimer: NodeJS.Timeout | null = null
+  /** 冷启动预热 ctx-window 缓存的重试 timer（见 warmModelContextCache） */
+  private warmCacheTimer: NodeJS.Timeout | null = null
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -558,6 +560,17 @@ export class ProxyServer {
       }
     }
 
+    // 安全提示：门户启用但未启用 TLS。门户用 Bearer session token + 明文密码登录；若 origin 经
+    // 非加密 hop 暴露（裸 HTTP / 某些 tunnel 不加密 edge→origin），token/密码会被中途截获。
+    // 推荐：依赖 Cloudflare Tunnel（client→edge 强制 HTTPS）且不要再在 origin 前串接明文 HTTP 跳。
+    if (this.config.portalEnabled && !this.config.tls?.enabled) {
+      console.warn('[ProxyServer] [Security] Portal enabled over plain HTTP: session tokens & passwords are unencrypted on the wire. Rely on a TLS-terminating tunnel (e.g. Cloudflare) and avoid any extra cleartext HTTP hop.')
+    }
+    // 安全提示：/admin/* 对外暴露 + 经公网时，管理面（充值/删客户/改配置）仅靠 operator key 一道防线。
+    if (this.config.adminApiExposed === true) {
+      console.warn('[ProxyServer] [Security] adminApiExposed=true: /admin/* is reachable over HTTP. Ensure a strong operator key and restrict access at the tunnel/proxy layer.')
+    }
+
     return new Promise((resolve, reject) => {
       this.isStopping = false
       const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => 
@@ -648,6 +661,9 @@ export class ProxyServer {
         }
         this.events.onStatusChange?.(true, this.config.port)
         resolve()
+        // 预热 ctx-window 缓存（fire-and-forget，带退避重试）：让首个请求就能拿到正确的
+        // context window（如 opus=1,000,000），避免冷窗口内反推 inputTokens 偏低 5 倍。
+        this.warmModelContextCache()
       })
 
       // D4 启用 TLS 时同时监听 HTTP fallback 端口（如果配置了 fallbackPort）
@@ -668,6 +684,52 @@ export class ProxyServer {
         this.fallbackServer = fallback
       }
     })
+  }
+
+  /**
+   * 冷启动预热：在 server 开始监听后立即填充 modelContextWindowCache（modelId → maxInputTokens），
+   * 供 contextUsageEvent 反推 inputTokens 与 token 裁剪预算使用。
+   *
+   * 背景（data-backed）：该缓存原本只在首次有人请求 /v1/models 时才由 getAvailableModels()
+   * 懒填充。在那之前，opus 等模型走关键词兜底 → 200K，而 Kiro 后端实际对 opus 上报 1,000,000。
+   * 于是 contextUsagePercentage 反推出的 inputTokens 偏低 5 倍，Claude Code 永远到不了 autocompact
+   * 阈值（"不 compact 直到撑爆"）。预热把这个冷窗口收敛到启动瞬间。
+   *
+   * 冷启动账号可能尚未同步进 pool（index.ts 有最多 ~10s 的 setAccounts 重试），故这里带退避重试：
+   * getAvailableModels() 拿不到账号会返回空且不缓存，重试直到缓存被真正填充或达到上限。
+   * fire-and-forget，绝不阻塞 start()。
+   */
+  private warmModelContextCache(): void {
+    if (this.warmCacheTimer) { clearTimeout(this.warmCacheTimer); this.warmCacheTimer = null }
+    const maxAttempts = 6           // 1s,2s,4s,8s,16s,32s ≈ 覆盖 index.ts 的账号同步重试窗口
+    const attempt = (n: number): void => {
+      if (this.isStopping || !this.server) return
+      this.getAvailableModels()
+        .then(({ models, fromCache }) => {
+          if (this.isStopping || !this.server) return
+          // models 非空即说明 setModelContextWindow 已被填充（见 getAvailableModels）。
+          if (models.length > 0) {
+            proxyLogger.info('ProxyServer', `Warmed model context-window cache (${models.length} models${fromCache ? ', from cache' : ''})`)
+            return
+          }
+          if (n < maxAttempts) {
+            this.warmCacheTimer = setTimeout(() => attempt(n + 1), Math.min(32_000, 1000 * 2 ** (n - 1)))
+            this.warmCacheTimer.unref?.()
+          } else {
+            proxyLogger.debug('ProxyServer', 'Warm cache: no models after retries; will lazy-fill on first /v1/models hit')
+          }
+        })
+        .catch((err) => {
+          if (this.isStopping || !this.server) return
+          if (n < maxAttempts) {
+            this.warmCacheTimer = setTimeout(() => attempt(n + 1), Math.min(32_000, 1000 * 2 ** (n - 1)))
+            this.warmCacheTimer.unref?.()
+          } else {
+            proxyLogger.debug('ProxyServer', `Warm cache failed after retries: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        })
+    }
+    attempt(1)
   }
 
   // 获取 TLS 配置选项
@@ -770,6 +832,7 @@ export class ProxyServer {
         this.activeRequests.clear()
         this.sockets.clear()
         if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
+        if (this.warmCacheTimer) { clearTimeout(this.warmCacheTimer); this.warmCacheTimer = null }
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }
@@ -1250,6 +1313,33 @@ export class ProxyServer {
     }
   }
 
+  /**
+   * fetchKiroModels + 401/403 自愈：token 被外部 Kiro IDE 轮换后，原 accessToken 会 403。
+   * 静默失败会让 ctx-window 缓存填不上（opus 误判 200K）且 /v1/models 变空，故这里 refresh 一次再重试。
+   * 非 auth 错误（网络/超时）原样上抛，由调用方既有 try/catch 处理。
+   */
+  private async fetchKiroModelsWithRefresh(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
+    try {
+      return await fetchKiroModels(account, signal)
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      const msg = error instanceof Error ? error.message : String(error)
+      if (!msg.startsWith('Auth error')) throw error
+      // 401/403 → refresh token 一次再重试
+      const full = this.accountPool.getAccount(account.id) || account
+      let refreshed = false
+      try {
+        refreshed = await this.refreshToken(full, signal)
+      } catch (refreshErr) {
+        console.error('[ProxyServer] Token refresh for model fetch failed:', formatError(refreshErr))
+      }
+      if (!refreshed) throw error
+      const fresh = this.accountPool.getAccount(account.id) || full
+      console.log('[ProxyServer] Retrying ListAvailableModels after token refresh')
+      return await fetchKiroModels(fresh, signal)
+    }
+  }
+
   async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
     const now = Date.now()
     
@@ -1268,7 +1358,7 @@ export class ProxyServer {
       }
 
       try {
-        kiroModels = await fetchKiroModels(account, signal)
+        kiroModels = await this.fetchKiroModelsWithRefresh(account, signal)
         if (kiroModels.length > 0) {
           this.modelCache = { models: kiroModels, timestamp: now }
           // 同步到 kiroApi 的 ctx cache, 供 token 裁剪逻辑使用
@@ -1835,7 +1925,10 @@ export class ProxyServer {
   private validateAdminApiKey(req: http.IncomingMessage): boolean {
     const hasApiKeys = !!(this.config.apiKeys && this.config.apiKeys.length > 0)
     const hasLegacyKey = !!this.config.apiKey
-    if (!hasApiKeys && !hasLegacyKey) return true // 未配置任何 Key：沿用旧行为（开放）
+    // 安全：管理接口 fail-closed。未配置任何 Key 时拒绝 admin（旧行为是放行，会让暴露在
+    // 公网 tunnel 上的 /admin/* 完全无防护）。普通 LLM 端点的「无 Key=开放」逻辑见 validateApiKey，
+    // 此处仅约束管理面。
+    if (!hasApiKeys && !hasLegacyKey) return false
 
     const authHeader = req.headers['authorization'] || ''
     const apiKeyHeader = (req.headers['x-api-key'] as string) || ''
@@ -2006,7 +2099,7 @@ export class ProxyServer {
     }
   }
 
-  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string, effort?: string, cacheReadTokens?: number, cacheWriteTokens?: number): void {
+  recordApiKeyUsage(apiKeyId: string, credits: number, inputTokens: number, outputTokens: number, model?: string, path?: string, effort?: string, cacheReadTokens?: number, cacheWriteTokens?: number, sessionId?: string): void {
     if (!this.config.apiKeys) return
     const apiKey = this.config.apiKeys.find(k => k.id === apiKeyId)
     if (!apiKey) return
@@ -2065,6 +2158,8 @@ export class ProxyServer {
     if (!apiKey.usageHistory) {
       apiKey.usageHistory = []
     }
+    // markup 在此算一次，record 与 balance 扣减共用同一值，保证对账一致
+    const markup = this.modelMarkupFor(model)
     apiKey.usageHistory.unshift({
       timestamp: now,
       model: model || 'unknown',
@@ -2074,7 +2169,10 @@ export class ProxyServer {
       path: path || 'unknown',
       effort: effortKey,
       cacheReadTokens: cacheRead,
-      cacheWriteTokens: cacheWrite
+      cacheWriteTokens: cacheWrite,
+      effectiveCredits: credits * markup,
+      markupAtTime: markup,
+      sessionId: sessionId || undefined
     })
     if (apiKey.usageHistory.length > 100) {
       apiKey.usageHistory = apiKey.usageHistory.slice(0, 100)
@@ -2086,7 +2184,7 @@ export class ProxyServer {
     if (apiKey.customerId && credits > 0 && this.config.customers) {
       const customer = this.config.customers.find(c => c.id === apiKey.customerId)
       if (customer) {
-        customer.creditBalance -= credits * this.modelMarkupFor(model)
+        customer.creditBalance -= credits * markup
       }
     }
 
@@ -2106,13 +2204,14 @@ export class ProxyServer {
     usage: { credits?: number; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number },
     model: string | undefined,
     path: string,
-    effort?: string
+    effort?: string,
+    sessionId?: string
   ): void {
     const credits = usage.credits || 0
     if (credits <= 0 && usage.inputTokens <= 0 && usage.outputTokens <= 0) return
     this.accountPool.recordSuccess(accountId, usage.inputTokens + usage.outputTokens)
     if (matchedApiKey) {
-      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path, effort, usage.cacheReadTokens, usage.cacheWriteTokens)
+      this.recordApiKeyUsage(matchedApiKey.id, credits, usage.inputTokens, usage.outputTokens, model, path, effort, usage.cacheReadTokens, usage.cacheWriteTokens, sessionId)
     }
   }
 
@@ -2221,7 +2320,7 @@ export class ProxyServer {
 
     // CORS 预检
     if (method === 'OPTIONS') {
-      this.setCorsHeaders(res)
+      this.setCorsHeaders(res, path, req)
       res.writeHead(204)
       res.end()
       req.off('aborted', abortRequest)
@@ -2231,7 +2330,7 @@ export class ProxyServer {
     }
 
     try {
-      this.setCorsHeaders(res)
+      this.setCorsHeaders(res, path, req)
 
       // P0-4 IP 访问控制（健康检查也走，防止扫描器）
       const ipCheck = this.isClientIPAllowed(clientIP)
@@ -2317,8 +2416,13 @@ export class ProxyServer {
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
         res.end(this.renderPrometheusMetrics())
       } else if (pathWithoutQuery.startsWith('/admin/')) {
-        // 管理 API 端点
-        await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
+        // 管理 API 端点。默认对外关闭（adminApiExposed!==true → 404，与「无此路由」无差别，
+        // 不向公网透露其存在）。应用自身管理界面走 Electron IPC，不依赖此 HTTP 接口，故关闭无副作用。
+        if (this.config.adminApiExposed !== true) {
+          this.sendError(res, 404, `Not Found: ${pathWithoutQuery}`)
+        } else {
+          await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
+        }
       } else if (pathWithoutQuery === '/portal' || pathWithoutQuery === '/portal/') {
         // 客户门户页面（静态 HTML）
         if (!this.config.portalEnabled) {
@@ -3681,7 +3785,7 @@ export class ProxyServer {
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold',
       'portalEnabled', 'portalSessionTtlHours', 'portalDefaultMaxKeys',
-      'portalGoogleEnabled', 'googleClientId'
+      'portalGoogleEnabled', 'googleClientId', 'adminApiExposed', 'portalAllowedOrigins'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 也排除：customers / portalSessionSecret —— 含密码哈希与签名密钥，仅本地 IPC / 专用 admin 端点改
     ]
@@ -3703,7 +3807,24 @@ export class ProxyServer {
   }
 
   // 设置 CORS 头
-  private setCorsHeaders(res: http.ServerResponse): void {
+  private setCorsHeaders(res: http.ServerResponse, path?: string, req?: http.IncomingMessage): void {
+    const p = (path || '').split('?')[0]
+    const isSensitive = p.startsWith('/admin/') || p === '/admin' || p.startsWith('/portal')
+    if (isSensitive) {
+      // 管理面 / 门户：不发通配 origin。仅当请求 Origin 命中白名单才回显该 origin（带 Vary: Origin）。
+      // 防止任意网站用浏览器脚本读取 portal/admin 的响应（凭证/客户数据）。
+      const origin = (req?.headers['origin'] as string) || ''
+      const allow = this.config.portalAllowedOrigins || []
+      if (origin && allow.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin)
+        res.setHeader('Vary', 'Origin')
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key')
+      }
+      // 未命中白名单：不设任何 CORS 头（同源仍可用；跨源浏览器读不到）
+      return
+    }
+    // LLM 代理路径（/v1/* 等）：保留通配，兼容各类客户端 SDK（无 cookie，凭证走 header）
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch')
@@ -3961,7 +4082,7 @@ export class ProxyServer {
             (usage) => {
               if (signal?.aborted || this.isResponseClosed(res)) {
                 // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
-                this.settleAbortedUsage(matchedApiKey, account.id, usage, modelId, '/v1beta/models')
+                this.settleAbortedUsage(matchedApiKey, account.id, usage, openaiRequest.model, '/v1beta/models', ProxyServer.deriveEffortLevel(geminiReq), kiroPayload.conversationState.conversationId)
                 resolve()
                 return
               }
@@ -3974,16 +4095,26 @@ export class ProxyServer {
               this.stats.outputTokens += usage.outputTokens
               this.stats.totalCredits += usage.credits || 0
               this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+              const respTime = Date.now() - startTime
+              this.events.onResponse?.({ path: '/v1beta/models', model: openaiRequest.model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
+              this.recordRequest({ path: '/v1beta/models', model: openaiRequest.model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
+              // 记录 API Key 用量（缺失会导致 Gemini 流式正常结束时不计费，而中断却计费——激励反向）
+              if (matchedApiKey) {
+                this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, openaiRequest.model, '/v1beta/models', ProxyServer.deriveEffortLevel(geminiReq), usage.cacheReadTokens, usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
+              }
               resolve()
             },
-            (error) => {
+            (error, partialUsage) => {
               if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+                if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, openaiRequest.model, '/v1beta/models', ProxyServer.deriveEffortLevel(geminiReq), kiroPayload.conversationState.conversationId)
                 resolve()
                 return
               }
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
               res.end()
               this.recordRequestFailed()
+              // mid-stream 报错但 Kiro 已计 credit：结算已消耗用量，防漏计费
+              if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, openaiRequest.model, '/v1beta/models', ProxyServer.deriveEffortLevel(geminiReq), kiroPayload.conversationState.conversationId)
               resolve()
             },
             signal,
@@ -4003,11 +4134,22 @@ export class ProxyServer {
         this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        this.stats.inputTokens += result.usage.inputTokens
+        this.stats.outputTokens += result.usage.outputTokens
+        this.stats.totalCredits += result.usage.credits || 0
+        this.accountPool.recordSuccess(account.id, result.usage.inputTokens + result.usage.outputTokens)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
           usageMetadata: { promptTokenCount: result.usage.inputTokens, candidatesTokenCount: result.usage.outputTokens, totalTokenCount: result.usage.inputTokens + result.usage.outputTokens }
         }))
+        const respTime = Date.now() - startTime
+        this.events.onResponse?.({ path: '/v1beta/models', model: openaiRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
+        this.recordRequest({ path: '/v1beta/models', model: openaiRequest.model, accountId: account.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+        // 记录 API Key 用量（旧实现只更新 totalTokens，导致 Gemini 非流式既不计费也无日志）
+        if (matchedApiKey) {
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, openaiRequest.model, '/v1beta/models', ProxyServer.deriveEffortLevel(geminiReq), result.usage.cacheReadTokens, result.usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
+        }
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1beta', modelId, startTime, signal)
@@ -4096,7 +4238,7 @@ export class ProxyServer {
       const account = this.accountPool.getNextAccount()
       if (account) {
         try {
-          kiroModels = await fetchKiroModels(account, signal)
+          kiroModels = await this.fetchKiroModelsWithRefresh(account, signal)
           if (kiroModels.length > 0) {
             this.modelCache = { models: kiroModels, timestamp: now }
             // 同步到 kiroApi 的 ctx cache, 供 token 裁剪逻辑使用
@@ -4289,11 +4431,11 @@ export class ProxyServer {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
         const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
         this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         // 记录 API Key 用量
         if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions', ProxyServer.deriveEffortLevel(request), result.usage.cacheReadTokens, result.usage.cacheWriteTokens)
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions', ProxyServer.deriveEffortLevel(request), result.usage.cacheReadTokens, result.usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
         }
       }
     } catch (error) {
@@ -4417,10 +4559,10 @@ export class ProxyServer {
         this.stats.outputTokens += result.usage.outputTokens
         this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
         const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, sessionId: affinityHintResp })
         this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
         if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest), result.usage.cacheReadTokens, result.usage.cacheWriteTokens)
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest), result.usage.cacheReadTokens, result.usage.cacheWriteTokens, affinityHintResp)
         }
         return
       }
@@ -4448,10 +4590,10 @@ export class ProxyServer {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
       const respTime = Date.now() - startTime
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, sessionId: affinityHintResp })
       this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
       if (matchedApiKey) {
-        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest), result.usage.cacheReadTokens, result.usage.cacheWriteTokens)
+        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses', ProxyServer.deriveEffortLevel(chatRequest), result.usage.cacheReadTokens, result.usage.cacheWriteTokens, affinityHintResp)
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
@@ -4471,7 +4613,8 @@ export class ProxyServer {
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
-    effort?: string
+    effort?: string,
+    authRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -4485,8 +4628,10 @@ export class ProxyServer {
     let toolCallIndex = 0
     const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
     let collectedContent = ''
-    // 发送初始 chunk（仅首轮）
-    if (currentRound === 0) {
+    // 是否已向客户端发出真实内容（文本/思考/工具）——auth 重试只在「尚未发出真实内容」时安全
+    let sentRealContent = false
+    // 发送初始 chunk（仅首轮；auth 重试时不重发，避免重复 role chunk）
+    if (currentRound === 0 && !authRetried) {
       const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
       res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
     }
@@ -4498,6 +4643,7 @@ export class ProxyServer {
         (text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
           if (text && text.trim()) {
+            sentRealContent = true
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
               const chunk = createOpenaiStreamChunk(id, model, { reasoning_content: text })
@@ -4510,6 +4656,7 @@ export class ProxyServer {
             }
           }
           if (toolUse) {
+            sentRealContent = true
             const idx = toolCallIndex++
             const restoredToolUse = toolNameRegistry.restoreToolUse(toolUse)
             pendingToolCalls.set(toolUse.toolUseId, {
@@ -4534,7 +4681,7 @@ export class ProxyServer {
         async (usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
-            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/chat/completions', effort)
+            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/chat/completions', effort, kiroPayload.conversationState.conversationId)
             resolve()
             return
           }
@@ -4551,11 +4698,11 @@ export class ProxyServer {
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
           this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
           const oaiRespTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
+          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime, sessionId: kiroPayload.conversationState.conversationId })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions', effort, usage.cacheReadTokens, usage.cacheWriteTokens)
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions', effort, usage.cacheReadTokens, usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
           }
 
           // 发送结束 chunk（包含完整 usage 信息）
@@ -4586,24 +4733,66 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error) => {
+        async (error, partialUsage) => {
           if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+            // 客户端断开但 Kiro 可能已计 credit：结算已消耗用量，防漏计费
+            if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, model, '/v1/chat/completions', effort, kiroPayload.conversationState.conversationId)
             resolve()
             return
           }
-          console.error('[ProxyServer] Stream error:', error)
+
+          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
+          const statusNum = errStatusCode ? parseInt(errStatusCode) : 0
+
+          // 401/403 自愈：token 被服务端撤销/轮换（常见于同账号被外部 Kiro IDE 轮换 refreshToken）。
+          // 仅在「尚未向客户端发出真实内容」且「本请求未重试过」时安全——此时刷新 token 后可
+          // 透明地重跑整个 stream，客户端无感知。已发出内容则无法回退，只能照常报错。
+          if (
+            (statusNum === 401 || statusNum === 403) &&
+            !authRetried &&
+            !sentRealContent &&
+            !signal?.aborted &&
+            !this.isResponseClosed(res)
+          ) {
+            console.log(`[ProxyServer] Stream auth error ${statusNum} before content; refreshing token and retrying once`)
+            let refreshed = false
+            const fullAccount = this.accountPool.getAccount(account.id)
+            try {
+              if (fullAccount) refreshed = await this.refreshToken(fullAccount, signal)
+            } catch (refreshErr) {
+              console.error('[ProxyServer] Token refresh during stream failed:', formatError(refreshErr))
+            }
+            if (signal?.aborted || this.isResponseClosed(res)) {
+              resolve()
+              return
+            }
+            if (refreshed) {
+              const refreshedAccount = this.accountPool.getAccount(account.id) || account
+              // 重跑整个 stream：headersSent=true 不重写响应头，authRetried=true 不重发 role chunk
+              this.handleOpenAIStream(
+                res, refreshedAccount as typeof account, kiroPayload, model, startTime,
+                currentRound, id, true, matchedApiKey, toolNameRegistry, signal, effort, true
+              ).then(resolve).catch(() => resolve())
+              return
+            }
+            // 刷新失败 → 落到下方常规错误处理，记账并切断该账号
+          }
+
+          console.error('[ProxyServer] Stream error:', formatError(error))
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          this.accountPool.recordError(account.id, errStatusCode ? classifyError(statusNum) : ErrorType.RECOVERABLE, errStatusCode ? statusNum : undefined)
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          // mid-stream 报错但 Kiro 已计 credit（meteringEvent 先于断开）：结算已消耗用量，防漏计费
+          if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, model, '/v1/chat/completions', effort, kiroPayload.conversationState.conversationId)
           resolve()
         },
         signal,
-        this.config.preferredEndpoint
+        this.config.preferredEndpoint,
+        model // clientModelId：保留 [1m] 后缀，让 contextUsageEvent 反推用正确的 context 分母
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -4780,8 +4969,12 @@ export class ProxyServer {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
         const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
         this.recordRequest({ path: '/v1/messages', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+        // 记录 API Key 用量（与 /v1/chat/completions 非流式一致；缺失会导致非流式 Anthropic 客户端不计费）
+        if (matchedApiKey) {
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/messages', ProxyServer.deriveEffortLevel(request), result.usage.cacheReadTokens, result.usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
+        }
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
@@ -4837,10 +5030,10 @@ export class ProxyServer {
     this.events.onCreditsUpdate?.(this.stats.totalCredits)
     this.accountPool.recordSuccess(account.id, loop.usage.inputTokens + loop.usage.outputTokens)
     const respTime = Date.now() - startTime
-    this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: loop.usage.inputTokens + loop.usage.outputTokens, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime })
+    this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: loop.usage.inputTokens + loop.usage.outputTokens, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
     this.recordRequest({ path: '/v1/messages', model: request.model, accountId: account.id, inputTokens: loop.usage.inputTokens, outputTokens: loop.usage.outputTokens, credits: loop.usage.credits, responseTime: respTime, success: true })
     if (matchedApiKey) {
-      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages', ProxyServer.deriveEffortLevel(request), loop.usage.cacheReadTokens, loop.usage.cacheWriteTokens)
+      this.recordApiKeyUsage(matchedApiKey.id, loop.usage.credits || 0, loop.usage.inputTokens, loop.usage.outputTokens, request.model, '/v1/messages', ProxyServer.deriveEffortLevel(request), loop.usage.cacheReadTokens, loop.usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
     }
 
     if (!request.stream) {
@@ -4928,7 +5121,8 @@ export class ProxyServer {
     // 再在网络 RTT 期间调用它计算并发出 message_start——同步开销与网络往返重叠。
     prepareCache?: () => { estimatedInputTokens: number; cacheProfile: unknown; cacheUsage: { cacheCreationInputTokens: number; cacheReadInputTokens: number } },
     // client ที่ขอมา (จาก request.max_tokens) — ใช้ตรวจ truncation เพื่อรายงาน stop_reason='max_tokens'
-    maxTokens?: number
+    maxTokens?: number,
+    authRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -4945,6 +5139,9 @@ export class ProxyServer {
     let pendingThinkingSignature: string | undefined
     let collectedContent = ''
     const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> = new Map()
+    // 是否已向客户端发出真实内容（文本/思考/工具/redacted）——auth 重试只在「尚未发出真实内容」时安全。
+    // 注意：message_start（ensureStarted）不算真实内容，重试时无需回退它。
+    let sentRealContent = false
 
     const flushThinkingSignature = () => {
       if (!pendingThinkingSignature) return
@@ -5013,6 +5210,8 @@ export class ProxyServer {
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          // 标记：一旦有真实内容（文本/思考/工具/redacted）即不可再透明重试
+          if (redactedContent || (text && text.trim()) || toolUse) sentRealContent = true
           ensureStarted() // message_start 必须先于任何 content delta（幂等）
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
           if (redactedContent) {
@@ -5138,7 +5337,7 @@ export class ProxyServer {
         async (usage) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             // 客户端已断开：仍按已消耗用量给客户计费，防白嫖
-            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/messages', effort)
+            this.settleAbortedUsage(matchedApiKey, account.id, usage, model, '/v1/messages', effort, kiroPayload.conversationState.conversationId)
             resolve()
             return
           }
@@ -5170,11 +5369,11 @@ export class ProxyServer {
           this.stats.cacheWriteTokens += usage.cacheWriteTokens || simCache?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simCache?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
+          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simCache?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort, usage.cacheReadTokens || simCache?.cacheReadInputTokens, usage.cacheWriteTokens || simCache?.cacheCreationInputTokens)
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort, usage.cacheReadTokens || simCache?.cacheReadInputTokens, usage.cacheWriteTokens || simCache?.cacheCreationInputTokens, kiroPayload.conversationState.conversationId)
           }
 
           // 成功后更新 prompt cache tracker
@@ -5205,12 +5404,51 @@ export class ProxyServer {
           res.end()
           resolve()
         },
-        (error) => {
+        async (error, partialUsage) => {
           if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+            // 客户端断开但 Kiro 可能已计 credit：结算已消耗用量，防漏计费
+            if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, model, '/v1/messages', effort, kiroPayload.conversationState.conversationId)
             resolve()
             return
           }
-          console.error('[ProxyServer] Stream error:', error)
+
+          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
+          const statusNum2 = errStatusCode2 ? parseInt(errStatusCode2) : 0
+
+          // 401/403 自愈：token 被服务端撤销/轮换。仅在「未发出真实内容」且「未重试过」时透明重跑整个 stream。
+          // message_start 已发出无妨——Anthropic 客户端允许 message_start 后跟随完整内容；重试用 headersSent=true
+          // 不重写响应头，authRetried=true 透传给重试分支（重试自身不再 retry）。
+          if (
+            (statusNum2 === 401 || statusNum2 === 403) &&
+            !authRetried &&
+            !sentRealContent &&
+            !signal?.aborted &&
+            !this.isResponseClosed(res)
+          ) {
+            console.log(`[ProxyServer] Claude stream auth error ${statusNum2} before content; refreshing token and retrying once`)
+            let refreshed = false
+            const fullAccount = this.accountPool.getAccount(account.id)
+            try {
+              if (fullAccount) refreshed = await this.refreshToken(fullAccount, signal)
+            } catch (refreshErr) {
+              console.error('[ProxyServer] Token refresh during stream failed:', formatError(refreshErr))
+            }
+            if (signal?.aborted || this.isResponseClosed(res)) {
+              resolve()
+              return
+            }
+            if (refreshed) {
+              const refreshedAccount = this.accountPool.getAccount(account.id) || account
+              this.handleClaudeStream(
+                res, refreshedAccount as typeof account, kiroPayload, model, startTime,
+                currentRound, id, true, currentBlockIndex, matchedApiKey, toolNameRegistry, signal,
+                simCache, promptInputTokens, effort, undefined, maxTokens, true
+              ).then(resolve).catch(() => resolve())
+              return
+            }
+          }
+
+          console.error('[ProxyServer] Stream error:', formatError(error))
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
           })
@@ -5218,14 +5456,16 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(statusNum2) : ErrorType.RECOVERABLE, errStatusCode2 ? statusNum2 : undefined)
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          // mid-stream 报错但 Kiro 已计 credit（meteringEvent 先于断开）：结算已消耗用量，防漏计费
+          if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, model, '/v1/messages', effort, kiroPayload.conversationState.conversationId)
           resolve()
         },
         signal,
-        this.config.preferredEndpoint
+        this.config.preferredEndpoint,
+        model // clientModelId：保留 [1m] 后缀，让 contextUsageEvent 反推用正确的 context 分母
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           const errorEvent = createClaudeStreamEvent('error', {
