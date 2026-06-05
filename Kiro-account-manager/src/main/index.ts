@@ -1704,7 +1704,9 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      // 24/7：禁用后台节流，确保最小化/失焦/托盘时 token 自动刷新、余额检查、自动保存等定时器照常运行
+      backgroundThrottling: false
     }
   })
 
@@ -1949,6 +1951,15 @@ function handleProtocolUrl(url: string): void {
     console.error('Failed to parse protocol URL:', error)
   }
 }
+
+// 24/7 稳定性：进程级兜底，防止单个未捕获异常/未处理 Promise rejection 直接杀死整个应用
+// （反代/后台任务里的偶发网络异常不应导致服务下线）。仅记录日志，保持进程存活。
+process.on('uncaughtException', (err) => {
+  try { console.error('[Main] uncaughtException (caught, keeping app alive):', err) } catch { /* ignore */ }
+})
+process.on('unhandledRejection', (reason) => {
+  try { console.error('[Main] unhandledRejection (caught, keeping app alive):', reason) } catch { /* ignore */ }
+})
 
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
