@@ -1391,11 +1391,42 @@ export class ProxyServer {
     return { models: merged.map(ProxyServer.mapKiroModelToApi), fromCache }
   }
 
-  // 检查 Token 是否需要刷新
+  // Token 刷新阈值分两档（stale-while-revalidate）：
+  //   soft（isTokenExpiringSoon）：进入 tokenRefreshBeforeExpiry（默认 300s）窗口 → 「应该尽快刷」，
+  //     但当前 token 仍可用，故先用旧 token 立即服务请求、把刷新作为后台 fire-and-forget（不阻塞 TTFT）。
+  //   hard（isTokenExpired）：剩余 < HARD_REFRESH_BUFFER_MS（或已过期）→ 「这次请求前必须刷」，
+  //     此时才在请求路径上 await 刷新。正常使用下 soft 后台刷新会赶在进入 hard 窗口前完成，
+  //     hard 阻塞仅在「长时间闲置到 token 逼近过期」这类罕见场景触发。
+  //
+  // 反检测说明：后台刷新复用同一条 refreshToken() 路径（同 jitter、同并发去重、同 device-id 绑定），
+  // 出网指纹与原阻塞式刷新完全一致；只是从「每个请求各等一次」变成「不阻塞用户」。不新增任何定时器，
+  // 刷新仍由真实请求驱动 → refresh-to-use 比例 ≈ 1:1、节奏随真实流量，不产生可被识别的周期性/突发。
+  private static readonly HARD_REFRESH_BUFFER_MS = 60_000
+
+  // soft 窗口：进入 tokenRefreshBeforeExpiry 但尚未触及 hard 窗口 → 后台刷新即可
   private isTokenExpiringSoon(account: ProxyAccount): boolean {
     if (!account.expiresAt) return false
     const refreshBeforeMs = (this.config.tokenRefreshBeforeExpiry || 300) * 1000
     return Date.now() + refreshBeforeMs >= account.expiresAt
+  }
+
+  // hard 窗口：token 已过期或剩余不足 HARD_REFRESH_BUFFER_MS → 必须在请求前阻塞刷新
+  private isTokenExpired(account: ProxyAccount): boolean {
+    if (!account.expiresAt) return false
+    return Date.now() + ProxyServer.HARD_REFRESH_BUFFER_MS >= account.expiresAt
+  }
+
+  // 后台刷新（fire-and-forget）：soft 窗口内触发，不阻塞当前请求。
+  // - 复用 refreshToken() 的并发去重（refreshingTokens map）：若已有在途刷新（请求路径或上一次后台）
+  //   则不会重复发起，天然防止「自造突发」。
+  // - 绝不传入请求的 AbortSignal：否则当前请求结束/中断会把后台刷新一并 abort，留下半刷新状态。
+  //   传 undefined 让刷新跑完其自然生命周期。
+  // - 调用方必须已先执行 syncKProxyDeviceId(account)，使本次刷新出网带正确的 device-id（与阻塞式刷新一致）。
+  private triggerBackgroundRefresh(account: ProxyAccount): void {
+    // 已有在途刷新（含本函数上一次触发）→ refreshToken 内部会复用，这里无需重复进入
+    if (this.refreshingTokens.has(account.id)) return
+    // 不传 signal；catch 收敛所有异常，避免 fire-and-forget 产生 unhandledRejection
+    void this.refreshToken(account, undefined).catch(() => { /* 后台刷新失败由请求路径的 hard 刷新兜底 */ })
   }
 
   // 刷新 Token —— 同账号并发去重：所有等待方共享同一个 in-flight refresh promise，
@@ -1533,13 +1564,18 @@ export class ProxyServer {
       const sticky = this.pickAccountWithAffinity(sessionHint)
       if (sticky && isAllowed(sticky)) {
         proxyLogger.debug('ProxyServer', `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`)
-        // 仍需检查 token 是否需要刷新
-        if (this.isTokenExpiringSoon(sticky)) {
+        // 仍需检查 token 是否需要刷新（stale-while-revalidate）
+        if (this.isTokenExpired(sticky)) {
+          // hard 窗口：token 逼近过期/已过期 → 这次请求前必须阻塞刷新
           const refreshed = await this.refreshToken(sticky, signal)
           if (refreshed) {
             return this.accountPool.getAccount(sticky.id) || sticky
           }
+          // 刷新失败 → 不在此 return，落到下方常规挑选逻辑（保持原「失败后另寻账号」语义）
         } else {
+          // token 仍可用：先用旧 token 立即服务（不阻塞 TTFT）；
+          // 若已进入 soft 窗口则顺带后台刷新，让下一个请求用上新 token。
+          if (this.isTokenExpiringSoon(sticky)) this.triggerBackgroundRefresh(sticky)
           return sticky
         }
       }
@@ -1610,10 +1646,12 @@ export class ProxyServer {
     if (!account) return null
 
     // 自动切换 K-Proxy 设备 ID（如果 K-Proxy 服务可用）
+    // 注意：必须在任何刷新（阻塞式或后台）之前执行，使刷新出网带本账号正确的 device-id。
     this.syncKProxyDeviceId(account)
 
-    // 检查是否需要刷新 Token
-    if (this.isTokenExpiringSoon(account)) {
+    // 检查是否需要刷新 Token（stale-while-revalidate）
+    if (this.isTokenExpired(account)) {
+      // hard 窗口：token 逼近过期/已过期 → 这次请求前必须阻塞刷新
       const refreshed = await this.refreshToken(account, signal)
       if (!refreshed) {
         // 刷新失败，如果启用多账号才尝试获取下一个账号（受 API Key 白名单约束）
@@ -1628,6 +1666,11 @@ export class ProxyServer {
       if (refreshedAccount && sessionHint) this.rememberAffinity(sessionHint, refreshedAccount.id)
       return refreshedAccount
     }
+
+    // token 仍可用：用旧 token 立即服务（不阻塞 TTFT）。
+    // 若已进入 soft 窗口，顺带后台刷新（device-id 已 sync），让后续请求用上新 token，
+    // 正常使用下可在 token 进入 hard 窗口前完成，从而避免请求路径上的阻塞刷新。
+    if (this.isTokenExpiringSoon(account)) this.triggerBackgroundRefresh(account)
 
     if (sessionHint) this.rememberAffinity(sessionHint, account.id)
     return account
