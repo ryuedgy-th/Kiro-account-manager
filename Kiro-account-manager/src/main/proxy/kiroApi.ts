@@ -132,6 +132,29 @@ function stringifyWithoutBinary(input: KiroUserInputMessage): string {
 }
 
 /**
+ * 廉价估算 payload 的序列化字节数（binary-aware）：文本字段按 UTF-8 字节，base64 附件按其字符串长度
+ * （base64 本身就是 HTTP body 的实际字节）。用于「是否需要进入 byte 截断」的预判，避免每个请求都对
+ * 整个 1.5MB+ payload 跑一次 JSON.stringify（热路径 O(payload)，多 MB base64 时尤其重）。
+ * 仅当估算逼近上限时才回退到精确的 JSON.stringify。结果略偏低（不含 JSON 结构符），故配 0.9 安全系数使用。
+ */
+function estimatePayloadBytes(payload: KiroPayload): number {
+  let bytes = 0
+  const acc = (msg?: KiroHistoryMessage): void => {
+    if (!msg) return
+    const input = msg.userInputMessage
+    if (input) {
+      bytes += Buffer.byteLength(stringifyWithoutBinary(input), 'utf-8')
+      for (const img of input.images ?? []) bytes += (img.source?.bytes?.length ?? 0)
+      for (const doc of input.documents ?? []) bytes += (doc.source?.bytes?.length ?? 0)
+    }
+    if (msg.assistantResponseMessage) bytes += Buffer.byteLength(JSON.stringify(msg.assistantResponseMessage), 'utf-8')
+  }
+  acc(payload.conversationState.currentMessage)
+  for (const m of payload.conversationState.history ?? []) acc(m)
+  return bytes
+}
+
+/**
  * 获取网络代理 agent
  * 优先级（从高到低）：
  *   1. 账号自身绑定的 proxyUrl（实现"N 个号一个 IP"分桶反代）
@@ -460,15 +483,36 @@ export function mapModelId(model: string): string {
   return MODEL_ID_MAP.default
 }
 
-// payload 深拷贝：每次请求/重试前隔离一份，避免改动污染调用方原对象。
-// structuredClone（Node 17+，结构化克隆算法）比 JSON.parse(JSON.stringify()) 快得多，
-// 且不会把 base64 附件再 serialize+parse 一遍（payload 可能含数 MB 附件，旧做法在此明显阻塞）。
-// 兜底：万一未来 payload 混入不可结构化克隆的字段（函数等），回退到 JSON 深拷贝保证不崩。
+// payload 隔离拷贝：每次请求/重试前隔离一份，避免改动污染调用方原对象。
+// 关键优化：callKiroApiStream 对 clone 只改「骨架标量」——顶层 profileArn、conversationState 的
+// agentContinuationId/agentTaskType、以及每条 userInputMessage 的 modelId/origin。重的叶子
+// （content / images / documents / userInputMessageContext 内的 toolResults 文本+base64）从不被改，
+// 因此只浅拷贝骨架、叶子按引用共享即可——避免 structuredClone 把数 MB base64/工具结果整段复制（热路径阻塞）。
+// 兜底：结构异常时回退 structuredClone / JSON 深拷贝，保证绝不崩。
 function clonePayload(payload: KiroPayload): KiroPayload {
   try {
-    return structuredClone(payload)
+    const cs = payload.conversationState
+    const cloneMsg = (m: KiroHistoryMessage): KiroHistoryMessage => {
+      // 仅当存在 userInputMessage 时浅拷贝其包装对象（隔离 modelId/origin 写入）；其余字段共享引用
+      if (m.userInputMessage) {
+        return { ...m, userInputMessage: { ...m.userInputMessage } }
+      }
+      return { ...m }
+    }
+    return {
+      ...payload,
+      conversationState: {
+        ...cs,
+        currentMessage: { ...cs.currentMessage, userInputMessage: { ...cs.currentMessage.userInputMessage } },
+        history: cs.history ? cs.history.map(cloneMsg) : cs.history
+      }
+    }
   } catch {
-    return JSON.parse(JSON.stringify(payload)) as KiroPayload
+    try {
+      return structuredClone(payload)
+    } catch {
+      return JSON.parse(JSON.stringify(payload)) as KiroPayload
+    }
   }
 }
 
@@ -1213,9 +1257,16 @@ export function buildKiroPayload(
   // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
   const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
   const TOOL_RESULT_TRUNCATE_LENGTH = 4000
-  // 基线算一次，之后每截一段按「字符长度差」做减法（与原先 JSON.stringify().length 同口径：
-  // UTF-16 code units），避免每截一次就 stringify 整个 1.5MB payload（O(n²)→O(n)）。
-  let initialPayloadSize = JSON.stringify(payload).length
+  // 热路径优化：先用 binary-aware 廉价估算预判；只有逼近上限时才付出整 payload JSON.stringify 的代价
+  // （这段 byte 截断实测几乎从不触发——真正的限制由下面第三阶段 token 预算处理，见其注释）。
+  let initialPayloadSize = 0
+  const estBytes = estimatePayloadBytes(payload)
+  // 估算偏低（不含 JSON 结构符/转义），用 0.9×limit 作为保守触发线；超过才精确测量
+  if (estBytes > PAYLOAD_SIZE_LIMIT * 0.9) {
+    initialPayloadSize = JSON.stringify(payload).length
+  } else {
+    initialPayloadSize = estBytes
+  }
   if (initialPayloadSize > PAYLOAD_SIZE_LIMIT && payload.conversationState.history) {
     const historyMessages = payload.conversationState.history
     let truncatedCount = 0

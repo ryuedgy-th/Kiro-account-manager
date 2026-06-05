@@ -368,7 +368,7 @@ export class ProxyServer {
   private stats: ProxyStats
   private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number }
   private events: ProxyServerEvents
-  private refreshingTokens: Set<string> = new Set() // 防止并发刷新
+  private refreshingTokens: Map<string, Promise<boolean>> = new Map() // 同账号并发刷新去重：共享同一个 in-flight promise
   private isHttps: boolean = false
   private isStopping: boolean = false
   private activeRequests: Set<AbortController> = new Set()
@@ -1398,7 +1398,8 @@ export class ProxyServer {
     return Date.now() + refreshBeforeMs >= account.expiresAt
   }
 
-  // 刷新 Token
+  // 刷新 Token —— 同账号并发去重：所有等待方共享同一个 in-flight refresh promise，
+  // 拿到真实结果（不再盲等 1s 后猜测，避免「猜成失败 → 误判 account 不可用 → 账号乱跳」）。
   private async refreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
     this.throwIfAborted(signal)
     if (!this.events.onTokenRefresh) {
@@ -1406,23 +1407,36 @@ export class ProxyServer {
       return false
     }
 
-    // 防止并发刷新
-    if (this.refreshingTokens.has(account.id)) {
-      console.log(`[ProxyServer] Token refresh already in progress for ${account.email || account.id}`)
-      // 等待刷新完成
-      await this.waitForRetry(1000, signal)
-      return !this.isTokenExpiringSoon(this.accountPool.getAccount(account.id) || account)
+    // 已有同账号刷新在途 → 复用同一 promise（不自己再发起、也不盲等）
+    const inFlight = this.refreshingTokens.get(account.id)
+    if (inFlight) {
+      console.log(`[ProxyServer] Awaiting in-flight token refresh for ${account.email || account.id}`)
+      try {
+        return await inFlight
+      } catch {
+        return false
+      }
     }
 
-    this.refreshingTokens.add(account.id)
-    console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
-
+    // 发起新的刷新，把 promise 存入 map 供其他 waiter 复用；finally 清理
+    const p = this.doRefreshToken(account, signal)
+    this.refreshingTokens.set(account.id, p)
     try {
-      // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作
+      return await p
+    } finally {
+      this.refreshingTokens.delete(account.id)
+    }
+  }
+
+  private async doRefreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
+    console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
+    try {
+      // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作。注意：因并发去重，同账号的
+      // N 个等待方共享这一次刷新，只「集体」承担一次 jitter，而不是每个请求各等一次。
       const jitter = Math.floor(Math.random() * 3000)
       if (jitter > 0) await this.waitForRetry(jitter, signal)
-      
-      const result = await this.abortable(this.events.onTokenRefresh(account), signal)
+
+      const result = await this.abortable(this.events.onTokenRefresh!(account), signal)
       if (result.success && result.accessToken) {
         // 更新账号池中的 Token
         this.accountPool.updateAccount(account.id, {
@@ -1449,8 +1463,6 @@ export class ProxyServer {
       console.error(`[ProxyServer] Token refresh error for ${account.email || account.id}:`, error)
       this.accountPool.markNeedsRefresh(account.id)
       return false
-    } finally {
-      this.refreshingTokens.delete(account.id)
     }
   }
 
@@ -3785,7 +3797,8 @@ export class ProxyServer {
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold',
       'portalEnabled', 'portalSessionTtlHours', 'portalDefaultMaxKeys',
-      'portalGoogleEnabled', 'googleClientId', 'adminApiExposed', 'portalAllowedOrigins'
+      'portalGoogleEnabled', 'googleClientId', 'adminApiExposed', 'portalAllowedOrigins',
+      'portalMaxConcurrentPerCustomer'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 也排除：customers / portalSessionSecret —— 含密码哈希与签名密钥，仅本地 IPC / 专用 admin 端点改
     ]
@@ -5676,7 +5689,10 @@ export class ProxyServer {
    * cap=0 表示不限制（始终返回 true 且不计数，release 也安全）。
    */
   private acquireCustomerSlot(customerId: string): boolean {
-    const cap = this.config.portalMaxConcurrentPerCustomer ?? 6
+    // 默认 32：Claude Code 单会话常并发开多个 stream（子代理/并行工具调用），cap=6 会误触发 429。
+    // 余额防护的真正防线在 validateApiKey 的 credit 检查；此 cap 仅防极端 runaway，故放宽默认值。
+    // cap<=0 表示完全不限制。
+    const cap = this.config.portalMaxConcurrentPerCustomer ?? 32
     if (cap <= 0) return true
     const cur = this.customerInFlight.get(customerId) || 0
     if (cur >= cap) return false
