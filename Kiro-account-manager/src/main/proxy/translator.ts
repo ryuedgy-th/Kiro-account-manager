@@ -399,23 +399,10 @@ export function openaiToKiro(
     }
   }
 
-  // 注入时间戳
-  const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
-
-  // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
-  const executionDirective = `
-<execution_discipline>
-当用户要求执行特定任务时，你必须遵循以下纪律：
-1. **目标锁定**：在整个会话中始终牢记用户的原始目标，不要在代码探索过程中迷失方向
-2. **行动优先**：优先执行任务而非仅分析或总结，除非用户明确只要求分析
-3. **计划执行**：为任务创建明确的步骤计划，逐步执行并标记完成状态
-4. **禁止确认性收尾**：在任务未完成前，禁止输出"需要我继续吗？"、"需要深入分析吗？"等确认性问题
-5. **持续推进**：如果发现部分任务已完成，立即继续执行剩余未完成的任务
-6. **完整交付**：直到所有任务步骤都执行完毕才算完成
-</execution_discipline>
-`
-  systemPrompt = systemPrompt + '\n\n' + executionDirective
+  // 时间戳改注入到 currentMessage 末尾（见下方 finalContent），而非 system prompt 头部。
+  // system prompt 是 prompt-cache 的 prefix；每轮变化的时间戳放在头部会让上游缓存永不命中
+  // （In 随上下文线性增长）。放到本轮新消息末尾则不影响稳定 prefix，缓存可命中。
+  const timestampContext = `[Context: Current time is ${new Date().toISOString()}]`
 
   // 构建历史消息（参考 Proxycast 实现）
   const history: KiroHistoryMessage[] = []
@@ -573,7 +560,8 @@ export function openaiToKiro(
     ]
     history.unshift(...systemMessages)
   }
-  const finalContent = currentContent || 'Continue.'
+  // 时间戳追加到本轮消息末尾（不污染 system/history prefix，保住 prompt-cache 命中）。
+  const finalContent = `${currentContent || 'Continue.'}\n\n${timestampContext}`
 
   // 转换工具定义
   const kiroTools = convertOpenAITools(request.tools, toolNameRegistry)
@@ -900,23 +888,12 @@ export function claudeToKiro(
     }).join('\n')
   }
 
-  // 注入时间戳
-  const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
-
-  // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
-  const executionDirective = `
-<execution_discipline>
-当用户要求执行特定任务时，你必须遵循以下纪律：
-1. **目标锁定**：在整个会话中始终牢记用户的原始目标，不要在代码探索过程中迷失方向
-2. **行动优先**：优先执行任务而非仅分析或总结，除非用户明确只要求分析
-3. **计划执行**：为任务创建明确的步骤计划，逐步执行并标记完成状态
-4. **禁止确认性收尾**：在任务未完成前，禁止输出"需要我继续吗？"、"需要深入分析吗？"等确认性问题
-5. **持续推进**：如果发现部分任务已完成，立即继续执行剩余未完成的任务
-6. **完整交付**：直到所有任务步骤都执行完毕才算完成
-</execution_discipline>
-`
-  systemPrompt = systemPrompt + '\n\n' + executionDirective
+  // 时间戳改注入到 currentMessage 末尾（见下方 finalContent），而非 system prompt 头部。
+  // 原因：system prompt 是 history 的首块，构成 prompt-cache 的 prefix。把每轮都变化的
+  // 时间戳放在 prefix 头部会让上游缓存（cachePoint）每轮 prefix 都不同 → 永不命中 →
+  // 每轮按全量 input 计费（In 随上下文线性增长）。时间戳放到「本轮新消息」末尾不影响
+  // 稳定的 system/history/tools prefix，缓存可命中，同时模型仍能看到当前时间。
+  const timestampContext = `[Context: Current time is ${new Date().toISOString()}]`
 
   // 构建历史消息 - Kiro API 要求严格的 user -> assistant 交替
   const history: KiroHistoryMessage[] = []
@@ -1074,7 +1051,9 @@ export function claudeToKiro(
     ]
     history.unshift(...systemMessages)
   }
-  const finalContent = currentContent || (currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue')
+  // 时间戳追加到本轮消息末尾（不污染 system/history prefix，保住 prompt-cache 命中）。
+  const baseContent = currentContent || (currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue')
+  const finalContent = `${baseContent}\n\n${timestampContext}`
 
   // 转换工具定义
   const kiroTools = convertClaudeTools(request.tools, toolNameRegistry, webToolsEnabled)

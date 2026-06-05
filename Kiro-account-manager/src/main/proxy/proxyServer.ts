@@ -3429,8 +3429,9 @@ export class ProxyServer {
     const totalCredits = effModelSum
 
     // 最近 50 条请求明细（按时间倒序）；credits 换算成实扣值（× 模型倍率）。
-    // input 拆成 uncached / cacheRead / cacheWrite，让客户看懂"input 很大但扣费少"——
-    // 大头通常是 cacheRead，其计费远低于普通 input。uncached 兜底不为负。
+    // input 拆成 uncached / cacheRead / cacheWrite 三段。注意：MITM 实测确认 Kiro 不做 prompt cache
+    // 也不返回 cache 字段，因此目前 cacheRead/cacheWrite 恒为 0、uncached == 全量 input。
+    // 保留这三个字段是为了：若将来 Kiro 真的返回 cache 用量，前端无需改动即可如实展示。
     const recentHistory = historyAll
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, 50)
@@ -3863,12 +3864,15 @@ export class ProxyServer {
   }
 
   private buildClaudeUsage(
-    usage: { inputTokens: number; outputTokens: number; cacheWriteTokens?: number; cacheReadTokens?: number },
-    simulatedCache?: { cacheCreationInputTokens: number; cacheReadInputTokens: number }
+    usage: { inputTokens: number; outputTokens: number; cacheWriteTokens?: number; cacheReadTokens?: number }
   ): { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } {
-    // 优先使用 Kiro 后端返回的真实 cache tokens，否则用模拟器的值
-    const cacheWrite = usage.cacheWriteTokens || simulatedCache?.cacheCreationInputTokens || 0
-    const cacheRead = usage.cacheReadTokens || simulatedCache?.cacheReadInputTokens || 0
+    // 仅使用 Kiro 后端返回的真实 cache tokens。
+    // 实测（MITM 抓取真实 kiro-cli，2026-06）：runtime.kiro.dev 不返回任何 cache 字段，
+    // 也不读取请求里的 cachePoint —— Kiro 没有 Anthropic 风格的 prompt cache。
+    // 因此这里不再用本地 promptCacheTracker 的模拟值兜底，避免向客户/客户端报告并不存在的缓存命中。
+    // 若将来 Kiro 真的返回 cacheReadTokens/cacheWriteTokens，这里会如实透传。
+    const cacheWrite = usage.cacheWriteTokens || 0
+    const cacheRead = usage.cacheReadTokens || 0
     // Kiro 的 inputTokens 是全量（含缓存），Anthropic API 规范中 input_tokens 不含缓存部分
     // 需要扣除 cache tokens 避免客户端双重计费
     const adjustedInput = Math.max(0, usage.inputTokens - cacheWrite - cacheRead)
@@ -4889,31 +4893,21 @@ export class ProxyServer {
 
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, useWebTools)
 
-      // 构建 prompt cache profile（用于模拟缓存 usage）
+      // 估算本轮请求的 input token 数（仅用于 message_start 的 usage 展示）。
       // 用 binary-aware 的 estimateTokenCount（与 count_tokens / message_start 同源），
       // 不能用 JSON.stringify(kiroPayload).length——payload 里的 base64 附件会让估算虚高数十倍。
       // 包成 thunk（只算一次）：stream 路径把这段同步开销推迟到「请求已发出后」再算，
-      // 与上游网络 RTT 重叠，降低 TTFT 并减少对并发请求的事件循环阻塞；web-tool / 非流式仍即时调用。
-      let _cachePrep: { estimatedInputTokens: number; cacheProfile: ReturnType<typeof promptCacheTracker.buildClaudeProfile>; cacheUsage: ReturnType<typeof promptCacheTracker.compute> } | undefined
-      const prepareCache = (): NonNullable<typeof _cachePrep> => {
-        if (_cachePrep) return _cachePrep
-        const estimatedInputTokens = Math.max(1,
+      // 与上游网络 RTT 重叠，降低 TTFT 并减少对并发请求的事件循环阻塞；非流式即时调用。
+      // 注：原先这里还会跑 promptCacheTracker 模拟 prompt cache usage，但 MITM 实测确认
+      // Kiro 没有 prompt cache、也不返回 cache 字段，模拟值只会误导客户，故已移除。
+      let _estimatedInputTokens: number | undefined
+      const prepareInputEstimate = (): number => {
+        if (_estimatedInputTokens !== undefined) return _estimatedInputTokens
+        _estimatedInputTokens = Math.max(1,
           this.estimateTokenCount(processedRequest.system) +
           this.estimateTokenCount(processedRequest.messages) +
           this.estimateTokenCount(processedRequest.tools))
-        const cacheProfile = promptCacheTracker.buildClaudeProfile(
-          processedRequest.system,
-          processedRequest.messages,
-          processedRequest.tools,
-          estimatedInputTokens,
-          processedRequest.model
-        )
-        const cacheUsage = promptCacheTracker.compute(account.id, cacheProfile)
-        if (cacheProfile) {
-          proxyLogger.debug('ProxyServer', `Prompt cache: ${cacheProfile.breakpoints.length} breakpoints, creation=${cacheUsage.cacheCreationInputTokens}, read=${cacheUsage.cacheReadInputTokens}`)
-        }
-        _cachePrep = { estimatedInputTokens, cacheProfile, cacheUsage }
-        return _cachePrep
+        return _estimatedInputTokens
       }
 
       // 记录请求详情到日志
@@ -4938,21 +4932,18 @@ export class ProxyServer {
       if (useWebTools && webToolConfig) {
         // Web 工具路径：代理侧执行 web_search/web_fetch 循环，得到最终回答后再返回客户端。
         // stream 与 non-stream 共用同一循环，只是输出格式不同（SSE replay vs 单个 JSON）。
-        const { cacheProfile, cacheUsage } = prepareCache()
         await this.handleClaudeWebToolRequest(
           res, account, kiroPayload, processedRequest, webToolConfig, toolNameRegistry,
-          startTime, matchedApiKey, signal,
-          cacheProfile && cacheUsage ? { cacheUsage, cacheProfile, accountId: account.id } : undefined
+          startTime, matchedApiKey, signal
         )
       } else if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        // 把 cacheProfile/usage + input token 估算推迟给 handleClaudeStream：先发上游请求，
+        // 把 input token 估算推迟给 handleClaudeStream：先发上游请求，
         // 再在网络 RTT 期间计算并发出 message_start（见 ensureStarted / setImmediate）。
         await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          undefined, undefined, ProxyServer.deriveEffortLevel(request), prepareCache, request.max_tokens)
+          undefined, ProxyServer.deriveEffortLevel(request), prepareInputEstimate, request.max_tokens)
       } else {
         // 非流式响应（带重试机制）
-        const { cacheProfile, cacheUsage } = prepareCache()
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
@@ -4965,12 +4956,8 @@ export class ProxyServer {
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
-        // 用缓存模拟的 usage 覆盖（如果有 cache profile）
-        if (cacheProfile && cacheUsage) {
-          if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
-          if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
-          promptCacheTracker.update(usedAccount.id, cacheProfile)
-        }
+        // 不再注入本地模拟的 cache usage：Kiro 不返回 cache 字段、也不做 prompt cache（MITM 实测确认）。
+        // response.usage 直接反映 Kiro 真实用量；若将来 Kiro 返回 cacheReadTokens，kiroToClaudeResponse 会透传。
 
         this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
@@ -5005,8 +4992,7 @@ export class ProxyServer {
     toolNameRegistry: ToolNameRegistry,
     startTime: number,
     matchedApiKey: import('./types').ApiKey | undefined,
-    signal: AbortSignal | undefined,
-    cache?: { cacheUsage: { cacheCreationInputTokens: number; cacheReadInputTokens: number }; cacheProfile: unknown; accountId: string }
+    signal: AbortSignal | undefined
   ): Promise<void> {
     const loop = await runWebToolLoop(account as Parameters<typeof runWebToolLoop>[0], kiroPayload, webToolConfig, signal)
     if (loop.webToolRounds > 0) {
@@ -5028,11 +5014,7 @@ export class ProxyServer {
       }
     }
 
-    if (cache?.cacheUsage) {
-      if (cache.cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cache.cacheUsage.cacheCreationInputTokens
-      if (cache.cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cache.cacheUsage.cacheReadInputTokens
-      promptCacheTracker.update(cache.accountId, cache.cacheProfile as Parameters<typeof promptCacheTracker.update>[1])
-    }
+    // 不再注入本地模拟的 cache usage（Kiro 无 prompt cache，MITM 实测确认）。
 
     this.throwIfResponseClosed(res, signal)
     this.recordRequestSuccess()
@@ -5062,15 +5044,11 @@ export class ProxyServer {
     res.cork()
     const id = response.id || `msg_${uuidv4()}`
     const write = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) }
-    // message_start.usage 与主流式路径口径保持一致：input_tokens 不含缓存，且带 cache 拆分字段。
-    const replayCacheRead = response.usage.cache_read_input_tokens || 0
-    const replayCacheCreation = response.usage.cache_creation_input_tokens || 0
-    const replayStartUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } = {
-      input_tokens: Math.max(1, loop.usage.inputTokens - replayCacheRead - replayCacheCreation),
+    // message_start.usage 与主流式路径口径一致：Kiro 无 prompt cache，input_tokens 即全量本轮 input。
+    const replayStartUsage: { input_tokens: number; output_tokens: number } = {
+      input_tokens: Math.max(1, loop.usage.inputTokens),
       output_tokens: 0
     }
-    if (replayCacheRead > 0) replayStartUsage.cache_read_input_tokens = replayCacheRead
-    if (replayCacheCreation > 0) replayStartUsage.cache_creation_input_tokens = replayCacheCreation
     write('message_start', createClaudeStreamEvent('message_start', {
       message: { id, type: 'message', role: 'assistant', content: [], model: request.model, stop_reason: null, stop_sequence: null, usage: replayStartUsage }
     }))
@@ -5127,12 +5105,11 @@ export class ProxyServer {
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
-    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string },
     promptInputTokens?: number,
     effort?: string,
-    // 推迟计算缓存 usage + input token 的 thunk（stream 路径专用）。给定时，先发上游请求，
+    // 推迟计算 input token 估算的 thunk（stream 路径专用）。给定时，先发上游请求，
     // 再在网络 RTT 期间调用它计算并发出 message_start——同步开销与网络往返重叠。
-    prepareCache?: () => { estimatedInputTokens: number; cacheProfile: unknown; cacheUsage: { cacheCreationInputTokens: number; cacheReadInputTokens: number } },
+    prepareInputEstimate?: () => number,
     // client ที่ขอมา (จาก request.max_tokens) — ใช้ตรวจ truncation เพื่อรายงาน stop_reason='max_tokens'
     maxTokens?: number,
     authRetried: boolean = false
@@ -5172,36 +5149,26 @@ export class ProxyServer {
     // 这里优先用调用方按 Claude 原始请求结构算出的 token 数（与 /v1/messages/count_tokens 同源），
     // 仅在缺失时回退到基于 payload 体积的粗略估算（≈3.5 字符/token，贴近 cl100k_base）。
     //
-    // ensureStarted：幂等地解析缓存 usage（若给了 prepareCache 则此刻才计算——与上游 RTT 重叠）
+    // ensureStarted：幂等地解析 input token 估算（若给了 prepareInputEstimate 则此刻才计算——与上游 RTT 重叠）
     // 并发出 message_start（仅首轮、仅一次）。在「主动 setImmediate」与「首个 onChunk/onComplete」
     // 两处调用，谁先到谁触发，保证 message_start 必定先于任何 content delta。
-    let simCache = simulatedCacheUsage
     let messageStarted = false
     const ensureStarted = (): void => {
       if (messageStarted) return
       messageStarted = true
       let grossInputTokens = promptInputTokens
-      if (prepareCache) {
-        const prep = prepareCache()
-        grossInputTokens = prep.estimatedInputTokens
-        simCache = prep.cacheProfile
-          ? { ...prep.cacheUsage, cacheProfile: prep.cacheProfile, accountId: account.id }
-          : undefined
+      if (prepareInputEstimate) {
+        grossInputTokens = prepareInputEstimate()
       }
       if (currentRound !== 0) return
-      const cacheReadStart = simCache?.cacheReadInputTokens || 0
-      const cacheCreationStart = simCache?.cacheCreationInputTokens || 0
       const gross = (typeof grossInputTokens === 'number' && grossInputTokens > 0)
         ? grossInputTokens
         : this.estimateKiroPayloadTokens(kiroPayload)
-      // 扣除缓存命中部分，避免客户端重复计入（与 buildClaudeUsage 的口径保持一致）
-      const startInputTokens = Math.max(1, gross - cacheReadStart - cacheCreationStart)
-      const startUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } = {
-        input_tokens: startInputTokens,
+      // Kiro 无 prompt cache，input_tokens 即全量本轮 input（不扣 cache）。
+      const startUsage: { input_tokens: number; output_tokens: number } = {
+        input_tokens: Math.max(1, gross),
         output_tokens: 0
       }
-      if (cacheReadStart > 0) startUsage.cache_read_input_tokens = cacheReadStart
-      if (cacheCreationStart > 0) startUsage.cache_creation_input_tokens = cacheCreationStart
       const messageStart = createClaudeStreamEvent('message_start', {
         message: {
           id,
@@ -5378,21 +5345,17 @@ export class ProxyServer {
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
           this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
-          this.stats.cacheReadTokens += usage.cacheReadTokens || simCache?.cacheReadInputTokens || 0
-          this.stats.cacheWriteTokens += usage.cacheWriteTokens || simCache?.cacheCreationInputTokens || 0
+          this.stats.cacheReadTokens += usage.cacheReadTokens || 0
+          this.stats.cacheWriteTokens += usage.cacheWriteTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simCache?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
+          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime, sessionId: kiroPayload.conversationState.conversationId })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort, usage.cacheReadTokens || simCache?.cacheReadInputTokens, usage.cacheWriteTokens || simCache?.cacheCreationInputTokens, kiroPayload.conversationState.conversationId)
+            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages', effort, usage.cacheReadTokens, usage.cacheWriteTokens, kiroPayload.conversationState.conversationId)
           }
 
-          // 成功后更新 prompt cache tracker
-          if (simCache?.cacheProfile && simCache?.accountId) {
-            promptCacheTracker.update(simCache.accountId, simCache.cacheProfile as any)
-          }
           // 发送 message_delta（包含完整 usage 信息）
           // stop_reason 优先级（保守策略，不影响已工作的工具循环）：
           //   1) 有工具调用 → 'tool_use'（客户端继续执行工具）
@@ -5408,7 +5371,7 @@ export class ProxyServer {
           }
           const messageDelta = createClaudeStreamEvent('message_delta', {
             delta: { stop_reason: stopReason, stop_sequence: null } as any,
-            usage: this.buildClaudeUsage(usage, simCache)
+            usage: this.buildClaudeUsage(usage)
           })
           res.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`)
           // 发送 message_stop
@@ -5455,7 +5418,7 @@ export class ProxyServer {
               this.handleClaudeStream(
                 res, refreshedAccount as typeof account, kiroPayload, model, startTime,
                 currentRound, id, true, currentBlockIndex, matchedApiKey, toolNameRegistry, signal,
-                simCache, promptInputTokens, effort, undefined, maxTokens, true
+                promptInputTokens, effort, undefined, maxTokens, true
               ).then(resolve).catch(() => resolve())
               return
             }
