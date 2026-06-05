@@ -273,10 +273,22 @@ function debouncedStoreSet(key: string, value: unknown): void {
 function flushStoreWrites(): void {
   storeFlushTimer = null
   if (!store || pendingStoreWrites.size === 0) return
-  for (const [key, value] of pendingStoreWrites) {
-    store.set(key, value)
-  }
+  // 合并为单次 store.set(object)：加密 store 每次 set() 都要整文件 read+decrypt+encrypt+write，
+  // 逐 key set ~7 次 = ~7 轮 PBKDF2+AES 同步阻塞主线程。一次性写入只付一轮（数据完全相同）。
+  const batch: Record<string, unknown> = {}
+  for (const [key, value] of pendingStoreWrites) batch[key] = value
   pendingStoreWrites.clear()
+  try {
+    // electron-store 支持 set(object) 一次合并多 key（仅一轮 encrypt+write）；本地 store 类型只声明了
+    // (key,value) 重载，故此处按 object-set 签名做局部 cast，不放宽共享类型。
+    ;(store.set as unknown as (obj: Record<string, unknown>) => void)(batch)
+  } catch (err) {
+    console.error('[Store] Batched flush failed, falling back to per-key:', err)
+    // 兜底：批量失败时退回逐 key 写，尽量不丢数据
+    for (const [key, value] of Object.entries(batch)) {
+      try { store.set(key, value) } catch { /* ignore single-key failure */ }
+    }
+  }
 }
 
 let trayMenuTimer: ReturnType<typeof setTimeout> | null = null
@@ -2333,9 +2345,12 @@ function handleProtocolUrl(url: string): void {
 // （反代/后台任务里的偶发网络异常不应导致服务下线）。仅记录日志，保持进程存活。
 process.on('uncaughtException', (err) => {
   try { console.error('[Main] uncaughtException (caught, keeping app alive):', err) } catch { /* ignore */ }
+  // 崩溃边缘先同步刷盘待写入（billing/credit/config），防 5s 防抖窗口内的数据随下一次致命错误丢失
+  try { flushStoreWrites() } catch { /* ignore */ }
 })
 process.on('unhandledRejection', (reason) => {
   try { console.error('[Main] unhandledRejection (caught, keeping app alive):', reason) } catch { /* ignore */ }
+  try { flushStoreWrites() } catch { /* ignore */ }
 })
 
 // This method will be called when Electron has finished
@@ -2871,11 +2886,20 @@ app.whenReady().then(async () => {
   ipcMain.handle('save-accounts', async (_event, data) => {
     try {
       await initStore()
+      // 去重：renderer 每 30s autosave 常常传来与上次完全相同的数据（refresh 只改内存运行态、
+      // 不改持久字段）。相同则跳过——避免无谓的整库 encrypt + secureBackup 阻塞主线程。
+      // 注意：用稳定序列化比对；只要有任何真实字段变化就照常落盘 + 备份，绝不漏存。
+      let unchanged = false
+      try {
+        unchanged = lastSavedData != null && JSON.stringify(data) === JSON.stringify(lastSavedData)
+      } catch { unchanged = false }
+      if (unchanged) return
+
       store!.set('accountData', data)
-      
+
       // 保存最后的数据（用于崩溃恢复）
       lastSavedData = data
-      
+
       // 每次保存时也创建备份
       await createBackup(data)
     } catch (error) {

@@ -2068,7 +2068,9 @@ async function parseEventStream(
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
               const reasoning = event.reasoningContentEvent || event
               if (reasoning.text) {
-                proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
+                // debug 而非 info：thinking 模式下每个 reasoning chunk 都会触发，逐条 info 会在
+                // 长思考时 token-by-token 跑 redact+JSON+落盘，拖慢流式输出。默认 DEBUG 被丢弃。
+                proxyLogger.debug('Kiro', `reasoning chunk (isThinking=true), len=${reasoning.text.length}`)
                 onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
                 usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length * 0.4))
@@ -2077,7 +2079,7 @@ async function parseEventStream(
               }
               // 处理 redactedContent（重编辑的加密 thinking 内容）
               if (reasoning.redactedContent) {
-                proxyLogger.info('Kiro', `Received redacted thinking content (len=${reasoning.redactedContent.length})`)
+                proxyLogger.debug('Kiro', `redacted thinking content (len=${reasoning.redactedContent.length})`)
                 onChunk('', undefined, true, undefined, reasoning.redactedContent)
               }
               proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))

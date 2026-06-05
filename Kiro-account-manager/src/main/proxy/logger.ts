@@ -250,6 +250,10 @@ class ProxyLogger {
 // 3. 单次写盘原子化（in-flight guard）防止并发 writeFile 导致竞态
 // 4. 写盘节流间隔从 5s 提至 30s — 大幅降低高频日志场景下的 IO 频率
 // 5. 应用退出时通过 flushSaveNow() 强制写盘，防止数据丢失
+// 日志裁剪摊还块大小：超过 maxLogs 后再多积累这么多条才一次性 slice，把 O(n) 裁剪成本
+// 摊到每 LOG_TRIM_CHUNK 条一次（热路径 add 不再每条都 reslice 5 万元素数组）。
+const LOG_TRIM_CHUNK = 5000
+
 class ProxyLogStore {
   private logs: LogEntry[] = []
   // 5 万条 × 平均 200 字节 ≈ 10 MB；既能覆盖常规调试需求，又把单次写盘成本控制在可接受范围内
@@ -322,8 +326,9 @@ class ProxyLogStore {
   add(entry: LogEntry): void {
     this.logs.push(entry)
 
-    // 超过最大数量时删除最旧的
-    if (this.logs.length > this.maxLogs) {
+    // 超过最大数量时删除最旧的。摊还处理：积累到 maxLogs + 一个 chunk 才一次性裁剪，
+    // 避免每条 add 都对 5 万元素数组做 slice（O(n) per add → 热路径 GC/CPU 抖动）。
+    if (this.logs.length > this.maxLogs + LOG_TRIM_CHUNK) {
       this.logs = this.logs.slice(-this.maxLogs)
     }
 
