@@ -89,6 +89,8 @@ interface ProxyConfig {
   modelMappings?: ModelMappingRule[]
   // 对外开放的模型白名单（空/未设 = 开放全部）
   allowedModels?: string[]
+  // 暴露 effort 变体模型（如 claude-opus-4.8-max）到 /v1/models
+  effortVariantsExposed?: boolean
   // v1.8 安全 / 限流 / 可观测
   maxRequestBodyBytes?: number
   allowedIPs?: string[]
@@ -1272,6 +1274,36 @@ export function ProxyPanel() {
               </div>
             </>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Effort 变体：开启后 /v1/models 为支持 thinking 的 Claude 模型额外列出 -max/-high/-low 等条目，
+          让无法在 UI 调 reasoning effort 的客户端（如 OpenCode）通过「选模型」来选 effort。 */}
+      <Card className="hover-lift">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">{isEn ? 'Effort Variants' : 'Effort 变体模型'}</CardTitle>
+          <CardDescription className="text-xs">
+            {isEn
+              ? 'Expose per-effort model variants (e.g. Opus 4.8 (Max)) in the model list so clients that can’t set reasoning effort (like OpenCode) can pick effort by choosing a model. Variants appear once models are loaded online.'
+              : '在模型列表中额外暴露按 effort 拆分的变体（如 Opus 4.8 (Max)），让无法调 reasoning effort 的客户端（如 OpenCode）通过选模型来选 effort。需模型已在线加载后变体才会出现。'}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center gap-2">
+            <Switch
+              id="effortVariantsExposed"
+              checked={config.effortVariantsExposed || false}
+              onCheckedChange={(checked) => {
+                setConfig(prev => ({ ...prev, effortVariantsExposed: checked }))
+                window.api.proxyUpdateConfig({ effortVariantsExposed: checked })
+              }}
+            />
+            <Label htmlFor="effortVariantsExposed" className="text-sm cursor-pointer">
+              {config.effortVariantsExposed
+                ? (isEn ? 'Effort variants exposed' : '已暴露 effort 变体')
+                : (isEn ? 'Disabled (no variants)' : '未开启（无变体）')}
+            </Label>
+          </div>
         </CardContent>
       </Card>
 

@@ -724,6 +724,17 @@ export interface ProxyConfig {
    */
   allowedModels?: string[]
 
+  /**
+   * 暴露 effort 变体模型（如 claude-opus-4.8-max / -high / -low）到 /v1/models。
+   * 未设置或 false = 零行为变更（模型列表与路由维持原状）。
+   * 设为 true 后：/v1/models 会为每个支持 thinking 的 Claude 模型按其真实 effort 枚举额外列出
+   * 「{base}-{effort}」条目；客户端选中该变体发起请求时，代理把 suffix 解析为 base 模型 +
+   * 强制注入对应 effort（覆盖客户端自带 effort）。
+   * 用途：让无法在 UI 调 reasoning effort 的客户端（如 OpenCode 的 openai-compatible provider，
+   * 实测会丢弃 reasoning_effort 字段）也能通过「选模型」来选 effort。
+   */
+  effortVariantsExposed?: boolean
+
   // 服务端 web 工具（web_search / web_fetch）配置
   // 启用后，代理会拦截模型发起的 web_search/web_fetch 调用并在代理侧执行（经第三方搜索 API），
   // 把结果喂回对话。未配置 apiKey 或 enabled=false 时，web 工具会被丢弃（避免 Bedrock 400）。

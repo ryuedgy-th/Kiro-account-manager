@@ -176,7 +176,24 @@ function modelDisplayName(id: string, modelName?: string): string {
     .join(' ')
 }
 
-// 内部/历史模型 ID：大写 CW 内部 ID（CLAUDE_SONNET_4_..._V1_0）、simple-task、claude-3.x 历史版本。
+// effort 变体后缀枚举（如 claude-opus-4.8-max 的 "max"）。取 Claude 模型 thinking effort 的并集
+// （opus=[low,medium,high,xhigh,max]、sonnet=[low,medium,high,max]）。仅用于「解析客户端选中的变体 ID」；
+// 生成 /v1/models 变体条目时按各模型真实枚举（见 expandEffortVariants），不依赖此常量。
+const EFFORT_VARIANT_SUFFIXES = ['low', 'medium', 'high', 'xhigh', 'max']
+
+// 从 model ID 拆出 effort 变体后缀，返回 { baseId, effort? }。
+// 仅当 base 是规范 Claude 模型（parseClaudeFamilyVersion 命中）时才拆——避免把恰好以 -max 等结尾的
+// 第三方模型名误拆。纯函数，不读 config：是否启用由调用方（resolveEffortVariant）判定。
+// 注：suffix 必须是 effort 词；版本号短横形式（claude-opus-4-8 的 "8"）不是 effort 词 → 不会被误拆。
+function splitEffortSuffix(modelId: string): { baseId: string; effort?: string } {
+  const m = modelId.match(/^(.+)-(low|medium|high|xhigh|max)$/i)
+  if (!m) return { baseId: modelId }
+  const base = m[1]
+  if (!parseClaudeFamilyVersion(base)) return { baseId: modelId }
+  return { baseId: base, effort: m[2].toLowerCase() }
+}
+
+
 // 这些仍可经 /v1/messages 直接按 ID 调用，只是不进 picker / 费率表（避免列表冗杂、版本无法区分）。
 function isInternalOrLegacyModelId(id: string): boolean {
   const lower = id.toLowerCase()
@@ -2324,6 +2341,50 @@ export class ProxyServer {
     return allow.some(m => canonicalizeModelId(m) === target)
   }
 
+  /**
+   * 解析客户端选中的 effort 变体模型 ID。
+   * 仅当 effortVariantsExposed=true 且 ID 形如「{Claude base}-{effort}」时拆分，否则原样返回。
+   * 调用点：每个请求 path 在 applyModelMapping / isModelAllowed 之前调用，把 model 还原成 base，
+   * 并把 effort 注入请求体（见各 handler）。这样 base 走原有白名单 / 映射逻辑，零额外改动。
+   */
+  private resolveEffortVariant(modelId: string): { baseId: string; effort?: string } {
+    if (this.config.effortVariantsExposed !== true) return { baseId: modelId }
+    return splitEffortSuffix(modelId)
+  }
+
+  /**
+   * 为 /v1/models 列表追加 effort 变体条目。
+   * 规则：对每个「规范 Claude 模型」且「后端返回了真实 effort 枚举（thinkingEfforts 非空）」的 base，
+   * 按其枚举顺序追加 {base.id}-{effort} 条目（保留 base 本身）。其余模型（auto / 第三方 / 无 effort 枚举）
+   * 原样保留、不加变体。必须在 filterPickerModels 之后调用——否则变体 ID 会被按家族收敛掉。
+   */
+  private expandEffortVariants(models: ClientModel[]): ClientModel[] {
+    const EFFORT_ORDER = EFFORT_VARIANT_SUFFIXES
+    const out: ClientModel[] = []
+    for (const m of models) {
+      out.push(m)
+      if (!parseClaudeFamilyVersion(m.id)) continue
+      const efforts = (m.thinkingEfforts || []).filter(e => EFFORT_ORDER.includes(e.toLowerCase()))
+      if (efforts.length === 0) continue
+      // 按 EFFORT_ORDER 稳定排序，避免后端枚举顺序抖动导致列表顺序变化
+      const ordered = EFFORT_ORDER.filter(e => efforts.some(x => x.toLowerCase() === e))
+      for (const eff of ordered) {
+        const cap = eff.charAt(0).toUpperCase() + eff.slice(1)
+        out.push({
+          ...m,
+          id: `${m.id}-${eff}`,
+          name: `${m.name} (${cap})`,
+          model_name: `${m.model_name || m.name} (${cap})`,
+          description: `${m.description} — effort: ${eff}`,
+          reasoning: true,
+          capabilities: { ...m.capabilities, reasoning: true },
+          root: `${m.id}-${eff}`
+        })
+      }
+    }
+    return out
+  }
+
   private applyModelMapping(requestedModel: string, apiKeyId?: string): string {
     const mappings = this.config.modelMappings
     if (!mappings || mappings.length === 0) return requestedModel
@@ -2418,8 +2479,14 @@ export class ProxyServer {
         return
       }
 
-      // API Key 验证（健康检查端点除外）
-      if (path !== '/health' && path !== '/' && !path.startsWith('/portal')) {
+      // API Key 验证（健康检查端点除外）。
+      // /portal（页面+API）走自身 session；/admin 与 /admin/ 是管理面【页面本身】，登录在客户端做
+      // （粘贴 operator key → 调 /admin/* 时才带 Authorization），故页面 HTML 不经此 Key 门。
+      // 注意：仅放行裸 /admin 页面；/admin/* 的 API 仍需经 validateApiKey + validateAdminApiKey 两道。
+      // 用去 query 后的路径判断，与下方路由（pathWithoutQuery）口径一致，避免 /admin?x 走岔。
+      const bareForAuth = path.split('?')[0]
+      const isAdminPage = bareForAuth === '/admin' || bareForAuth === '/admin/'
+      if (path !== '/health' && path !== '/' && !path.startsWith('/portal') && !isAdminPage) {
         const authResult = this.validateApiKey(req)
         if (!authResult.valid) {
           const errorMsg = authResult.reason || 'Invalid or missing API key'
@@ -2492,6 +2559,14 @@ export class ProxyServer {
         // P2-16 Prometheus metrics
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
         res.end(this.renderPrometheusMetrics())
+      } else if (pathWithoutQuery === '/admin' || pathWithoutQuery === '/admin/') {
+        // 运营方管理面页面（静态 HTML）。与 /admin/* API 同一道 adminApiExposed 开关：
+        // 关闭时一律 404（不透露存在）。生产建议在隧道层再套 Cloudflare Access。
+        if (this.config.adminApiExposed !== true) {
+          this.sendError(res, 404, `Not Found: ${pathWithoutQuery}`)
+        } else {
+          this.handleAdminPage(res)
+        }
       } else if (pathWithoutQuery.startsWith('/admin/')) {
         // 管理 API 端点。默认对外关闭（adminApiExposed!==true → 404，与「无此路由」无差别，
         // 不向公网透露其存在）。应用自身管理界面走 Electron IPC，不依赖此 HTTP 接口，故关闭无副作用。
@@ -2635,6 +2710,53 @@ export class ProxyServer {
         return
       }
       this.handleAdminDeleteCustomer(res, customerId)
+    } else if (path === '/admin/api-keys' && method === 'GET') {
+      // 运营方 Key 列表（脱敏：仅 customerId 为空的 operator Key）
+      this.handleAdminListApiKeys(res)
+    } else if (path === '/admin/api-keys' && method === 'POST') {
+      // 创建运营方 Key（format sk/simple/token；返回一次完整 key）
+      await this.handleAdminCreateApiKey(req, res, signal)
+    } else if (/^\/admin\/api-keys\/[^/]+\/reset-usage$/.test(path) && method === 'POST') {
+      // 重置某 Key 的用量统计
+      let keyId: string
+      try { keyId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'API key not found')
+        return
+      }
+      this.handleAdminResetApiKeyUsage(res, keyId)
+    } else if (/^\/admin\/api-keys\/[^/]+$/.test(path) && method === 'PUT') {
+      // 更新运营方 Key（name/enabled/creditsLimit）
+      let keyId: string
+      try { keyId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'API key not found')
+        return
+      }
+      await this.handleAdminUpdateApiKey(req, res, keyId, signal)
+    } else if (/^\/admin\/api-keys\/[^/]+$/.test(path) && method === 'DELETE') {
+      // 删除运营方 Key
+      let keyId: string
+      try { keyId = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'API key not found')
+        return
+      }
+      this.handleAdminDeleteApiKey(res, keyId)
+    } else if (path === '/admin/invites' && method === 'GET') {
+      // 邀请码列表
+      this.sendJson(res, 200, { invites: this.listInvites() })
+    } else if (path === '/admin/invites' && method === 'POST') {
+      // 创建邀请码
+      await this.handleAdminCreateInvite(req, res, signal)
+    } else if (/^\/admin\/invites\/[^/]+$/.test(path) && method === 'DELETE') {
+      // 撤销未使用的邀请码
+      let code: string
+      try { code = decodeURIComponent(path.split('/')[3]) } catch {
+        this.sendError(res, 404, 'Invite not found')
+        return
+      }
+      this.handleAdminRevokeInvite(res, code)
+    } else if (path === '/admin/slip-records' && method === 'GET') {
+      // 收款单（slip）核销记录
+      this.sendJson(res, 200, { records: this.listSlipTopupRecords(50) })
     } else {
       this.sendError(res, 404, 'Admin endpoint not found')
     }
@@ -3106,6 +3228,163 @@ export class ProxyServer {
     }
   }
 
+  // ============ 管理 API - 运营方 API Key 管理 ============
+  //
+  // 运营方 Key = config.apiKeys 中【未绑定 customerId】的 Key（与门户客户自助 Key 区分）。
+  // 这套 HTTP 端点把桌面端 IPC（proxy-add/update/delete/reset-api-key）的能力搬到 /admin，
+  // 共用同一份 config.apiKeys 存储；变更后统一走 onConfigChanged 持久化 + appendAuditLog 审计。
+
+  /** 运营方 Key 列表（脱敏 key，仅返回 customerId 为空的 operator Key） */
+  private handleAdminListApiKeys(res: http.ServerResponse): void {
+    const keys = (this.config.apiKeys || [])
+      .filter(k => !k.customerId)
+      .map(k => ({
+        id: k.id,
+        name: k.name,
+        keyMasked: portal.maskKey(k.key),
+        format: k.format,
+        enabled: k.enabled,
+        createdAt: k.createdAt,
+        lastUsedAt: k.lastUsedAt,
+        creditsLimit: k.creditsLimit ?? null,
+        usage: {
+          totalRequests: k.usage?.totalRequests || 0,
+          totalCredits: k.usage?.totalCredits || 0,
+          totalInputTokens: k.usage?.totalInputTokens || 0,
+          totalOutputTokens: k.usage?.totalOutputTokens || 0
+        }
+      }))
+    this.sendJson(res, 200, { apiKeys: keys })
+  }
+
+  /** 创建运营方 Key。format 决定 key 字符串格式；返回一次完整 key（之后列表只给脱敏值）。 */
+  private async handleAdminCreateApiKey(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    let parsed: { name?: string; format?: 'sk' | 'simple' | 'token'; creditsLimit?: unknown } = {}
+    try { parsed = body ? JSON.parse(body) : {} } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    const creditsLimit = this.normalizeCreditsLimit(parsed.creditsLimit)
+    if (creditsLimit === INVALID_LIMIT) {
+      this.sendError(res, 400, 'creditsLimit must be a positive number')
+      return
+    }
+    const crypto = require('crypto') as typeof import('crypto')
+    const format: 'sk' | 'simple' | 'token' = parsed.format === 'simple' || parsed.format === 'token' ? parsed.format : 'sk'
+    const randomHex = crypto.randomBytes(24).toString('hex')
+    let key: string
+    switch (format) {
+      case 'simple': key = `PROXY_KEY_${randomHex.toUpperCase().substring(0, 32)}`; break
+      case 'token': key = `KEY:${randomHex.substring(0, 16)}:TOKEN:${randomHex.substring(16, 32)}`; break
+      default: key = `sk-${randomHex}`
+    }
+    const existing = this.config.apiKeys || []
+    const newKey: import('./types').ApiKey = {
+      id: crypto.randomUUID(),
+      name: (parsed.name || '').trim().slice(0, 64) || `operator-key-${existing.length + 1}`,
+      key,
+      format,
+      enabled: true,
+      createdAt: Date.now(),
+      usage: { totalRequests: 0, totalCredits: 0, totalInputTokens: 0, totalOutputTokens: 0, daily: {} }
+    }
+    if (typeof creditsLimit === 'number') newKey.creditsLimit = creditsLimit
+    if (!this.config.apiKeys) this.config.apiKeys = []
+    this.config.apiKeys.push(newKey)
+    this.appendAuditLog('admin_key_created', { keyId: newKey.id, name: newKey.name, format })
+    this.events.onConfigChanged?.(this.config)
+    // 仅此一次返回完整 key
+    this.sendJson(res, 200, { id: newKey.id, name: newKey.name, key: newKey.key, format, creditsLimit: newKey.creditsLimit ?? null })
+  }
+
+  /** 更新运营方 Key：name / enabled / creditsLimit。拒绝改 customer Key（customerId 非空）。 */
+  private async handleAdminUpdateApiKey(req: http.IncomingMessage, res: http.ServerResponse, keyId: string, signal?: AbortSignal): Promise<void> {
+    const key = (this.config.apiKeys || []).find(k => k.id === keyId)
+    // 仅允许操作 operator Key（customerId 为空）；客户 Key 不在此端点管理范围内
+    if (!key || key.customerId) {
+      this.sendError(res, 404, 'API key not found')
+      return
+    }
+    const body = await this.readBody(req, signal)
+    let parsed: { name?: unknown; enabled?: unknown; creditsLimit?: unknown } = {}
+    try { parsed = body ? JSON.parse(body) : {} } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    if (typeof parsed.name === 'string') key.name = parsed.name.trim().slice(0, 64) || key.name
+    if (typeof parsed.enabled === 'boolean') key.enabled = parsed.enabled
+    if (parsed.creditsLimit !== undefined) {
+      const creditsLimit = this.normalizeCreditsLimit(parsed.creditsLimit)
+      if (creditsLimit === INVALID_LIMIT) {
+        this.sendError(res, 400, 'creditsLimit must be a positive number')
+        return
+      }
+      if (typeof creditsLimit === 'number') key.creditsLimit = creditsLimit
+      else delete key.creditsLimit
+    }
+    this.appendAuditLog('admin_key_updated', { keyId: key.id, name: key.name, enabled: key.enabled, creditsLimit: key.creditsLimit ?? null })
+    this.events.onConfigChanged?.(this.config)
+    this.sendJson(res, 200, { id: key.id, name: key.name, enabled: key.enabled, creditsLimit: key.creditsLimit ?? null })
+  }
+
+  /** 删除运营方 Key。拒绝删 customer Key（应走客户门户/删客户流程）。 */
+  private handleAdminDeleteApiKey(res: http.ServerResponse, keyId: string): void {
+    const key = (this.config.apiKeys || []).find(k => k.id === keyId)
+    if (!key || key.customerId) {
+      this.sendError(res, 404, 'API key not found')
+      return
+    }
+    this.config.apiKeys = (this.config.apiKeys || []).filter(k => k.id !== keyId)
+    this.appendAuditLog('admin_key_deleted', { keyId })
+    this.events.onConfigChanged?.(this.config)
+    this.sendJson(res, 200, { success: true })
+  }
+
+  /** 重置运营方 Key 的用量统计（不影响 key 本身）。 */
+  private handleAdminResetApiKeyUsage(res: http.ServerResponse, keyId: string): void {
+    const key = (this.config.apiKeys || []).find(k => k.id === keyId)
+    if (!key || key.customerId) {
+      this.sendError(res, 404, 'API key not found')
+      return
+    }
+    key.usage = { totalRequests: 0, totalCredits: 0, totalInputTokens: 0, totalOutputTokens: 0, daily: {} }
+    key.usageHistory = []
+    this.appendAuditLog('admin_key_usage_reset', { keyId })
+    this.events.onConfigChanged?.(this.config)
+    this.sendJson(res, 200, { success: true })
+  }
+
+  // ============ 管理 API - 邀请码 ============
+
+  /** 创建邀请码。校验失败抛 Error（message 可直接展示）。 */
+  private async handleAdminCreateInvite(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    let parsed: { email?: string; name?: string; creditBalance?: number; maxKeys?: number; expiresInDays?: number } = {}
+    try { parsed = body ? JSON.parse(body) : {} } catch {
+      this.sendError(res, 400, 'Invalid JSON body')
+      return
+    }
+    try {
+      const invite = this.createInvite(parsed)
+      this.sendJson(res, 200, { success: true, invite })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to create invite'
+      this.sendError(res, 400, msg)
+    }
+  }
+
+  /** 撤销未使用的邀请码。 */
+  private handleAdminRevokeInvite(res: http.ServerResponse, code: string): void {
+    try {
+      this.revokeInvite(code)
+      this.sendJson(res, 200, { success: true })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed'
+      this.sendError(res, msg === 'Invite not found' ? 404 : 400, msg)
+    }
+  }
+
   // ============ 客户门户 API ============
 
   /** 小工具：发送 JSON 响应 */
@@ -3513,7 +3792,9 @@ export class ProxyServer {
           cacheReadTokens: cacheRead,
           cacheWriteTokens: cacheWrite,
           outputTokens: r.outputTokens,
-          credits: r.credits * this.modelMarkupFor(r.model)
+          credits: r.credits * this.modelMarkupFor(r.model),
+          // 会话分组键（MaxPlus 风格 session 视图）。旧记录无此字段 → 前端按「单条 = 单 session」兜底。
+          sessionId: r.sessionId
         }
       })
 
@@ -3766,6 +4047,12 @@ export class ProxyServer {
     res.end(PORTAL_HTML)
   }
 
+  /** 运营方管理面静态页面（自包含 HTML）。仅在 adminApiExposed=true 时由路由放行；建议外层套 Cloudflare Access。 */
+  private handleAdminPage(res: http.ServerResponse): void {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end(ADMIN_HTML)
+  }
+
   // 管理 API - 详细统计
   private handleAdminStats(res: http.ServerResponse): void {
     const stats = this.getStats()
@@ -3858,6 +4145,7 @@ export class ProxyServer {
       'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
       'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
       'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings', 'allowedModels',
+      'effortVariantsExposed',
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
@@ -4099,8 +4387,12 @@ export class ProxyServer {
       this.sendError(res, 400, 'Invalid Gemini endpoint path')
       return
     }
-    const [, modelId, method] = match
+    const [, rawModelId, method] = match
     const isStream = method === 'streamGenerateContent'
+
+    // effort 变体：从 Gemini model 段还原 base + 取出 effort，注入下方 openaiRequest。
+    const evGem = this.resolveEffortVariant(rawModelId)
+    const modelId = evGem.baseId
 
     // 将 Gemini 请求转为 OpenAI 格式
     const messages: OpenAIMessage[] = []
@@ -4123,7 +4415,8 @@ export class ProxyServer {
       stream: isStream,
       temperature: geminiReq.generationConfig?.temperature,
       top_p: geminiReq.generationConfig?.topP,
-      max_tokens: geminiReq.generationConfig?.maxOutputTokens
+      max_tokens: geminiReq.generationConfig?.maxOutputTokens,
+      ...(evGem.effort ? { reasoning_effort: evGem.effort } : {})
     }
 
     // 模型白名单拦截
@@ -4391,10 +4684,15 @@ export class ProxyServer {
     //    同一 Claude 家族只留最新版本 + 剔除内部/历史 ID，避免 Cowork/Claude Code
     //    下拉里出现一堆无法区分的 "Opus 4"。被剔除的模型仍可经 /v1/messages 按 ID 直调。
     const pickerModels = filterPickerModels(allModels).filter(m => this.isModelAllowed(m.id))
+    // effort 变体（如 claude-opus-4.8-max）：仅在开关开启时追加，按各模型真实 effort 枚举生成。
+    // 必须在 filterPickerModels 之后——否则变体 ID 会被按 Claude 家族收敛掉。
+    const listModels = this.config.effortVariantsExposed === true
+      ? this.expandEffortVariants(pickerModels)
+      : pickerModels
 
     this.throwIfResponseClosed(res, signal)
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ object: 'list', data: pickerModels }))
+    res.end(JSON.stringify({ object: 'list', data: listModels }))
   }
 
   // 处理 OpenAI Chat Completions 请求
@@ -4403,6 +4701,12 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     const request: OpenAIChatRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+
+    // effort 变体：把 claude-opus-4.8-max 还原成 base + 强制注入 effort（覆盖客户端自带值）。
+    // 必须在 applyModelMapping / isModelAllowed 之前——让 base 走原有逻辑。
+    const evChat = this.resolveEffortVariant(request.model)
+    request.model = evChat.baseId
+    if (evChat.effort) request.reasoning_effort = evChat.effort
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
     const rawHintChat = ProxyServer.extractSessionHint(req, request)
@@ -4541,6 +4845,10 @@ export class ProxyServer {
     try {
       responseRequest = JSON.parse(body)
       chatRequest = responsesToOpenAIChat(responseRequest)
+      // effort 变体：还原 base + 注入 reasoning_effort（与 chat path 同口径）。
+      const evResp = this.resolveEffortVariant(chatRequest.model)
+      chatRequest.model = evResp.baseId
+      if (evResp.effort) chatRequest.reasoning_effort = evResp.effort
       // session hint：用于会话粘性
       const rawHintResp = ProxyServer.extractSessionHint(req, responseRequest)
       if (rawHintResp) {
@@ -4906,6 +5214,12 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     const request: ClaudeRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+
+    // effort 变体：还原 base + 注入 effort。Claude path 经 output_config.effort 下发
+    // （deriveClaudeEffort 优先读 output_config.effort），覆盖客户端自带值。
+    const evClaude = this.resolveEffortVariant(request.model)
+    request.model = evClaude.baseId
+    if (evClaude.effort) request.output_config = { ...request.output_config, effort: evClaude.effort }
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
     const rawHint = ProxyServer.extractSessionHint(req, request)
@@ -6227,6 +6541,25 @@ const PORTAL_HTML = `<!doctype html>
   .chart { width:100%; height:130px; display:block; }
   .chart-empty { color:var(--muted); font-size:13px; padding:30px 0; text-align:center; }
   .legend { font-size:12px; color:var(--muted); margin-top:8px; }
+
+  /* ===== session-grouped usage history (MaxPlus-style cards) ===== */
+  .sess-list { display:flex; flex-direction:column; gap:10px; }
+  .sess-card { border:1px solid var(--border); border-radius:14px; overflow:hidden; background:var(--card); }
+  .sess-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; cursor:pointer; flex-wrap:wrap; }
+  .sess-head:hover { background:var(--card-soft); }
+  .sess-id-wrap { display:flex; align-items:center; gap:11px; min-width:0; }
+  .sess-dot { width:11px; height:11px; border-radius:50%; flex-shrink:0; }
+  .sess-id-line { display:flex; align-items:center; gap:7px; }
+  .sess-id-line .lbl { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:700; }
+  .sess-id { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-weight:800; font-size:14px; letter-spacing:.02em; }
+  .sess-meta { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .sess-tok { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .sess-cred { font-size:14px; font-weight:800; color:var(--accent-d); font-variant-numeric:tabular-nums; }
+  .sess-caret { color:var(--muted); font-size:11px; transition:transform .15s; }
+  .sess-body { border-top:1px solid var(--border); padding:2px 14px 6px; overflow-x:auto; }
+  .sess-body table { font-size:12.5px; }
+  .sess-card.collapsed .sess-body { display:none; }
+  .sess-card.collapsed .sess-caret { transform:rotate(-90deg); }
   .login-center { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; }
   .login-card { width:100%; max-width:400px; }
   .login-card .card { box-shadow:var(--shadow); border-radius:20px; padding:24px; }
@@ -6391,13 +6724,8 @@ const PORTAL_HTML = `<!doctype html>
         <section class="tab hide" data-panel="usage">
           <h2>ประวัติการใช้งานล่าสุด</h2>
           <div class="card">
-            <div class="muted" style="margin-bottom:8px">50 รายการล่าสุด · credits คือยอดที่หักจริง · input แยกเป็น ปกติ / cache-read / cache-write (cache-read คิดถูกกว่ามาก)</div>
-            <div style="overflow-x:auto">
-              <table>
-                <thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">input (ปกติ/cache-r/cache-w)</th><th class="num">output</th><th class="num">credits</th></tr></thead>
-                <tbody id="historyRows"></tbody>
-              </table>
-            </div>
+            <div class="muted" style="margin-bottom:10px">50 รายการล่าสุด · จัดกลุ่มตาม session · credits คือยอดที่หักจริง · input แยกเป็น ปกติ / cache-read / cache-write (cache-read คิดถูกกว่ามาก)</div>
+            <div class="sess-list" id="historyRows"></div>
             <div class="empty" id="historyEmpty"></div>
           </div>
 
@@ -7200,31 +7528,108 @@ const PORTAL_HTML = `<!doctype html>
     return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
   }
 
+  // session 颜色：按 id 稳定 hash 取色板里一种（与 MaxPlus 每会话一色一致）
+  var SESS_COLORS = ['#6366f1','#10b981','#f59e0b','#ef4444','#0ea5e9','#a855f7','#ec4899','#14b8a6'];
+  function sessColor(id){
+    var h = 0; var s = String(id||'');
+    for (var i=0;i<s.length;i++){ h = (h*31 + s.charCodeAt(i)) >>> 0; }
+    return SESS_COLORS[h % SESS_COLORS.length];
+  }
+  // session 短 id：取 UUID 第一段（'-' 前），最多 8 位；无 id → '—'
+  function shortSid(id){
+    if (!id) return '—';
+    var s = String(id);
+    var dash = s.indexOf('-');
+    return (dash > 0 ? s.slice(0, dash) : s).slice(0, 8);
+  }
+
   function renderHistory(){
     if (!lastUsage) return;
     var hist = lastUsage.recentHistory || [];
-    var rows = $('historyRows'); rows.innerHTML = '';
+    var wrap = $('historyRows'); wrap.innerHTML = '';
     if (hist.length === 0){
       $('historyEmpty').textContent = 'ยังไม่มีประวัติการใช้งาน';
       return;
     }
     $('historyEmpty').textContent = '';
-    hist.forEach(function(rec){
-      // input 三段：ปกติ(uncached) / cache-read / cache-write；旧记录无拆分字段时 uncached 兜底为 inputTokens
-      var uncached = (rec.uncachedInputTokens != null) ? rec.uncachedInputTokens : rec.inputTokens;
-      var cr = rec.cacheReadTokens || 0;
-      var cw = rec.cacheWriteTokens || 0;
-      var inputCell = fmtTokens(uncached) + ' / ' + fmtTokens(cr) + ' / ' + fmtTokens(cw);
-      var inputTitle = 'input ปกติ: ' + fmtInt(uncached) + '\\ncache-read: ' + fmtInt(cr) + '\\ncache-write: ' + fmtInt(cw) + '\\nรวม input: ' + fmtInt(rec.inputTokens);
-      var bar = effortColor(rec.effort||'none');
-      var tr = document.createElement('tr');
-      tr.innerHTML = '<td class="muted" style="border-left:3px solid '+bar+'; padding-left:10px">'+esc(fmtTime(rec.timestamp))+'</td>'
-        + '<td>'+esc(displayModelName(rec.model))+'</td>'
-        + '<td>'+esc(effortLabel(rec.effort||'none'))+'</td>'
-        + '<td class="num" title="'+esc(inputTitle)+'">'+inputCell+'</td>'
-        + '<td class="num">'+fmtTokens(rec.outputTokens)+'</td>'
-        + '<td class="num">'+fmt(rec.credits)+'</td>';
-      rows.appendChild(tr);
+
+    // 按 sessionId 分组；无 sessionId 的旧记录各自成组（不合并），保持「单条 = 单 session」兜底
+    var groups = []; var byId = {};
+    hist.forEach(function(rec, idx){
+      var sid = rec.sessionId;
+      var key = (sid != null) ? ('s:' + sid) : ('solo:' + idx);
+      var g = byId[key];
+      if (!g){
+        g = { sid: sid, key: key, recs: [], credits: 0, inTok: 0, outTok: 0, tsMax: 0 };
+        byId[key] = g; groups.push(g);
+      }
+      g.recs.push(rec);
+      g.credits += (rec.credits || 0);
+      g.inTok += (rec.inputTokens || 0);
+      g.outTok += (rec.outputTokens || 0);
+      if (rec.timestamp > g.tsMax) g.tsMax = rec.timestamp;
+    });
+    // 会话按最近活动时间倒序
+    groups.sort(function(a,b){ return b.tsMax - a.tsMax; });
+
+    groups.forEach(function(g){
+      g.recs.sort(function(a,b){ return b.timestamp - a.timestamp; });
+      var totalTok = g.inTok + g.outTok;
+      var color = sessColor(g.sid || g.key);
+
+      var card = document.createElement('div');
+      card.className = 'sess-card';
+
+      // ---- header（会话汇总：短 id + 请求数 + 总 token + 总 credit）----
+      var head = document.createElement('div');
+      head.className = 'sess-head';
+      head.innerHTML =
+        '<div class="sess-id-wrap">'
+        +   '<span class="sess-dot" style="background:'+color+'"></span>'
+        +   '<div>'
+        +     '<div class="sess-id-line"><span class="lbl">session</span><span class="sess-id">'+esc(shortSid(g.sid))+'</span></div>'
+        +     '<div class="muted" style="font-size:11px">'+esc(fmtTime(g.tsMax))+'</div>'
+        +   '</div>'
+        + '</div>'
+        + '<div class="sess-meta">'
+        +   '<span class="chip">'+fmtInt(g.recs.length)+' req</span>'
+        +   '<span class="sess-tok">'+fmtTokens(totalTok)+' tokens</span>'
+        +   '<span class="sess-cred">'+fmt(g.credits)+'</span>'
+        +   '<span class="sess-caret">&#9660;</span>'
+        + '</div>';
+      head.addEventListener('click', function(){ card.classList.toggle('collapsed'); });
+      card.appendChild(head);
+
+      // ---- body（该会话的逐请求明细）----
+      var body = document.createElement('div');
+      body.className = 'sess-body';
+      var rowsHtml = '';
+      g.recs.forEach(function(rec){
+        // input 三段：ปกติ(uncached) / cache-read / cache-write；旧记录无拆分字段时 uncached 兜底为 inputTokens
+        var uncached = (rec.uncachedInputTokens != null) ? rec.uncachedInputTokens : rec.inputTokens;
+        var cr = rec.cacheReadTokens || 0;
+        var cw = rec.cacheWriteTokens || 0;
+        var inputCell = fmtTokens(uncached) + ' / ' + fmtTokens(cr) + ' / ' + fmtTokens(cw);
+        var inputTitle = 'input ปกติ: ' + fmtInt(uncached) + '\\ncache-read: ' + fmtInt(cr) + '\\ncache-write: ' + fmtInt(cw) + '\\nรวม input: ' + fmtInt(rec.inputTokens);
+        var bar = effortColor(rec.effort||'none');
+        rowsHtml +=
+          '<tr>'
+          + '<td class="muted" style="border-left:3px solid '+bar+'; padding-left:10px">'+esc(fmtTime(rec.timestamp))+'</td>'
+          + '<td>'+esc(displayModelName(rec.model))+'</td>'
+          + '<td>'+esc(effortLabel(rec.effort||'none'))+'</td>'
+          + '<td class="num" title="'+esc(inputTitle)+'">'+inputCell+'</td>'
+          + '<td class="num">'+fmtTokens(rec.outputTokens)+'</td>'
+          + '<td class="num">'+fmt(rec.credits)+'</td>'
+          + '</tr>';
+      });
+      body.innerHTML =
+        '<table>'
+        + '<thead><tr><th>เวลา</th><th>โมเดล</th><th>effort</th><th class="num">input (ปกติ/cache-r/cache-w)</th><th class="num">output</th><th class="num">credits</th></tr></thead>'
+        + '<tbody>'+rowsHtml+'</tbody>'
+        + '</table>';
+      card.appendChild(body);
+
+      wrap.appendChild(card);
     });
   }
 
@@ -7286,6 +7691,483 @@ const PORTAL_HTML = `<!doctype html>
   if (goKeys) goKeys.addEventListener('click', function(){ selectTab('keys'); });
 
   if (token) loadDash(); else { show('login'); initGoogle(); }
+})();
+</script>
+</body>
+</html>`
+
+// ============================================================================
+// 运营方 Web 管理面 (Admin Dashboard) —— 自包含 HTML，经 Cloudflare Access 保护后对外。
+// 与客户门户 PORTAL_HTML 同源同 port，仅 path 前缀 /admin 区分。复用同一套配色/组件类。
+// 登录：粘贴 operator key（= config.apiKeys 中未绑定 customerId 的 Key）→ 存 localStorage →
+// 以 Authorization: Bearer 调 /admin/* 。所有写操作后端已 appendAuditLog + onConfigChanged 持久化。
+// ============================================================================
+const ADMIN_HTML = `<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#eef2f1; --bg2:#e7edec; --shell:#ffffff; --card:#ffffff; --card-soft:#f5f8f7;
+    --border:#e7ecf1; --border2:#dde4ea; --txt:#0f1b2d; --txt2:#46566b; --muted:#5a6675;
+    --accent:#10b981; --accent2:#34d399; --accent3:#6ee7b7; --accent-d:#059669; --accent-dd:#047857;
+    --accent-ink:#04231a; --accent-dim:rgba(16,185,129,.10);
+    --blue:#3b82f6; --danger:#e11d48; --ok:#10b981; --warn:#f59e0b;
+    --radius:22px; --shadow:0 1px 3px rgba(15,27,45,.06);
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; color:var(--txt); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","IBM Plex Sans Thai",Roboto,sans-serif; background:var(--bg); min-height:100vh; -webkit-font-smoothing:antialiased; line-height:1.5; }
+  .shell { max-width:1240px; margin:22px auto; min-height:calc(100vh - 44px); display:grid; grid-template-columns:240px 1fr; background:var(--shell); border:1px solid var(--border); border-radius:28px; box-shadow:var(--shadow); overflow:hidden; }
+  .sidebar { border-right:1px solid var(--border); padding:24px 18px; display:flex; flex-direction:column; gap:6px; background:#fbfdfc; }
+  .brand-row { display:flex; align-items:center; gap:11px; font-weight:800; font-size:17px; letter-spacing:-.01em; padding:2px 6px 18px; }
+  .logo { width:34px; height:34px; border-radius:11px; flex-shrink:0; background:var(--accent-dim); display:inline-flex; align-items:center; justify-content:center; font-size:18px; color:var(--accent-d); }
+  .nav-item { display:flex; align-items:center; gap:11px; padding:11px 13px; border-radius:12px; font-size:14px; font-weight:600; color:var(--muted); cursor:pointer; border:none; background:transparent; text-align:left; width:100%; transition:background .12s,color .12s; }
+  .nav-item:hover { background:var(--card-soft); color:var(--txt2); }
+  .nav-item.on { background:var(--accent-dim); color:var(--accent-d); }
+  .nav-spacer { flex:1; }
+  .main { padding:30px 34px 44px; min-width:0; overflow-x:hidden; }
+  h1 { font-size:26px; font-weight:800; margin:0; letter-spacing:-.02em; }
+  h2 { font-size:12px; margin:26px 0 12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-weight:700; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:18px; padding:20px; margin-bottom:16px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
+  .stat { background:var(--card-soft); border:1px solid var(--border); border-radius:14px; padding:15px 16px; }
+  .stat .v { font-size:23px; font-weight:800; letter-spacing:-.01em; }
+  .stat .k { font-size:12px; color:var(--muted); margin-top:3px; }
+  .stat.accent { background:var(--accent-dim); border-color:rgba(16,185,129,.22); }
+  .stat.accent .v { color:var(--accent-d); }
+  input,select { width:100%; padding:11px 13px; border:1px solid var(--border2); border-radius:11px; background:#fbfdfc; color:var(--txt); font-size:14px; transition:border-color .15s, box-shadow .15s; }
+  input:focus,select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); background:#fff; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 5px; font-weight:500; }
+  button { padding:10px 16px; border:none; border-radius:11px; background:var(--accent-dd); color:#fff; font-size:14px; font-weight:700; cursor:pointer; transition:opacity .15s, transform .08s; white-space:nowrap; }
+  button:hover { opacity:.94; } button:active { transform:translateY(1px); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.secondary { background:#fff; color:var(--txt2); border:1px solid var(--border2); }
+  button.secondary:hover { background:var(--card-soft); }
+  button.danger { background:rgba(225,29,72,.08); color:var(--danger); border:1px solid rgba(225,29,72,.22); }
+  button.tiny { padding:5px 10px; font-size:12px; border-radius:8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:none; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  code { background:var(--card-soft); padding:3px 7px; border-radius:6px; font-size:12px; word-break:break-all; border:1px solid var(--border); color:var(--txt2); }
+  .chip { display:inline-block; font-size:12px; font-weight:700; padding:3px 10px; border-radius:999px; background:var(--accent-dim); color:var(--accent-d); }
+  .pill { display:inline-block; font-size:11px; padding:2px 9px; border-radius:999px; font-weight:600; }
+  .pill.ok { background:var(--accent-dim); color:var(--accent-d); }
+  .pill.off { background:rgba(225,29,72,.10); color:var(--danger); }
+  .empty { color:var(--muted); font-size:13px; padding:14px 0; text-align:center; }
+  .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
+  .hide { display:none; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:18px; flex-wrap:wrap; }
+  .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.3); border-radius:12px; padding:14px; margin-top:12px; color:var(--accent-d); font-weight:600; word-break:break-all; }
+  .keybox code { background:#fff; color:var(--txt); }
+  /* login */
+  .login-center { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .login-card { width:100%; max-width:400px; background:var(--card); border:1px solid var(--border); border-radius:20px; padding:28px; box-shadow:var(--shadow); }
+  /* modal */
+  .modal-bg { position:fixed; inset:0; background:rgba(15,27,45,.45); display:flex; align-items:center; justify-content:center; padding:20px; z-index:60; }
+  .modal { background:var(--card); border-radius:18px; padding:24px; width:100%; max-width:440px; box-shadow:0 20px 60px -15px rgba(15,27,45,.4); }
+  .modal h3 { margin:0 0 4px; font-size:18px; }
+  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:18px; }
+  @media (max-width:860px){ .shell { grid-template-columns:1fr; margin:0; border-radius:0; min-height:100vh; } .sidebar { flex-direction:row; flex-wrap:wrap; border-right:none; border-bottom:1px solid var(--border); } .nav-spacer { display:none; } .main { padding:20px 16px 40px; } th,td { padding:8px 5px; } }
+</style>
+</head>
+<body>
+  <!-- ===== LOGIN ===== -->
+  <div id="loginView" class="login-center">
+    <div class="login-card">
+      <div class="brand-row" style="padding-bottom:12px"><span class="logo">⚙️</span> Admin Dashboard</div>
+      <div class="muted" style="margin-bottom:16px">ใส่ operator key เพื่อเข้าจัดการระบบ</div>
+      <label>Operator API Key</label>
+      <input id="keyInput" type="password" placeholder="sk-... หรือ PROXY_KEY_..." autocomplete="off">
+      <button id="loginBtn" style="width:100%; margin-top:14px">เข้าสู่ระบบ</button>
+      <div class="err" id="loginErr"></div>
+      <div class="muted" style="font-size:12px; margin-top:10px; line-height:1.5">หน้านี้ควรอยู่หลัง Cloudflare Access (Zero Trust). operator key คือ API key ที่ไม่ผูกกับลูกค้า</div>
+    </div>
+  </div>
+
+  <!-- ===== DASHBOARD ===== -->
+  <div id="dashView" class="shell hide">
+    <aside class="sidebar">
+      <div class="brand-row"><span class="logo">⚙️</span> Admin</div>
+      <button class="nav-item on" data-tab="overview">📊 ภาพรวม</button>
+      <button class="nav-item" data-tab="customers">👥 ลูกค้า</button>
+      <button class="nav-item" data-tab="keys">🔑 API Keys</button>
+      <button class="nav-item" data-tab="invites">✉️ Invites</button>
+      <button class="nav-item" data-tab="audit">📜 Audit</button>
+      <div class="nav-spacer"></div>
+      <button class="nav-item" id="logoutBtn">🚪 ออกจากระบบ</button>
+    </aside>
+    <main class="main">
+      <!-- Overview -->
+      <section class="tab" data-panel="overview">
+        <div class="topbar"><h1>ภาพรวมระบบ</h1><button class="secondary tiny" id="refreshOverview">รีเฟรช</button></div>
+        <div class="stats" id="statBoxes"></div>
+        <h2>สุขภาพ Account Pool</h2>
+        <div class="card"><div class="stats" id="poolBoxes"></div></div>
+        <h2>คำขอล่าสุด</h2>
+        <div class="card" style="overflow-x:auto">
+          <table><thead><tr><th>เวลา</th><th>path</th><th class="num">status</th><th class="num">tokens</th></tr></thead><tbody id="recentRows"></tbody></table>
+          <div class="empty hide" id="recentEmpty">ยังไม่มีคำขอ</div>
+        </div>
+      </section>
+
+      <!-- Customers -->
+      <section class="tab hide" data-panel="customers">
+        <div class="topbar"><h1>ลูกค้า</h1><button id="newCustomerBtn">+ สร้างลูกค้า</button></div>
+        <div class="card" style="overflow-x:auto">
+          <table>
+            <thead><tr><th>อีเมล</th><th>ชื่อ</th><th class="num">credit</th><th class="num">keys</th><th>สถานะ</th><th></th></tr></thead>
+            <tbody id="custRows"></tbody>
+          </table>
+          <div class="empty hide" id="custEmpty">ยังไม่มีลูกค้า</div>
+        </div>
+      </section>
+
+      <!-- API Keys -->
+      <section class="tab hide" data-panel="keys">
+        <div class="topbar"><h1>API Keys (operator)</h1><button id="newKeyBtn">+ สร้าง key</button></div>
+        <div class="card" style="overflow-x:auto">
+          <table>
+            <thead><tr><th>ชื่อ</th><th>key</th><th>format</th><th class="num">requests</th><th class="num">credits</th><th>สถานะ</th><th></th></tr></thead>
+            <tbody id="keyRows"></tbody>
+          </table>
+          <div class="empty hide" id="keyEmpty">ยังไม่มี key</div>
+        </div>
+      </section>
+
+      <!-- Invites -->
+      <section class="tab hide" data-panel="invites">
+        <div class="topbar"><h1>Invite Codes</h1><button id="newInviteBtn">+ สร้าง invite</button></div>
+        <div class="card" style="overflow-x:auto">
+          <table>
+            <thead><tr><th>code</th><th>อีเมล</th><th class="num">credit</th><th>หมดอายุ</th><th>สถานะ</th><th></th></tr></thead>
+            <tbody id="inviteRows"></tbody>
+          </table>
+          <div class="empty hide" id="inviteEmpty">ยังไม่มี invite</div>
+        </div>
+      </section>
+
+      <!-- Audit -->
+      <section class="tab hide" data-panel="audit">
+        <div class="topbar"><h1>Audit Log</h1><button class="secondary tiny" id="clearCacheBtn">ล้าง cache</button></div>
+        <div class="muted" style="margin-bottom:10px">บันทึกการกระทำล่าสุด (เปิดได้เมื่อ enableAuditLog = true)</div>
+        <div class="card" style="overflow-x:auto">
+          <table><thead><tr><th>เวลา</th><th>ประเภท</th><th>รายละเอียด</th></tr></thead><tbody id="auditRows"></tbody></table>
+          <div class="empty hide" id="auditEmpty">ยังไม่มีบันทึก (หรือ enableAuditLog ปิดอยู่)</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modalRoot"></div>
+
+<script>
+(function(){
+  var TOKEN_KEY = 'admin_operator_key';
+  var token = localStorage.getItem(TOKEN_KEY) || '';
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function fmt(n){ return (Math.round((n||0)*1000)/1000).toLocaleString(); }
+  function fmtInt(n){ return Math.round(n||0).toLocaleString(); }
+  function fmtTokens(n){ n=n||0; if(n>=1e9)return (Math.round(n/1e8)/10)+'B'; if(n>=1e6)return (Math.round(n/1e5)/10)+'M'; if(n>=1e3)return (Math.round(n/100)/10)+'K'; return String(Math.round(n)); }
+  function fmtTime(ts){ if(!ts) return '—'; var d=new Date(ts); function p(n){return (n<10?'0':'')+n;} return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes()); }
+  function fmtDate(ts){ if(!ts) return '—'; var d=new Date(ts); function p(n){return (n<10?'0':'')+n;} return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
+
+  function api(path, opts){
+    opts = opts || {};
+    var headers = { 'Content-Type':'application/json' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    return fetch(path, { method: opts.method || 'GET', headers: headers, body: opts.body ? JSON.stringify(opts.body) : undefined })
+      .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(j){ return { ok: r.ok, status: r.status, data: j }; }); })
+      .catch(function(){ return { ok:false, status:0, data:{} }; });
+  }
+
+  function show(view){ $('loginView').classList.toggle('hide', view!=='login'); $('dashView').classList.toggle('hide', view!=='dash'); }
+  function selectTab(name){
+    Array.prototype.forEach.call(document.querySelectorAll('.nav-item[data-tab]'), function(b){ b.classList.toggle('on', b.getAttribute('data-tab')===name); });
+    Array.prototype.forEach.call(document.querySelectorAll('.tab[data-panel]'), function(p){ p.classList.toggle('hide', p.getAttribute('data-panel')!==name); });
+    if (name==='overview') loadOverview();
+    else if (name==='customers') loadCustomers();
+    else if (name==='keys') loadKeys();
+    else if (name==='invites') loadInvites();
+    else if (name==='audit') loadAudit();
+  }
+
+  // ---- login ----
+  function doLogin(){
+    var k = $('keyInput').value.trim();
+    if (!k){ $('loginErr').textContent='กรุณาใส่ key'; return; }
+    $('loginErr').textContent=''; $('loginBtn').disabled=true;
+    token = k;
+    api('/admin/stats').then(function(r){
+      $('loginBtn').disabled=false;
+      if (r.ok){ localStorage.setItem(TOKEN_KEY, k); show('dash'); selectTab('overview'); }
+      else { token=''; $('loginErr').textContent = r.status===401 ? 'key ไม่ถูกต้อง หรือไม่ใช่ operator key' : ('เข้าสู่ระบบไม่สำเร็จ ('+r.status+')'); }
+    });
+  }
+  function logout(){ token=''; localStorage.removeItem(TOKEN_KEY); $('keyInput').value=''; show('login'); }
+
+  // ---- overview ----
+  function loadOverview(){
+    api('/admin/stats').then(function(r){
+      if (!r.ok){ if(r.status===401) logout(); return; }
+      var s = r.data || {};
+      var up = s.uptime ? Math.floor(s.uptime/1000) : 0;
+      var upStr = up>=3600 ? (Math.floor(up/3600)+'ชม '+Math.floor((up%3600)/60)+'น') : (Math.floor(up/60)+'น');
+      var boxes = [
+        { k:'คำขอทั้งหมด', v:fmtInt(s.totalRequests), accent:true },
+        { k:'สำเร็จ', v:fmtInt(s.successRequests) },
+        { k:'ล้มเหลว', v:fmtInt(s.failedRequests) },
+        { k:'tokens รวม', v:fmtTokens(s.totalTokens) },
+        { k:'uptime', v:upStr }
+      ];
+      $('statBoxes').innerHTML = boxes.map(function(b){ return '<div class="stat'+(b.accent?' accent':'')+'"><div class="v">'+esc(b.v)+'</div><div class="k">'+esc(b.k)+'</div></div>'; }).join('');
+      // recent requests
+      var recent = s.recentRequests || [];
+      var rb = $('recentRows'); rb.innerHTML='';
+      $('recentEmpty').classList.toggle('hide', recent.length>0);
+      recent.slice(-30).reverse().forEach(function(rq){
+        var tr=document.createElement('tr');
+        tr.innerHTML='<td class="muted">'+esc(fmtTime(rq.time||rq.timestamp))+'</td><td>'+esc(rq.path||'—')+'</td><td class="num">'+esc(String(rq.status||'—'))+'</td><td class="num">'+fmtTokens(rq.tokens)+'</td>';
+        rb.appendChild(tr);
+      });
+    });
+    api('/admin/accounts').then(function(r){
+      if (!r.ok) return;
+      var a = r.data || {};
+      $('poolBoxes').innerHTML =
+        '<div class="stat accent"><div class="v">'+fmtInt(a.total)+'</div><div class="k">บัญชีทั้งหมด</div></div>'+
+        '<div class="stat"><div class="v">'+fmtInt(a.available)+'</div><div class="k">พร้อมใช้</div></div>';
+    });
+  }
+
+  // ---- customers ----
+  function loadCustomers(){
+    api('/admin/customers').then(function(r){
+      if (!r.ok){ if(r.status===401) logout(); return; }
+      var list = (r.data && r.data.customers) || [];
+      var tb=$('custRows'); tb.innerHTML='';
+      $('custEmpty').classList.toggle('hide', list.length>0);
+      list.forEach(function(c){
+        var tr=document.createElement('tr');
+        var statusPill = c.enabled ? '<span class="pill ok">เปิด</span>' : '<span class="pill off">ปิด</span>';
+        tr.innerHTML =
+          '<td>'+esc(c.email)+'</td>'+
+          '<td class="muted">'+esc(c.name||'—')+'</td>'+
+          '<td class="num"><strong>'+fmt(c.creditBalance)+'</strong></td>'+
+          '<td class="num">'+fmtInt(c.keyCount)+' / '+fmtInt(c.maxKeys)+'</td>'+
+          '<td>'+statusPill+'</td>'+
+          '<td class="num"></td>';
+        var actions=document.createElement('div'); actions.className='row'; actions.style.justifyContent='flex-end';
+        actions.appendChild(mkBtn('เติม', 'tiny', function(){ topupModal(c); }));
+        actions.appendChild(mkBtn(c.enabled?'ปิด':'เปิด', 'tiny secondary', function(){ toggleCustomer(c); }));
+        actions.appendChild(mkBtn('รหัสผ่าน', 'tiny secondary', function(){ pwModal(c); }));
+        actions.appendChild(mkBtn('ลบ', 'tiny danger', function(){ delCustomer(c); }));
+        tr.lastChild.appendChild(actions);
+        tb.appendChild(tr);
+      });
+    });
+  }
+  function mkBtn(label, cls, fn){ var b=document.createElement('button'); b.className=cls; b.textContent=label; b.addEventListener('click',fn); return b; }
+
+  function topupModal(c){
+    openModal('เติม/หัก credit — '+esc(c.email),
+      '<label>จำนวน (ติดลบ = หัก)</label><input id="m_amount" type="number" step="any" placeholder="เช่น 100 หรือ -50">'+
+      '<label>หมายเหตุ</label><input id="m_note" placeholder="optional">'+
+      '<div class="muted" style="margin-top:8px">ยอดปัจจุบัน: '+fmt(c.creditBalance)+'</div>',
+      function(){
+        var amt = parseFloat($('m_amount').value);
+        if (!isFinite(amt) || amt===0){ return 'กรุณาใส่จำนวน'; }
+        return api('/admin/customers/'+encodeURIComponent(c.id)+'/credit', { method:'POST', body:{ amount:amt, note:$('m_note').value||undefined } }).then(function(r){
+          if (r.ok){ closeModal(); loadCustomers(); } else return (r.data&&r.data.error)||'ล้มเหลว';
+        });
+      });
+  }
+  function pwModal(c){
+    openModal('รีเซ็ตรหัสผ่าน — '+esc(c.email),
+      '<label>รหัสผ่านใหม่ (อย่างน้อย 8 ตัว)</label><input id="m_pw" type="text" placeholder="รหัสผ่านใหม่">',
+      function(){
+        var pw=$('m_pw').value||'';
+        if (pw.length<8) return 'รหัสผ่านสั้นเกินไป';
+        return api('/admin/customers/'+encodeURIComponent(c.id)+'/password', { method:'POST', body:{ password:pw } }).then(function(r){
+          if (r.ok){ closeModal(); } else return (r.data&&r.data.error)||'ล้มเหลว';
+        });
+      });
+  }
+  function toggleCustomer(c){
+    var act = c.enabled ? 'disable' : 'enable';
+    api('/admin/customers/'+encodeURIComponent(c.id)+'/'+act, { method:'POST' }).then(function(r){ if(r.ok) loadCustomers(); });
+  }
+  function delCustomer(c){
+    openConfirm('ลบลูกค้า '+esc(c.email)+'? Key ทั้งหมดของลูกค้านี้จะถูกเพิกถอนด้วย', function(){
+      return api('/admin/customers/'+encodeURIComponent(c.id), { method:'DELETE' }).then(function(r){ if(r.ok){ closeModal(); loadCustomers(); } else return (r.data&&r.data.error)||'ล้มเหลว'; });
+    });
+  }
+  function newCustomer(){
+    openModal('สร้างลูกค้าใหม่',
+      '<label>อีเมล</label><input id="m_email" type="email" placeholder="user@example.com">'+
+      '<label>รหัสผ่าน (อย่างน้อย 8 ตัว)</label><input id="m_pw" type="text">'+
+      '<label>ชื่อ (optional)</label><input id="m_name">'+
+      '<label>credit เริ่มต้น (optional)</label><input id="m_credit" type="number" step="any" placeholder="0">',
+      function(){
+        var email=($('m_email').value||'').trim(); var pw=$('m_pw').value||'';
+        if(!email) return 'กรุณาใส่อีเมล'; if(pw.length<8) return 'รหัสผ่านสั้นเกินไป';
+        var credit=parseFloat($('m_credit').value);
+        return api('/admin/customers', { method:'POST', body:{ email:email, password:pw, name:$('m_name').value||undefined, creditBalance: isFinite(credit)?credit:undefined } }).then(function(r){
+          if(r.ok){ closeModal(); loadCustomers(); } else return (r.data&&r.data.error)||'ล้มเหลว';
+        });
+      });
+  }
+
+  // ---- api keys ----
+  function loadKeys(){
+    api('/admin/api-keys').then(function(r){
+      if(!r.ok){ if(r.status===401) logout(); return; }
+      var list=(r.data&&r.data.apiKeys)||[];
+      var tb=$('keyRows'); tb.innerHTML='';
+      $('keyEmpty').classList.toggle('hide', list.length>0);
+      list.forEach(function(k){
+        var tr=document.createElement('tr');
+        var statusPill = k.enabled ? '<span class="pill ok">เปิด</span>' : '<span class="pill off">ปิด</span>';
+        var lim = k.creditsLimit!=null ? (' / '+fmt(k.creditsLimit)) : '';
+        tr.innerHTML =
+          '<td>'+esc(k.name)+'</td>'+
+          '<td><code>'+esc(k.keyMasked)+'</code></td>'+
+          '<td class="muted">'+esc(k.format)+'</td>'+
+          '<td class="num">'+fmtInt(k.usage.totalRequests)+'</td>'+
+          '<td class="num">'+fmt(k.usage.totalCredits)+lim+'</td>'+
+          '<td>'+statusPill+'</td><td class="num"></td>';
+        var actions=document.createElement('div'); actions.className='row'; actions.style.justifyContent='flex-end';
+        actions.appendChild(mkBtn(k.enabled?'ปิด':'เปิด','tiny secondary',function(){ updateKey(k.id,{enabled:!k.enabled}); }));
+        actions.appendChild(mkBtn('limit','tiny secondary',function(){ keyLimitModal(k); }));
+        actions.appendChild(mkBtn('reset','tiny secondary',function(){ resetKeyUsage(k); }));
+        actions.appendChild(mkBtn('ลบ','tiny danger',function(){ delKey(k); }));
+        tr.lastChild.appendChild(actions);
+        tb.appendChild(tr);
+      });
+    });
+  }
+  function updateKey(id, body){ api('/admin/api-keys/'+encodeURIComponent(id), { method:'PUT', body:body }).then(function(r){ if(r.ok) loadKeys(); }); }
+  function keyLimitModal(k){
+    openModal('ตั้ง credit limit — '+esc(k.name),
+      '<label>credit limit (เว้นว่าง/0 = ไม่จำกัด)</label><input id="m_lim" type="number" step="any" value="'+(k.creditsLimit!=null?k.creditsLimit:'')+'">',
+      function(){
+        var v=$('m_lim').value.trim(); var body={ creditsLimit: v===''?null:parseFloat(v) };
+        return api('/admin/api-keys/'+encodeURIComponent(k.id), { method:'PUT', body:body }).then(function(r){ if(r.ok){ closeModal(); loadKeys(); } else return (r.data&&r.data.error)||'ล้มเหลว'; });
+      });
+  }
+  function resetKeyUsage(k){ openConfirm('รีเซ็ตสถิติการใช้งานของ '+esc(k.name)+'?', function(){ return api('/admin/api-keys/'+encodeURIComponent(k.id)+'/reset-usage',{method:'POST'}).then(function(r){ if(r.ok){ closeModal(); loadKeys(); } else return 'ล้มเหลว'; }); }); }
+  function delKey(k){ openConfirm('ลบ key '+esc(k.name)+'?', function(){ return api('/admin/api-keys/'+encodeURIComponent(k.id),{method:'DELETE'}).then(function(r){ if(r.ok){ closeModal(); loadKeys(); } else return 'ล้มเหลว'; }); }); }
+  function newKey(){
+    openModal('สร้าง operator key',
+      '<label>ชื่อ</label><input id="m_name" placeholder="เช่น my-tool">'+
+      '<label>format</label><select id="m_fmt"><option value="sk">sk-...</option><option value="simple">PROXY_KEY_...</option><option value="token">KEY:...:TOKEN:...</option></select>'+
+      '<label>credit limit (optional)</label><input id="m_lim" type="number" step="any" placeholder="ไม่จำกัด">',
+      function(){
+        var lim=parseFloat($('m_lim').value);
+        return api('/admin/api-keys',{method:'POST',body:{ name:$('m_name').value||undefined, format:$('m_fmt').value, creditsLimit:isFinite(lim)?lim:undefined }}).then(function(r){
+          if(r.ok){ var k=r.data; showKeyOnce(k.key); loadKeys(); } else return (r.data&&r.data.error)||'ล้มเหลว';
+        });
+      });
+  }
+  function showKeyOnce(key){
+    openModal('สร้าง key สำเร็จ', '<div class="muted">คัดลอก key นี้ทันที — จะไม่แสดงอีก</div><div class="keybox"><code>'+esc(key)+'</code></div>', null, 'ปิด');
+  }
+
+  // ---- invites ----
+  function loadInvites(){
+    api('/admin/invites').then(function(r){
+      if(!r.ok){ if(r.status===401) logout(); return; }
+      var list=(r.data&&r.data.invites)||[];
+      var tb=$('inviteRows'); tb.innerHTML='';
+      $('inviteEmpty').classList.toggle('hide', list.length>0);
+      list.forEach(function(iv){
+        var used = !!iv.usedAt;
+        var expired = iv.expiresAt && iv.expiresAt < Date.now();
+        var statusPill = used ? '<span class="pill off">ใช้แล้ว</span>' : (expired ? '<span class="pill off">หมดอายุ</span>' : '<span class="pill ok">พร้อมใช้</span>');
+        var tr=document.createElement('tr');
+        tr.innerHTML =
+          '<td><code>'+esc(iv.code)+'</code></td>'+
+          '<td>'+esc(iv.email)+'</td>'+
+          '<td class="num">'+fmt(iv.creditBalance||0)+'</td>'+
+          '<td class="muted">'+esc(iv.expiresAt?fmtDate(iv.expiresAt):'ไม่มี')+'</td>'+
+          '<td>'+statusPill+'</td><td class="num"></td>';
+        if (!used){ var actions=document.createElement('div'); actions.className='row'; actions.style.justifyContent='flex-end'; actions.appendChild(mkBtn('ยกเลิก','tiny danger',function(){ revokeInvite(iv); })); tr.lastChild.appendChild(actions); }
+        tb.appendChild(tr);
+      });
+    });
+  }
+  function revokeInvite(iv){ api('/admin/invites/'+encodeURIComponent(iv.code),{method:'DELETE'}).then(function(r){ if(r.ok) loadInvites(); }); }
+  function newInvite(){
+    openModal('สร้าง invite code',
+      '<label>อีเมล</label><input id="m_email" type="email" placeholder="user@example.com">'+
+      '<label>ชื่อ (optional)</label><input id="m_name">'+
+      '<label>credit เริ่มต้น (optional)</label><input id="m_credit" type="number" step="any" placeholder="0">'+
+      '<label>หมดอายุใน (วัน, optional)</label><input id="m_days" type="number" placeholder="ไม่มี">',
+      function(){
+        var email=($('m_email').value||'').trim(); if(!email) return 'กรุณาใส่อีเมล';
+        var credit=parseFloat($('m_credit').value); var days=parseInt($('m_days').value,10);
+        return api('/admin/invites',{method:'POST',body:{ email:email, name:$('m_name').value||undefined, creditBalance:isFinite(credit)?credit:undefined, expiresInDays:isFinite(days)?days:undefined }}).then(function(r){
+          if(r.ok){ closeModal(); loadInvites(); } else return (r.data&&r.data.error)||'ล้มเหลว';
+        });
+      });
+  }
+
+  // ---- audit ----
+  function loadAudit(){
+    api('/admin/audit').then(function(r){
+      if(!r.ok){ if(r.status===401) logout(); return; }
+      var list=(r.data&&r.data.entries)||[];
+      var tb=$('auditRows'); tb.innerHTML='';
+      $('auditEmpty').classList.toggle('hide', list.length>0);
+      list.slice().reverse().forEach(function(e){
+        var tr=document.createElement('tr');
+        var detail=''; try{ detail=JSON.stringify(e.data||{}); }catch(_){ detail=''; }
+        tr.innerHTML='<td class="muted">'+esc(fmtTime(e.ts))+'</td><td><code>'+esc(e.type)+'</code></td><td class="muted">'+esc(detail)+'</td>';
+        tb.appendChild(tr);
+      });
+    });
+  }
+  function clearCache(){ openConfirm('ล้าง cache ทั้งหมด (conversationId/model/prompt cache)?', function(){ return api('/admin/cache/clear',{method:'POST'}).then(function(r){ if(r.ok){ closeModal(); } else return 'ล้มเหลว'; }); }); }
+
+  // ---- modal ----
+  function openModal(title, bodyHtml, onConfirm, confirmLabel){
+    var root=$('modalRoot');
+    root.innerHTML='<div class="modal-bg"><div class="modal"><h3>'+title+'</h3><div id="modalBody">'+bodyHtml+'</div><div class="err" id="modalErr"></div><div class="modal-actions">'+
+      (onConfirm?'<button class="secondary" id="modalCancel">ยกเลิก</button><button id="modalOk">ยืนยัน</button>':'<button id="modalOk">'+(confirmLabel||'ปิด')+'</button>')+'</div></div></div>';
+    var bg=root.querySelector('.modal-bg');
+    bg.addEventListener('click',function(e){ if(e.target===bg) closeModal(); });
+    var cancel=$('modalCancel'); if(cancel) cancel.addEventListener('click',closeModal);
+    $('modalOk').addEventListener('click',function(){
+      if(!onConfirm){ closeModal(); return; }
+      var res=onConfirm();
+      if(res && typeof res.then==='function'){ $('modalOk').disabled=true; res.then(function(err){ $('modalOk').disabled=false; if(err) $('modalErr').textContent=err; }); }
+      else if(typeof res==='string'){ $('modalErr').textContent=res; }
+    });
+  }
+  function openConfirm(msg, onConfirm){ openModal('ยืนยัน', '<div class="muted">'+msg+'</div>', onConfirm); }
+  function closeModal(){ $('modalRoot').innerHTML=''; }
+
+  // ---- wire ----
+  $('loginBtn').addEventListener('click', doLogin);
+  $('keyInput').addEventListener('keydown', function(e){ if(e.key==='Enter') doLogin(); });
+  $('logoutBtn').addEventListener('click', logout);
+  $('refreshOverview').addEventListener('click', loadOverview);
+  $('newCustomerBtn').addEventListener('click', newCustomer);
+  $('newKeyBtn').addEventListener('click', newKey);
+  $('newInviteBtn').addEventListener('click', newInvite);
+  $('clearCacheBtn').addEventListener('click', clearCache);
+  Array.prototype.forEach.call(document.querySelectorAll('.nav-item[data-tab]'), function(btn){ btn.addEventListener('click', function(){ selectTab(btn.getAttribute('data-tab')); }); });
+
+  if (token){ show('dash'); selectTab('overview'); } else show('login');
 })();
 </script>
 </body>
