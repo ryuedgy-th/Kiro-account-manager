@@ -643,6 +643,7 @@ export interface CustomerView {
   totalToppedUp: number
   keyCount: number
   maxKeys: number
+  topupHistory?: Array<{ timestamp: number; amount: number; note?: string; by?: 'admin' | 'slip'; transRef?: string }>
 }
 
 // 模型映射规则

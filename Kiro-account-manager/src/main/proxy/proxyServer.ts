@@ -2781,7 +2781,8 @@ export class ProxyServer {
       creditBalance: c.creditBalance,
       totalToppedUp: c.totalToppedUp || 0,
       keyCount: portal.customerKeys(this.config, c.id).length,
-      maxKeys: portal.maxKeysFor(this.config, c)
+      maxKeys: portal.maxKeysFor(this.config, c),
+      topupHistory: Array.isArray(c.topupHistory) ? c.topupHistory.slice(0, 100) : []
     }
   }
 
@@ -6524,7 +6525,7 @@ const PORTAL_HTML = `<!doctype html>
   tr:last-child td { border-bottom:none; }
   td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
   code { background:var(--card-soft); padding:3px 7px; border-radius:6px; font-size:12px; word-break:break-all; border:1px solid var(--border); color:var(--txt2); }
-  .hide { display:none; }
+  .hide { display:none !important; }
   .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
   .hint { color:var(--muted); font-size:12px; line-height:1.5; }
   .sep { display:flex; align-items:center; text-align:center; color:var(--muted); font-size:12px; margin:20px 0 4px; }
@@ -6532,6 +6533,20 @@ const PORTAL_HTML = `<!doctype html>
   .sep span { padding:0 12px; }
   .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.3); border-radius:12px; padding:14px; margin-top:12px; color:var(--accent-d); font-weight:600; }
   .keybox code { background:#fff; color:var(--txt); }
+
+  /* ===== Getting Started tab ===== */
+  .start-step .step-head { display:flex; align-items:center; gap:10px; font-size:15px; }
+  .step-num { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border-radius:50%; background:var(--accent); color:#fff; font-size:13px; font-weight:800; flex-shrink:0; }
+  .code-block { position:relative; margin-top:6px; }
+  .code-block pre { margin:0; background:var(--txt); color:#e6edf3; border-radius:12px; padding:14px 16px; padding-right:84px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; line-height:1.55; overflow-x:auto; white-space:pre; -webkit-overflow-scrolling:touch; }
+  .code-block .code-path { font-size:12px; color:var(--muted); margin:10px 0 4px; font-weight:600; }
+  .copy-btn { position:absolute; top:10px; right:10px; z-index:1; padding:5px 12px; font-size:12px; border-radius:8px; border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.12); color:#fff; cursor:pointer; font-weight:600; transition:background .12s; }
+  .copy-btn:hover { background:rgba(255,255,255,.22); }
+  .copy-btn.done { background:var(--accent); border-color:var(--accent); }
+  .client-pills { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 16px; }
+  .pill-btn { padding:8px 16px; border-radius:999px; border:1px solid var(--border2); background:var(--card-soft); color:var(--txt2); font-size:13px; font-weight:600; cursor:pointer; transition:all .12s; }
+  .pill-btn:hover { border-color:var(--accent); color:var(--txt); }
+  .pill-btn.on { background:var(--accent); border-color:var(--accent); color:#fff; }
   .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
   .logo { width:34px; height:34px; border-radius:11px; flex-shrink:0; background:var(--accent-dim); display:inline-flex; align-items:center; justify-content:center; font-size:18px; color:var(--accent-d); }
   .avatar { width:36px; height:36px; border-radius:50%; background:var(--accent-dim); display:inline-flex; align-items:center; justify-content:center; font-weight:800; color:var(--accent-d); font-size:15px; flex-shrink:0; }
@@ -6614,6 +6629,10 @@ const PORTAL_HTML = `<!doctype html>
           <button class="nav-item on" data-tab="overview">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
             ภาพรวม
+          </button>
+          <button class="nav-item" data-tab="start">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>
+            เริ่มต้นใช้งาน
           </button>
           <button class="nav-item" data-tab="keys">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 19 4"/><path d="M16 7l3 3"/><path d="M14 9l3 3"/></svg>
@@ -6782,6 +6801,43 @@ const PORTAL_HTML = `<!doctype html>
           </div>
         </section>
 
+        <!-- ===== TAB: Getting Started (เริ่มต้นใช้งาน) ===== -->
+        <section class="tab hide" data-panel="start">
+          <h2>เริ่มต้นใช้งาน</h2>
+          <div class="muted" style="margin-bottom:18px">ตั้งค่า client ที่คุณใช้ให้ชี้มาที่ proxy ของเรา — เลือก client แล้วคัดลอกไปวางได้เลย</div>
+
+          <div class="card start-step">
+            <div class="step-head"><span class="step-num">1</span><strong>Base URL</strong></div>
+            <div class="muted" style="font-size:13px; margin:6px 0 10px">ที่อยู่ของ proxy (ตรวจจากหน้าที่คุณเปิดอยู่อัตโนมัติ)</div>
+            <div class="code-block"><button class="copy-btn" data-copy="startBaseUrl">คัดลอก</button><pre id="startBaseUrl">–</pre></div>
+          </div>
+
+          <div class="card start-step" style="margin-top:14px">
+            <div class="step-head"><span class="step-num">2</span><strong>API Key</strong></div>
+            <div class="muted" style="font-size:13px; margin:6px 0 10px">snippet ด้านล่างใช้ค่าตัวอย่าง <code>&lt;YOUR_API_KEY&gt;</code> — สร้าง key ใหม่ที่นี่เพื่อให้เติมลง snippet ให้อัตโนมัติ (แสดงครั้งเดียว)</div>
+            <div class="row">
+              <input id="startKeyName" placeholder="ชื่อ key (เช่น opencode)" style="max-width:240px">
+              <button id="startCreateKeyBtn">สร้าง key ใหม่</button>
+            </div>
+            <div class="err" id="startKeyErr"></div>
+            <div id="startKeyBox"></div>
+          </div>
+
+          <div class="card start-step" style="margin-top:14px">
+            <div class="step-head"><span class="step-num">3</span><strong>เลือก Client แล้วคัดลอก</strong></div>
+            <div class="client-pills" id="startClientPills">
+              <button class="pill-btn on" data-client="claudeCode">Claude Code</button>
+              <button class="pill-btn" data-client="opencode">OpenCode</button>
+              <button class="pill-btn" data-client="codex">Codex CLI</button>
+              <button class="pill-btn" data-client="gemini">Gemini CLI</button>
+              <button class="pill-btn" data-client="hermes">Hermes</button>
+              <button class="pill-btn" data-client="openclaw">OpenClaw</button>
+            </div>
+            <div id="startSnippets"></div>
+            <div class="hint" id="startWarn" style="display:none">⚠️ snippet นี้มี API key จริงของคุณ — อย่าแชร์ไฟล์หรือภาพหน้าจอให้คนอื่น</div>
+          </div>
+        </section>
+
         <!-- ===== TAB: Top-up (เติมเงินด้วยสลิป) ===== -->
         <section class="tab hide" data-panel="topup">
           <h2>เติมเครดิตด้วยสลิปโอนเงิน</h2>
@@ -6856,7 +6912,181 @@ const PORTAL_HTML = `<!doctype html>
     var panels = document.querySelectorAll('.tab[data-panel]');
     Array.prototype.forEach.call(panels, function(p){ p.classList.toggle('hide', p.getAttribute('data-panel') !== name); });
     if (name === 'topup') loadSlipHistory();
+    if (name === 'start') loadStart();
   }
+
+  // ===== Getting Started tab: สร้าง config snippet ของแต่ละ client ให้ลูกค้า copy =====
+  // baseURL = origin ที่ลูกค้าเปิด portal อยู่จริง; key = placeholder จนกว่าจะสร้าง key ใหม่ในหน้านี้;
+  // model list = ดึงจาก /v1/models ด้วย key ที่เพิ่งสร้าง (มี static fallback)
+  var START_PLACEHOLDER = '<YOUR_API_KEY>';
+  var startKey = null;            // full key (เฉพาะที่เพิ่งสร้างในหน้านี้; รีเฟรช = หาย)
+  var startClient = 'claudeCode';
+  var startModels = ['claude-opus-4.8', 'claude-sonnet-4.6', 'claude-haiku-4.5', 'auto'];
+  var startModelsLoaded = false;
+
+  function startOrigin(){ return window.location.origin; }
+
+  // default model สำหรับ field ที่ต้องระบุตัวเดียว — เลือก opus ตัวฐาน (ไม่ใช่ variant) ถ้ามี ไม่งั้นตัวแรก
+  function startDefaultModel(){
+    var base = startModels.filter(function(m){ return m.indexOf('-low')<0 && m.indexOf('-medium')<0 && m.indexOf('-high')<0 && m.indexOf('-xhigh')<0 && m.indexOf('-max')<0; });
+    var opus = base.filter(function(m){ return m.indexOf('opus')>=0; })[0];
+    return opus || base[0] || startModels[0] || 'claude-opus-4.8';
+  }
+  function startHaiku(){
+    var h = startModels.filter(function(m){ return m.indexOf('haiku')>=0; })[0];
+    return h || 'claude-haiku-4.5';
+  }
+
+  function loadStart(){
+    $('startBaseUrl').textContent = startOrigin();
+    if (!startModelsLoaded && startKey) fetchStartModels();
+    renderSnippets();
+  }
+
+  // ดึง model list จริงจาก proxy (ต้องมี key); ล้มเหลว = คง static fallback
+  function fetchStartModels(){
+    var key = startKey;
+    if (!key) return;
+    fetch(startOrigin() + '/v1/models', { headers: { 'Authorization': 'Bearer ' + key } })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(j){
+        var data = j && j.data;
+        if (Array.isArray(data) && data.length){
+          startModels = data.map(function(m){ return m.id; }).filter(Boolean);
+          startModelsLoaded = true;
+          renderSnippets();
+        }
+      })
+      .catch(function(){ /* คง fallback */ });
+  }
+
+  function createStartKey(){
+    $('startKeyErr').textContent = '';
+    var name = ($('startKeyName').value || '').trim() || 'getting-started';
+    $('startCreateKeyBtn').disabled = true;
+    api('/portal/keys', { method:'POST', body:{ name:name } }).then(function(r){
+      $('startCreateKeyBtn').disabled = false;
+      if (!r.ok){ $('startKeyErr').textContent = (r.data && r.data.error) || 'สร้าง key ไม่สำเร็จ'; return; }
+      startKey = r.data.key;
+      startModelsLoaded = false;
+      $('startKeyBox').innerHTML = '<div class="keybox">บันทึก key นี้ไว้ (แสดงครั้งเดียว):<br><code>'+esc(r.data.key)+'</code></div>';
+      $('startKeyName').value = '';
+      if (typeof loadKeys === 'function') loadKeys();   // sync tab API Keys
+      fetchStartModels();
+      renderSnippets();
+    });
+  }
+
+  function selectStartClient(id){
+    startClient = id;
+    Array.prototype.forEach.call(document.querySelectorAll('#startClientPills .pill-btn'), function(b){
+      b.classList.toggle('on', b.getAttribute('data-client') === id);
+    });
+    renderSnippets();
+  }
+
+  // JSON.stringify ที่ esc แล้วฝังใน HTML ได้ (กัน </script> / quote พัง)
+  function startCode(path, body){
+    var head = path ? '<div class="code-path">'+esc(path)+'</div>' : '';
+    var btnId = 'cp_' + Math.random().toString(36).slice(2, 8);
+    return head + '<div class="code-block"><button class="copy-btn" data-copy-target="'+btnId+'">คัดลอก</button><pre id="'+btnId+'">'+esc(body)+'</pre></div>';
+  }
+
+  function renderSnippets(){
+    var O = startOrigin();
+    var key = startKey || START_PLACEHOLDER;
+    var def = startDefaultModel();
+    var html = startBuildSnippet(startClient, O, key, startModels, def, startHaiku());
+    $('startSnippets').innerHTML = html;
+    $('startWarn').style.display = startKey ? '' : 'none';
+  }
+
+  // มิเรอร์ clientConfig.ts — สร้างเนื้อไฟล์ config ของแต่ละ client (เป็น string ให้ copy)
+  function startBuildSnippet(client, O, key, models, def, haiku){
+    if (client === 'claudeCode'){
+      var cc = {
+        env: {
+          ANTHROPIC_BASE_URL: O,
+          ANTHROPIC_AUTH_TOKEN: key,
+          ANTHROPIC_API_KEY: key,
+          ANTHROPIC_MODEL: def,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: def,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: def
+        }
+      };
+      return startCode('~/.claude/settings.json', JSON.stringify(cc, null, 2));
+    }
+    if (client === 'opencode'){
+      var mm = {};
+      models.forEach(function(id){ mm[id] = { name: id }; });
+      var oc = {
+        '$schema': 'https://opencode.ai/config.json',
+        provider: { kiro: { npm: '@ai-sdk/openai-compatible', name: 'Kiro', options: { baseURL: O + '/v1', apiKey: key }, models: mm } },
+        model: 'kiro/' + def,
+        small_model: 'kiro/' + haiku
+      };
+      return startCode('~/.config/opencode/opencode.jsonc', JSON.stringify(oc, null, 2));
+    }
+    if (client === 'codex'){
+      var auth = { OPENAI_API_KEY: key };
+      var toml = 'model = "' + def + '"\\n'
+        + 'model_provider = "kiro"\\n\\n'
+        + '[model_providers.kiro]\\n'
+        + 'name = "Kiro Proxy"\\n'
+        + 'base_url = "' + O + '/v1"\\n'
+        + 'wire_api = "responses"\\n';
+      return startCode('~/.codex/auth.json', JSON.stringify(auth, null, 2))
+        + startCode('~/.codex/config.toml', toml);
+    }
+    if (client === 'gemini'){
+      var env = 'GEMINI_API_KEY=' + key + '\\n'
+        + 'GOOGLE_GEMINI_BASE_URL=' + O + '/v1beta\\n'
+        + 'GEMINI_MODEL=' + def + '\\n';
+      var settings = { security: { auth: { selectedType: 'gemini-api-key' } } };
+      return startCode('~/.gemini/.env', env)
+        + startCode('~/.gemini/settings.json', JSON.stringify(settings, null, 2));
+    }
+    if (client === 'hermes'){
+      var ml = models.map(function(id){ return '      ' + id + ':\\n        context_length: 200000'; }).join('\\n');
+      var yaml = 'custom_providers:\\n'
+        + '  - name: kiro\\n'
+        + '    base_url: ' + O + '/v1\\n'
+        + '    api_key: ' + key + '\\n'
+        + '    model: ' + def + '\\n'
+        + '    models:\\n' + ml + '\\n\\n'
+        + 'model:\\n'
+        + '  default: "kiro/' + def + '"\\n'
+        + '  provider: "kiro"\\n';
+      return startCode('~/.hermes/config.yaml', yaml);
+    }
+    if (client === 'openclaw'){
+      var ocw = {
+        models: {
+          mode: 'merge',
+          providers: { kiro: { base_url: O + '/v1', api_key: key, api: 'openai-chat', models: models.map(function(id){ return { id: id, name: id, context_window: 200000 }; }) } }
+        },
+        agents: { defaults: { model: { primary: 'kiro/' + def, fallbacks: [] } } }
+      };
+      return startCode('~/.openclaw/openclaw.json', JSON.stringify(ocw, null, 2));
+    }
+    return '';
+  }
+
+  function startCopy(targetId){
+    var el = $(targetId);
+    if (!el) return;
+    var text = el.textContent || '';
+    var done = function(btn){ if(btn){ var o=btn.textContent; btn.textContent='คัดลอกแล้ว ✓'; btn.classList.add('done'); setTimeout(function(){ btn.textContent=o; btn.classList.remove('done'); }, 1500); } };
+    var btn = document.querySelector('[data-copy="'+targetId+'"], [data-copy-target="'+targetId+'"]');
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){ done(btn); }).catch(function(){ startCopyFallback(text, btn, done); });
+    } else { startCopyFallback(text, btn, done); }
+  }
+  function startCopyFallback(text, btn, done){
+    try { var ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done(btn); } catch(e){}
+  }
+
 
   // Google 登录回调：拿到 ID token 后连同 invite code 一起发给后端
   function onGoogleCredential(resp){
@@ -7690,6 +7920,22 @@ const PORTAL_HTML = `<!doctype html>
   var goKeys = $('goKeysBtn');
   if (goKeys) goKeys.addEventListener('click', function(){ selectTab('keys'); });
 
+  // ===== Getting Started tab wiring =====
+  var startCreateBtn = $('startCreateKeyBtn');
+  if (startCreateBtn) startCreateBtn.addEventListener('click', createStartKey);
+  var startPills = $('startClientPills');
+  if (startPills) startPills.addEventListener('click', function(e){
+    var b = e.target.closest ? e.target.closest('.pill-btn') : null;
+    if (b && b.getAttribute('data-client')) selectStartClient(b.getAttribute('data-client'));
+  });
+  // copy buttons (ทั้ง Base URL ที่ static และ snippet ที่ render ภายหลัง) — ใช้ delegation
+  document.addEventListener('click', function(e){
+    var b = e.target.closest ? e.target.closest('.copy-btn') : null;
+    if (!b) return;
+    var target = b.getAttribute('data-copy') || b.getAttribute('data-copy-target');
+    if (target) startCopy(target);
+  });
+
   if (token) loadDash(); else { show('login'); initGoogle(); }
 })();
 </script>
@@ -7764,7 +8010,7 @@ const ADMIN_HTML = `<!doctype html>
   .pill.off { background:rgba(225,29,72,.10); color:var(--danger); }
   .empty { color:var(--muted); font-size:13px; padding:14px 0; text-align:center; }
   .err { color:var(--danger); font-size:13px; margin-top:8px; min-height:18px; }
-  .hide { display:none; }
+  .hide { display:none !important; }
   .topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:18px; flex-wrap:wrap; }
   .keybox { background:var(--accent-dim); border:1px solid rgba(16,185,129,.3); border-radius:12px; padding:14px; margin-top:12px; color:var(--accent-d); font-weight:600; word-break:break-all; }
   .keybox code { background:#fff; color:var(--txt); }
@@ -7968,6 +8214,7 @@ const ADMIN_HTML = `<!doctype html>
           '<td class="num"></td>';
         var actions=document.createElement('div'); actions.className='row'; actions.style.justifyContent='flex-end';
         actions.appendChild(mkBtn('เติม', 'tiny', function(){ topupModal(c); }));
+        actions.appendChild(mkBtn('ประวัติ', 'tiny secondary', function(){ historyModal(c); }));
         actions.appendChild(mkBtn(c.enabled?'ปิด':'เปิด', 'tiny secondary', function(){ toggleCustomer(c); }));
         actions.appendChild(mkBtn('รหัสผ่าน', 'tiny secondary', function(){ pwModal(c); }));
         actions.appendChild(mkBtn('ลบ', 'tiny danger', function(){ delCustomer(c); }));
@@ -7990,6 +8237,29 @@ const ADMIN_HTML = `<!doctype html>
           if (r.ok){ closeModal(); loadCustomers(); } else return (r.data&&r.data.error)||'ล้มเหลว';
         });
       });
+  }
+  function historyModal(c){
+    var hist = (c.topupHistory || []).slice();
+    var rows;
+    if (!hist.length){
+      rows = '<div class="empty">ยังไม่มีประวัติการเติม/หัก credit</div>';
+    } else {
+      rows = '<div style="max-height:360px; overflow-y:auto"><table><thead><tr><th>เวลา</th><th class="num">จำนวน</th><th>ที่มา</th><th>หมายเหตุ</th></tr></thead><tbody>';
+      hist.forEach(function(h){
+        var amt = h.amount || 0;
+        var amtStr = (amt>0?'+':'')+fmt(amt);
+        var amtColor = amt>=0 ? 'var(--accent-d)' : 'var(--danger)';
+        var src = h.by==='slip' ? '<span class="pill ok">slip</span>' : (h.by==='admin' ? '<span class="pill">admin</span>' : esc(h.by||'—'));
+        var note = h.note || (h.transRef ? ('ref: '+h.transRef) : '');
+        rows += '<tr><td class="muted">'+esc(fmtTime(h.timestamp))+'</td>'+
+          '<td class="num"><strong style="color:'+amtColor+'">'+esc(amtStr)+'</strong></td>'+
+          '<td>'+src+'</td>'+
+          '<td class="muted">'+esc(note)+'</td></tr>';
+      });
+      rows += '</tbody></table></div>';
+    }
+    var summary = '<div class="muted" style="margin-bottom:10px">ยอดปัจจุบัน: <strong>'+fmt(c.creditBalance)+'</strong> · เติมสะสม: <strong>'+fmt(c.totalToppedUp||0)+'</strong> · '+hist.length+' รายการ</div>';
+    openModal('ประวัติเติมเงิน — '+esc(c.email), summary+rows, null, 'ปิด');
   }
   function pwModal(c){
     openModal('รีเซ็ตรหัสผ่าน — '+esc(c.email),
