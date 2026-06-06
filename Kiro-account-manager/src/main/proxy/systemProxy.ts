@@ -20,11 +20,17 @@ const SYSTEM_PROXY_CACHE_TTL = 30_000 // 30秒缓存
 //   keepAliveMaxTimeout 单连接最长存活 10min 后强制轮换（避免 NAT/LB 静默断连后用到死连接）
 //   connections         每个 origin 最多 64 条连接，足够并发又不至于过量
 //   pipelining          1（HTTP/1.1，不跨请求复用同一管道，避免多账号请求互相串扰/指纹异常）
+//   connect.keepAlive            在 TCP 层开 SO_KEEPALIVE：流式响应里上游长时间无字节（模型 thinking、
+//                                工具循环间隙）时，由内核定期发 keepalive 探针维持链路，降低中间层
+//                                （NAT/LB）按 idle 静默切断 → 客户端见 "other side closed/UND_ERR_SOCKET" 的概率。
+//   connect.keepAliveInitialDelay 首个探针延迟 10s（undici 默认 60s，常追不上更短的中间层 idle 阈值）。
+//                                探针在 kernel/socket 层，应用层（含 AWS 端）看不到此值，且 10s 属常见客户端范围，不构成异常指纹。
 const POOL_OPTS = {
   keepAliveTimeout: 30_000,
   keepAliveMaxTimeout: 600_000,
   connections: 64,
-  pipelining: 1
+  pipelining: 1,
+  connect: { keepAlive: true, keepAliveInitialDelay: 10_000 }
 } as const
 
 let _directAgent: Agent | null = null

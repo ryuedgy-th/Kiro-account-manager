@@ -20,7 +20,7 @@ import type {
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, canonicalizeModelId, type KiroModel, type WebToolSearchRecord } from './kiroApi'
+import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, canonicalizeModelId, isTransientNetworkError, type KiroModel, type WebToolSearchRecord } from './kiroApi'
 import { proxyLogger, formatError } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -4692,7 +4692,9 @@ export class ProxyServer {
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
     effort?: string,
-    authRetried: boolean = false
+    authRetried: boolean = false,
+    // 瞬时网络错误已重试标记：防止 transient-close 重试无限放大（仅重试一次）。
+    transientRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
       this.writeSseHead(res)
@@ -4705,7 +4707,8 @@ export class ProxyServer {
     // 是否已向客户端发出真实内容（文本/思考/工具）——auth 重试只在「尚未发出真实内容」时安全
     let sentRealContent = false
     // 发送初始 chunk（仅首轮；auth 重试时不重发，避免重复 role chunk）
-    if (currentRound === 0 && !authRetried) {
+    // 发送初始 chunk（仅首轮、仅首次进入；任何重试继续（headersSent=true）都不重发，避免重复 role chunk）
+    if (currentRound === 0 && !authRetried && !headersSent) {
       const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
       res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
     }
@@ -4850,6 +4853,25 @@ export class ProxyServer {
               return
             }
             // 刷新失败 → 落到下方常规错误处理，记账并切断该账号
+          }
+
+          // 瞬时上游断连自愈：读流途中上游/中间层 idle 切断（UND_ERR_SOCKET / "other side closed"）。
+          // 仅在「尚未发出真实内容」且「未因瞬时错误重试过」时透明重跑整个 stream（与 401/403 自愈同构）。
+          // 不在重试前 settle partialUsage，避免与重试成功后的正式计费重复。已发出内容则照常报错。
+          if (
+            statusNum === 0 &&
+            !transientRetried &&
+            !sentRealContent &&
+            !signal?.aborted &&
+            !this.isResponseClosed(res) &&
+            isTransientNetworkError(error)
+          ) {
+            console.log(`[ProxyServer] Stream transient close before content; retrying once: ${formatError(error)}`)
+            this.handleOpenAIStream(
+              res, account, kiroPayload, model, startTime,
+              currentRound, id, true, matchedApiKey, toolNameRegistry, signal, effort, authRetried, true
+            ).then(resolve).catch(() => resolve())
+            return
           }
 
           console.error('[ProxyServer] Stream error:', formatError(error))
@@ -5219,7 +5241,9 @@ export class ProxyServer {
     prepareInputEstimate?: () => number,
     // client ที่ขอมา (จาก request.max_tokens) — ใช้ตรวจ truncation เพื่อรายงาน stop_reason='max_tokens'
     maxTokens?: number,
-    authRetried: boolean = false
+    authRetried: boolean = false,
+    // 瞬时网络错误已重试标记：防止 transient-close 重试无限放大（仅重试一次）。
+    transientRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
       // 统一 SSE 头 + 心跳（auth 重试 headersSent=true 时不重复启动）
@@ -5528,16 +5552,29 @@ export class ProxyServer {
             }
           }
 
-          console.error('[ProxyServer] Stream error:', formatError(error))
-          const errorEvent = createClaudeStreamEvent('error', {
-            error: { type: 'api_error', message: error.message }
-          })
-          res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
-          res.end()
+          // 瞬时上游断连自愈：parseEventStream 读流途中上游/中间层 idle 切断
+          // （UND_ERR_SOCKET / "other side closed" / terminated）。仅在「尚未向客户端发出真实内容」
+          // 且「本请求未因瞬时错误重试过」时安全——此时透明重跑整个 stream，客户端无感知。
+          // 与 401/403 自愈同构：不在重试前 settle partialUsage，避免与重试成功后的正式计费重复。
+          // 已发出真实内容（sentRealContent）则无法回退，照常报错（重试会重复 content）。
+          if (
+            statusNum2 === 0 &&
+            !transientRetried &&
+            !sentRealContent &&
+            !signal?.aborted &&
+            !this.isResponseClosed(res) &&
+            isTransientNetworkError(error)
+          ) {
+            console.log(`[ProxyServer] Claude stream transient close before content; retrying once: ${formatError(error)}`)
+            this.handleClaudeStream(
+              res, account, kiroPayload, model, startTime,
+              currentRound, id, true, currentBlockIndex, matchedApiKey, toolNameRegistry, signal,
+              promptInputTokens, effort, undefined, maxTokens, authRetried, true
+            ).then(resolve).catch(() => resolve())
+            return
+          }
 
-          this.recordRequestFailed()
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(statusNum2) : ErrorType.RECOVERABLE, errStatusCode2 ? statusNum2 : undefined)
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
+          console.error('[ProxyServer] Stream error:', formatError(error))
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           // mid-stream 报错但 Kiro 已计 credit（meteringEvent 先于断开）：结算已消耗用量，防漏计费
           if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, model, '/v1/messages', effort, kiroPayload.conversationState.conversationId)
