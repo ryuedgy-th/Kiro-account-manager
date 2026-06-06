@@ -28,6 +28,7 @@ import {
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
+import { perfDiag, PerfEvent, PerfPhase } from './proxy/perfDiag'
 import { installCrashDiagnostics, attachWindowDiagnostics, writeCrashLog, getCrashLogPath } from './crashLog'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
@@ -2891,7 +2892,12 @@ app.whenReady().then(async () => {
       // 注意：用稳定序列化比对；只要有任何真实字段变化就照常落盘 + 备份，绝不漏存。
       let unchanged = false
       try {
+        const _t = perfDiag.enabled ? perfDiag.now() : 0
         unchanged = lastSavedData != null && JSON.stringify(data) === JSON.stringify(lastSavedData)
+        if (perfDiag.enabled) {
+          perfDiag.recordTiming(PerfPhase.SaveAccountsStringify, perfDiag.now() - _t)
+          perfDiag.incr(unchanged ? PerfEvent.SaveAccountsUnchanged : PerfEvent.SaveAccountsPersisted)
+        }
       } catch { unchanged = false }
       if (unchanged) return
 

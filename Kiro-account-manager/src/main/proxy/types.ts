@@ -770,6 +770,12 @@ export interface ProxyConfig {
   /** 是否暴露 /metrics（Prometheus 文本格式） */
   enableMetrics?: boolean
   /**
+   * 性能诊断开关（默认 false）。开启后采集 event-loop 延迟、每请求分阶段耗时与嫌疑计数器，
+   * 通过 /metrics 与周期日志输出，用于定位偶发卡顿/「越优化越慢」。关闭时热路径零开销。
+   * 仅用于诊断，不改变任何请求行为或计费数值。
+   */
+  perfDiagnostics?: boolean
+  /**
    * P2-21 API Key 与账号的精细绑定：apiKey id → 允许使用的账号 ID 数组（白名单）
    * 未配置或空数组 = 该 API Key 可使用所有账号；
    * 兼容旧名 apiKeyGroupBindings（按 group 绑定，需配合 group 同步）

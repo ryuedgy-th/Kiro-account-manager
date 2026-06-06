@@ -19,6 +19,7 @@ import { proxyLogger, formatError } from './logger'
 import { getKProxyService } from '../kproxy'
 import { getSystemProxy, getDirectPoolAgent, getCachedProxyAgent } from './systemProxy'
 import { isServerWebTool, executeWebToolStructured, type WebToolConfig } from './webTools'
+import { perfDiag, PerfEvent, PerfPhase } from './perfDiag'
 import {
   countTokens,
   getModelContextLength,
@@ -1332,6 +1333,7 @@ export function buildKiroPayload(
         estTokens += estimateMessageTokens(parent) - before
       }
       if (truncated > 0) {
+        perfDiag.incr(PerfEvent.TrimTriggered)
         console.log(`[KiroPayload] Token-budget truncated ${truncated} large tool results → est ${estTokens.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens (prevents CONTENT_LENGTH 400)`)
       }
     }
@@ -1529,7 +1531,10 @@ export async function callKiroApiStream(
   for (const endpoint of endpoints) {
     try {
       throwIfAborted(signal)
+      const _diag = perfDiag.enabled
+      const _tClone = _diag ? perfDiag.now() : 0
       const requestPayload = clonePayload(payload)
+      if (_diag) perfDiag.recordTiming(PerfPhase.Clone, perfDiag.now() - _tClone)
       // 流式端点对 BuilderId 占位符 ARN 返回 403，仅传真实 ARN 或 Social ARN
       const resolvedArn = resolveProfileArn(account)
       if (resolvedArn && !isPlaceholderProfileArn(resolvedArn)) {
@@ -1554,7 +1559,9 @@ export async function callKiroApiStream(
       }
 
       const endpointUrl = resolveEndpointUrl(endpoint, account)
+      const _tSer = _diag ? perfDiag.now() : 0
       const payloadStr = JSON.stringify(requestPayload)
+      if (_diag) perfDiag.recordTiming(PerfPhase.Serialize, perfDiag.now() - _tSer)
       const headers = getAuthHeaders(account, endpoint)
       const currentUserInput = requestPayload.conversationState.currentMessage.userInputMessage
       const historyMessages = requestPayload.conversationState.history ?? []
@@ -1582,6 +1589,7 @@ export async function callKiroApiStream(
       // 对「连接阶段」的瞬时错误先就地重试 1 次（短 backoff）更稳。仅在 stream 尚未开始时安全（见上）。
       let response: Response | undefined
       const MAX_CONNECT_ATTEMPTS = 2
+      const _tFetch = _diag ? perfDiag.now() : 0
       for (let attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS; attempt++) {
         try {
           response = agent
@@ -1599,6 +1607,8 @@ export async function callKiroApiStream(
           throw fetchErr
         }
       }
+      // upstream TTFB：从发出 fetch 到拿到响应头（不含 body 流式部分），度量上游网络往返
+      if (_diag) perfDiag.recordTiming(PerfPhase.UpstreamTTFB, perfDiag.now() - _tFetch)
       if (!response) throw lastError || new Error(`Endpoint ${endpoint.name} produced no response`)
 
       if (response.status === 429) {
@@ -1618,6 +1628,11 @@ export async function callKiroApiStream(
         throwIfAborted(signal)
         const body = await response.text()
         throwIfAborted(signal)
+        // 嫌疑计数：Kiro token 维度拒绝（CONTENT_LENGTH_EXCEEDS_THRESHOLD，400）——
+        // 若 trim 估算偏低导致 payload 超限，流式无重试 → 客户端中断重发，表现为「卡住/变慢」。
+        if (response.status === 400 && /CONTENT_LENGTH|THRESHOLD/i.test(body)) {
+          perfDiag.incr(PerfEvent.ContentLength400)
+        }
         throw new Error(`API error ${response.status}: ${body}`)
       }
 
@@ -1628,7 +1643,16 @@ export async function callKiroApiStream(
       const bootstrapInputTokens = estimatePayloadTokens(requestPayload)
       // 反推 inputTokens 用的 model：优先用客户端原始 model（含 [1m] 等能力后缀），
       // 缺失时回退到 payload 里的后端 modelId。后缀决定 context 分母，必须与客户端一致。
-      await parseEventStream(response.body!, onChunk, onComplete, onError, bootstrapInputTokens, signal, clientModelId || requestedModelId)
+      // TTFT：从发出 fetch 到首个 content/tool/thinking chunk 抵达。包裹 onChunk 仅记录首次；
+      // 关闭诊断时直接用原 onChunk（零包裹开销）。
+      let _firstChunk = false
+      const chunkSink = _diag
+        ? (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string): void => {
+            if (!_firstChunk) { _firstChunk = true; perfDiag.recordTiming(PerfPhase.TTFT, perfDiag.now() - _tFetch) }
+            onChunk(text, toolUse, isThinking, reasoningSignature, redactedContent)
+          }
+        : onChunk
+      await parseEventStream(response.body!, chunkSink, onComplete, onError, bootstrapInputTokens, signal, clientModelId || requestedModelId)
       return
     } catch (error) {
       if (signal?.aborted) {

@@ -40,6 +40,7 @@ import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { estimateBase64DocumentTokens, IMAGE_TOKEN_ESTIMATE } from './tokenCounter'
 import { isServerWebTool, type WebToolConfig } from './webTools'
+import { perfDiag, PerfEvent, PerfPhase } from './perfDiag'
 import * as portal from './portal'
 import type { Customer, CustomerView, SlipTopupRecord } from './types'
 import { fetch as undiciFetch, FormData as UndiciFormData, type Dispatcher } from 'undici'
@@ -645,6 +646,9 @@ export class ProxyServer {
       // 让 timer 在 Node 退出时不阻塞
       this.cleanupTimer.unref?.()
 
+      // 性能诊断（默认关闭）：开启时启动 event-loop 监视 + 周期汇总。零行为变更。
+      if (this.config.perfDiagnostics) perfDiag.start()
+
       // 从持久化的slip充值流水重建 transRef 去重集合（restart 后仍防重复入账）
       this.rebuildSlipTransRefIndex()
 
@@ -833,6 +837,7 @@ export class ProxyServer {
         this.sockets.clear()
         if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
         if (this.warmCacheTimer) { clearTimeout(this.warmCacheTimer); this.warmCacheTimer = null }
+        perfDiag.stop()
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }
@@ -869,6 +874,14 @@ export class ProxyServer {
       proxyLogger.warn('ProxyServer', `Config change requires restart: ${restartTriggerFields.filter(k => k in config).join(', ')}`)
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
+    // perfDiagnostics 可热切换（无需重启）：仅当本次确实改变了该值且服务在运行时，立刻 start/stop。
+    // start()/stop() 自身幂等；此处比较 old→new 避免无谓地重置已累计的诊断数据。
+    if ('perfDiagnostics' in config && this.isRunning()) {
+      const wasOn = !!this.config.perfDiagnostics
+      const willOn = !!config.perfDiagnostics
+      if (willOn && !wasOn) perfDiag.start()
+      else if (!willOn && wasOn) perfDiag.stop()
+    }
     this.config = { ...this.config, ...config }
     // 门户启用时若未设签名密钥，自动生成一份（持久化靠 onConfigChanged）。
     // 缺少密钥会导致 /portal/login 返回 503，故在此兜底初始化。
@@ -1426,7 +1439,10 @@ export class ProxyServer {
     // 已有在途刷新（含本函数上一次触发）→ refreshToken 内部会复用，这里无需重复进入
     if (this.refreshingTokens.has(account.id)) return
     // 不传 signal；catch 收敛所有异常，避免 fire-and-forget 产生 unhandledRejection
-    void this.refreshToken(account, undefined).catch(() => { /* 后台刷新失败由请求路径的 hard 刷新兜底 */ })
+    void this.refreshToken(account, undefined).then(
+      (ok) => { if (!ok) perfDiag.incr(PerfEvent.BackgroundRefreshFailure) },
+      () => { perfDiag.incr(PerfEvent.BackgroundRefreshFailure) /* 后台刷新失败由请求路径的 hard 刷新兜底 */ }
+    )
   }
 
   // 刷新 Token —— 同账号并发去重：所有等待方共享同一个 in-flight refresh promise，
@@ -1652,6 +1668,12 @@ export class ProxyServer {
     // 检查是否需要刷新 Token（stale-while-revalidate）
     if (this.isTokenExpired(account)) {
       // hard 窗口：token 逼近过期/已过期 → 这次请求前必须阻塞刷新
+      // 嫌疑计数：区分「已有在途刷新（含后台 SWR）时被迫等待」与「自己发起新刷新」——
+      // 前者多说明后台软刷新没能在 hard 窗口前刷完（jitter+RTT 过长），是 TTFT 尾延迟来源。
+      if (perfDiag.enabled) {
+        perfDiag.incr(PerfEvent.HardWindowBlockingRefresh)
+        if (this.refreshingTokens.has(account.id)) perfDiag.incr(PerfEvent.HardWindowAwaitInflight)
+      }
       const refreshed = await this.refreshToken(account, signal)
       if (!refreshed) {
         // 刷新失败，如果启用多账号才尝试获取下一个账号（受 API Key 白名单约束）
@@ -3842,7 +3864,7 @@ export class ProxyServer {
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog', 'poolLowThreshold',
       'portalEnabled', 'portalSessionTtlHours', 'portalDefaultMaxKeys',
       'portalGoogleEnabled', 'googleClientId', 'adminApiExposed', 'portalAllowedOrigins',
-      'portalMaxConcurrentPerCustomer'
+      'portalMaxConcurrentPerCustomer', 'perfDiagnostics'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 也排除：customers / portalSessionSecret —— 含密码哈希与签名密钥，仅本地 IPC / 专用 admin 端点改
     ]
@@ -4127,7 +4149,7 @@ export class ProxyServer {
 
       if (isStream) {
         // SSE 流式
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+        this.writeSseHead(res)
         return new Promise<void>((resolve) => {
           callKiroApiStream(
             account as ProxyAccount,
@@ -4567,11 +4589,7 @@ export class ProxyServer {
     try {
       const toolNameRegistry = new ToolNameRegistry()
       if (processedRequest.stream) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
-        })
+        this.writeSseHead(res)
         const responseId = `resp_${uuidv4()}`
         res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`)
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -4677,11 +4695,7 @@ export class ProxyServer {
     authRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
+      this.writeSseHead(res)
     }
 
     const id = streamId || `chatcmpl-${uuidv4()}`
@@ -4934,7 +4948,9 @@ export class ProxyServer {
       const webToolConfig = this.getWebToolConfig()
       const useWebTools = !!webToolConfig && this.claudeRequestUsesWebTools(request)
 
+      const _tTranslate = perfDiag.enabled ? perfDiag.now() : 0
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, useWebTools)
+      if (perfDiag.enabled) perfDiag.recordTiming(PerfPhase.Translate, perfDiag.now() - _tTranslate)
 
       // 估算本轮请求的 input token 数（仅用于 message_start 的 usage 展示）。
       // 用 binary-aware 的 estimateTokenCount（与 count_tokens / message_start 同源），
@@ -5021,6 +5037,8 @@ export class ProxyServer {
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
+    } finally {
+      if (perfDiag.enabled) perfDiag.recordTiming(PerfPhase.Total, Date.now() - startTime)
     }
   }
 
@@ -5081,7 +5099,9 @@ export class ProxyServer {
     }
 
     // stream=true：把最终 response replay 成 Anthropic SSE
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+    // 这是 web-tool 循环已 buffer 完结果后的「一次性同步 replay」，没有 idle 间隙，故无需心跳（heartbeat:false）；
+    // 但仍需 X-Accel-Buffering:no，避免 Cloudflare/nginx 把整段 SSE 缓冲后才下发。
+    this.writeSseHead(res, { heartbeat: false })
     // 整段最终结果是同步一次性 replay：cork 期间合并成尽量少的 TCP 段，uncork（在 res.end 前）一次性冲刷，
     // 减少系统调用/小包数量。字节输出完全不变；非实时增量，故不影响流式顺滑度。
     res.cork()
@@ -5134,6 +5154,50 @@ export class ProxyServer {
     res.end()
   }
 
+  /**
+   * 统一写出 SSE 响应头 + （可选）启动心跳。集中到一处，避免 5 个流式分支各自 copy-paste
+   * 这组头——任何新增的 SSE 端点只要调用本方法，就不会漏掉 X-Accel-Buffering / 心跳，
+   * 从而不会再退回「Cloudflare Tunnel 缓冲 / idle 切断流式连接」的老问题。
+   *
+   * X-Accel-Buffering:no —— 禁止 Cloudflare Tunnel / nginx 等中间层缓冲 SSE（否则 token 不实时、表现为「卡成一坨」）。
+   * heartbeat —— 真正逐 token 流式的分支传 true（默认）；已 buffer 完一次性 replay 的分支传 false（无 idle 间隙）。
+   * 幂等性由调用点保证（如 handleClaudeStream 仅在 !headersSent 时调用），本方法不重复防护。
+   */
+  private writeSseHead(res: http.ServerResponse, opts?: { heartbeat?: boolean }): void {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    if (opts?.heartbeat !== false) this.startSseHeartbeat(res)
+  }
+
+  /**
+   * SSE 心跳：流式响应在「上游长时间无输出」（如模型 thinking、工具循环间隙）时，链路上没有字节流动，
+   * Cloudflare Tunnel / undici 等中间层会按 idle 超时（cloudflared 默认连接、undici bodyTimeout=300s）
+   * 主动关闭这条连接 → 客户端（Claude Code）看到 "socket connection closed unexpectedly"。
+   * 这里每 intervalMs 写一个 SSE 注释行（": hb\n\n"，SSE 规范允许、所有客户端忽略，不进入消息流），
+   * 保持链路有字节流动，避免被 idle 切断。与正常 content 写入互不干扰（注释行被客户端丢弃）。
+   * 自动停止：res 触发 finish/close、或已 writableEnded/destroyed 时清理 timer，绝不泄漏。
+   * 返回一个手动 stop 函数（一般无需调用，依赖 finish/close 即可）。
+   */
+  private startSseHeartbeat(res: http.ServerResponse, intervalMs = 15_000): () => void {
+    let timer: ReturnType<typeof setInterval> | null = null
+    const stop = (): void => {
+      if (timer) { clearInterval(timer); timer = null }
+    }
+    timer = setInterval(() => {
+      if (res.writableEnded || res.destroyed) { stop(); return }
+      try { res.write(': hb\n\n') } catch { stop() }
+    }, intervalMs)
+    // 心跳不应阻止进程退出
+    timer.unref?.()
+    res.once('close', stop)
+    res.once('finish', stop)
+    return stop
+  }
+
   // 处理 Claude 流式响应
   private async handleClaudeStream(
     res: http.ServerResponse,
@@ -5158,11 +5222,8 @@ export class ProxyServer {
     authRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      })
+      // 统一 SSE 头 + 心跳（auth 重试 headersSent=true 时不重复启动）
+      this.writeSseHead(res)
     }
 
     const id = msgId || `msg_${uuidv4()}`
@@ -5853,6 +5914,8 @@ export class ProxyServer {
     lines.push('# HELP kiro_proxy_uptime_seconds Server uptime in seconds')
     lines.push('# TYPE kiro_proxy_uptime_seconds gauge')
     lines.push(`kiro_proxy_uptime_seconds ${Math.floor((Date.now() - s.startTime) / 1000)}`)
+    // 性能诊断指标（仅在 perfDiagnostics 开启时输出；关闭时返回空数组）
+    for (const line of perfDiag.renderMetrics()) lines.push(line)
     return lines.join('\n') + '\n'
   }
 
