@@ -52,6 +52,9 @@ export function CustomerManager() {
   const [hostIsLocal, setHostIsLocal] = useState(true)
   const [copied, setCopied] = useState(false)
 
+  // Web 管理面（/admin）暴露开关。默认关闭，开启后 /admin 页面+API 才对外可达。
+  const [adminExposed, setAdminExposed] = useState(false)
+
   // 新建客户表单
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -90,8 +93,9 @@ export function CustomerManager() {
   const loadStatus = useCallback(async () => {
     try {
       const status = await window.api.proxyGetStatus()
-      const cfg = (status?.config || {}) as { port?: number; host?: string; tls?: { enabled?: boolean }; portalEnabled?: boolean; portalGoogleEnabled?: boolean; googleClientId?: string }
+      const cfg = (status?.config || {}) as { port?: number; host?: string; tls?: { enabled?: boolean }; portalEnabled?: boolean; portalGoogleEnabled?: boolean; googleClientId?: string; adminApiExposed?: boolean }
       setPortalEnabled(!!cfg.portalEnabled)
+      setAdminExposed(!!cfg.adminApiExposed)
       setGoogleEnabled(!!cfg.portalGoogleEnabled)
       setGoogleClientId(cfg.googleClientId || '')
       setClientIdDraft(cfg.googleClientId || '')
@@ -162,6 +166,25 @@ export function CustomerManager() {
       setTimeout(() => setCopied(false), 1500)
     })
   }, [portalUrl])
+
+  // 切换 Web 管理面（/admin）对外暴露。复用 proxy-update-config，无需重启即时生效。
+  // 开启 = /admin 页面+API 对外可达；务必在 tunnel 层加 Zero Trust / IP 白名单再开。
+  const toggleAdminExposed = useCallback(async (next: boolean) => {
+    setBusy(true)
+    try {
+      const result = await window.api.proxyUpdateConfig({ adminApiExposed: next })
+      if (result.success) {
+        setAdminExposed(next)
+        flash(next
+          ? t('Web admin enabled — protect /admin behind your tunnel access policy', 'Web 管理面已开启 — 请在 tunnel 层用访问策略保护 /admin')
+          : t('Web admin disabled', 'Web 管理面已关闭'))
+      } else {
+        flash(result.error || t('Failed', '失败'), true)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [flash, t])
 
   const createCustomer = useCallback(async () => {
     if (!email.trim() || !password) {
@@ -437,6 +460,29 @@ export function CustomerManager() {
                   </span>
                 </div>
               )}
+            </div>
+          )}
+        </div>
+
+        {/* Web 管理面（/admin）暴露开关 */}
+        <div className="rounded-lg border p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="text-sm font-medium">{t('Web admin dashboard (/admin)', 'Web 管理面（/admin）')}</Label>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {t('Exposes the /admin dashboard + API so you can manage from a browser instead of this app.',
+                   '开放 /admin 管理面与 API，可在浏览器中管理而无需打开此应用。')}
+              </p>
+            </div>
+            <Switch checked={adminExposed} onCheckedChange={toggleAdminExposed} disabled={busy} />
+          </div>
+          {adminExposed && (
+            <div className="flex items-start gap-1.5 text-xs text-amber-600">
+              <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              <span>
+                {t('Anyone who can reach /admin can manage all accounts and credits. Keep it behind Zero Trust / Cloudflare Access or an IP allowlist.',
+                   '任何能访问 /admin 的人都可管理全部账号与额度。务必置于 Zero Trust / Cloudflare Access 或 IP 白名单之后。')}
+              </span>
             </div>
           )}
         </div>
