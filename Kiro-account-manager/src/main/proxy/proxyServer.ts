@@ -2069,17 +2069,23 @@ export class ProxyServer {
         }
       }
       if (matched) {
-        if (matched.creditsLimit && matched.usage.totalCredits >= matched.creditsLimit) {
+        // 计费 Gate 分两类，语义不同：
+        //  - Gate A（per-key creditsLimit）：standalone Key 的终身用量上限（usage.totalCredits 累计、永不重置）。
+        //    仅对【未绑定客户】的 Key 生效——客户门户 Key 的额度由预付 creditBalance 控制（见 types.ts），
+        //    若这里也卡 creditsLimit，则客户充值 creditBalance 也无法解封（充值不重置 usage），故跳过。
+        //  - Gate B（customer.creditBalance）：客户门户预付余额，admin/slip 充值即可解封。
+        // 两者耗尽都返回非可重试错误（上层映射 402），避免客户端把额度问题当成限流而无限重试。
+        if (!matched.customerId && matched.creditsLimit && matched.usage.totalCredits >= matched.creditsLimit) {
           return { valid: false, reason: 'Credits limit exceeded' }
         }
-        // 客户门户预付余额校验：Key 归属某客户时，余额 <= 0 或客户被禁用则拒绝
+        // 客户门户预付余额校验：Key 归属某客户时，客户被禁用 / 不存在 / 余额 <= 0 则拒绝
         if (matched.customerId) {
           const customer = (this.config.customers || []).find(c => c.id === matched!.customerId)
           if (!customer || !customer.enabled) {
-            return { valid: false, reason: 'Credits limit exceeded' }
+            return { valid: false, reason: 'Account disabled' }
           }
           if (customer.creditBalance <= 0) {
-            return { valid: false, reason: 'Credits limit exceeded' }
+            return { valid: false, reason: 'Insufficient credit balance' }
           }
         }
         return { valid: true, apiKey: matched }
@@ -2576,10 +2582,18 @@ export class ProxyServer {
       if (path !== '/health' && path !== '/' && !path.startsWith('/portal') && !isAdminPage) {
         const authResult = this.validateApiKey(req)
         if (!authResult.valid) {
-          const errorMsg = authResult.reason || 'Invalid or missing API key'
-          const statusCode = authResult.reason === 'Credits limit exceeded' ? 429 : 401
-          // 401 不返回 reason 详情（防止指纹爬取）
-          this.sendError(res, statusCode, statusCode === 401 ? 'Unauthorized' : errorMsg,
+          const reason = authResult.reason
+          // 额度类失败 → 402 Payment Required（非可重试）。关键：不要用 429，
+          // 否则 Claude Code / Cursor 等客户端会把它当成限流而无限指数退避重试，
+          // 表现为「充值后仍卡在 retry」。402 让客户端立即停止并报出明确的计费错误。
+          const isBilling = reason === 'Credits limit exceeded'
+            || reason === 'Insufficient credit balance'
+          // 账号被运营方禁用 → 403（与额度无关，充值也不解封）。
+          const isDisabled = reason === 'Account disabled'
+          const statusCode = isBilling ? 402 : isDisabled ? 403 : 401
+          // 401 不返回 reason 详情（防止指纹爬取）；402/403 返回可读 reason 以便用户处置。
+          const errorMsg = statusCode === 401 ? 'Unauthorized' : (reason || 'Forbidden')
+          this.sendError(res, statusCode, errorMsg,
             this.isAnthropicPath(path) ? 'anthropic' : 'openai')
           return
         }
@@ -4298,6 +4312,7 @@ export class ProxyServer {
   private getAnthropicErrorType(status: number): string {
     if (status === 400) return 'invalid_request_error'
     if (status === 401) return 'authentication_error'
+    if (status === 402) return 'billing_error'
     if (status === 403) return 'permission_error'
     if (status === 404) return 'not_found_error'
     if (status === 429) return 'rate_limit_error'
