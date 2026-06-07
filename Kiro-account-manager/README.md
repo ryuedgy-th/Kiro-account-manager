@@ -139,6 +139,16 @@ npm run typecheck
 
 ## 📋 Changelog
 
+### v1.7.7
+
+#### 🐞 Fixes
+- **Customer portal blank page** — A literal `</script>` inside a JS comment in the Getting-Started snippet code prematurely closed the page's script block, breaking the whole `/portal` page. Fixed and made structurally impossible going forward (see below).
+- **Admin dashboard wouldn't switch to dashboard after login** — CSS cascade bug where `.hide` lost to a later equal-specificity rule, so the login overlay never hid. Fixed with `!important`.
+
+#### ✨ Improvements
+- **Top-up history in admin** — New "ประวัติ" (History) button per customer; view manual + slip2go credit top-ups (timestamp, amount, source, note).
+- **Maintainable page templates** — Extracted the portal/admin HTML out of the proxy source into real `.html` files (imported at build time). Editors now lint the markup as HTML, and the build auto-escapes `</script>`, so the blank-page bug class can't recur.
+
 ### v1.7.0 (Current)
 
 #### 🔥 Major Features (4 phases, 19 new features)
