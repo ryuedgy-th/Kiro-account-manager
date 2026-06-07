@@ -45,6 +45,10 @@ import * as portal from './portal'
 import type { Customer, CustomerView, SlipTopupRecord } from './types'
 import { fetch as undiciFetch, FormData as UndiciFormData, type Dispatcher } from 'undici'
 import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
+// Self-contained single-page templates (vanilla JS, no external deps), inlined at
+// build time via Vite's `?raw`. Served verbatim by handlePortalPage/handleAdminPage.
+//   portal.html — customer portal: login → balance/usage/rates → API-key mgmt (/portal/* JSON API)
+//   admin.html  — operator dashboard behind Cloudflare Access; operator key → Bearer → /admin/*
 import PORTAL_HTML from './templates/portal.html?raw'
 import ADMIN_HTML from './templates/admin.html?raw'
 
@@ -6306,16 +6310,4 @@ export class ProxyServer {
   }
 }
 
-// ============ 客户门户静态页面 ============
-// 自包含单页（vanilla JS，无外部依赖）：登录 → 查看余额/用量/费率 → 管理 API Key。
-// 通过 fetch 调用 /portal/* JSON API；会话 token 存 localStorage。
-// 动态 HTML 一律用字符串拼接（不用模板字面量/${}），避免与外层 TS 模板字面量冲突，
-// 并统一经 esc() 转义防 XSS。
-
-// ============================================================================
-// 运营方 Web 管理面 (Admin Dashboard) —— 自包含 HTML，经 Cloudflare Access 保护后对外。
-// 与客户门户 PORTAL_HTML 同源同 port，仅 path 前缀 /admin 区分。复用同一套配色/组件类。
-// 登录：粘贴 operator key（= config.apiKeys 中未绑定 customerId 的 Key）→ 存 localStorage →
-// 以 Authorization: Bearer 调 /admin/* 。所有写操作后端已 appendAuditLog + onConfigChanged 持久化。
-// ============================================================================
 
