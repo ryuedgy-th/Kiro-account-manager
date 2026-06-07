@@ -139,7 +139,18 @@ npm run typecheck
 
 ## 📋 更新日志
 
-### v1.7.7
+### v1.7.5
+
+#### 🔌 反向代理：同步上游 v1.7.5 + 稳定性增强
+- **Cursor / 扁平工具结构兼容** — 部分客户端（如 Cursor Agent 模式）发送的 OpenAI 工具是扁平结构（`{type:'function', name, description, parameters}`），而非嵌套在 `function` 下。转换器现已同时兼容两种结构，请求不再因 `ERROR_PROVIDER_ERROR`（"Cannot read properties of undefined (reading 'description')"）而崩溃。
+- **思考模式 — 双 schema 路径** — 模型思考能力新增记录 `schemaPath`（`output_config` vs `reasoning`），使 reasoning-effort 类模型按各自声明的 schema 驱动。
+- **THINKING_SIGNATURE_INVALID 自动重试** — 遇到思考签名无效错误时，从助手消息中剥离 reasoning 内容并重试，而非整条请求失败。
+- **企业版/IdC profileArn 自愈** — 对于 profileArn 缺失/为占位符的外部 IdP 账号，代理通过 `ListAvailableProfiles` 获取真实 ARN、写回并通知 UI 持久化。新增 5 分钟冷却，使其在 token 刷新后可重新自愈，而非永久固定为 fallback。
+- **tool_use XML 剥离** — 清除混入文本流的游离 `<tool_use>...</tool_use>` XML —— 加了守卫以保留正常 chunk 边界的空白字符。
+- **Agent 模式（vibe/spec）** — 可配置的 agent 模式作为 header 转发给 Kiro，不再从身份推断。
+- **Steering 文件** — 自动注入工作区的 `.kiro/steering/*.md` 作为 system prompt，使代理像真实 Kiro 一样遵循项目上下文。
+- **载荷大小上限** — 提升至 150 MB（限制在 256 KB–200 MB）；修复此前会塌缩为 1.5 MB 的 fallback。
+- **删除账号 UI** — 在订阅页删除失败账号时新增「连删账号」复选框。
 
 #### 🐞 修复
 - **客户门户白屏** — 「快速开始」代码片段中一条 JS 注释里含有字面量 `</script>`，被浏览器当作脚本结束标签，导致整个 `/portal` 页面脚本中断、白屏。已修复，并从结构上杜绝复发（见下）。

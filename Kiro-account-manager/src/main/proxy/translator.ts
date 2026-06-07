@@ -468,13 +468,17 @@ export function openaiToKiro(
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           if (tc.type === 'function') {
+            // 兼容扁平形态：部分客户端把 name/arguments 直接铺在 tool_call 顶层而非 function 下。
+            const fn = tc.function ?? (tc as unknown as { name?: string; arguments?: string })
+            const fnName = fn?.name
+            if (!fnName || typeof fnName !== 'string') continue
             let input = {}
             try {
-              input = JSON.parse(tc.function.arguments)
+              input = JSON.parse(fn.arguments ?? '{}')
             } catch { /* ignore */ }
             toolUses.push({
               toolUseId: tc.id,
-              name: toolNameRegistry.toKiroName(tc.function.name),
+              name: toolNameRegistry.toKiroName(fnName),
               input
             })
           }
@@ -768,16 +772,25 @@ function convertOpenAITools(
   if (!tools) return []
 
   return tools.flatMap(tool => {
-    let description = tool.function.description || `Tool: ${tool.function.name}`
+    // 兼容两种工具形态：
+    //  - 标准 OpenAI：{ type:'function', function:{ name, description, parameters } }
+    //  - 扁平形态（部分客户端如 Cursor Agent 模式把字段直接铺在顶层）：{ type:'function', name, description, parameters }
+    // 缺失 function 时回退到顶层字段，避免读取 undefined.description 抛 500（ERROR_PROVIDER_ERROR）。
+    const flat = tool as unknown as { name?: string; description?: string; parameters?: unknown }
+    const fn = tool.function ?? flat
+    const name = fn?.name
+    // 无可用名称的工具无法构造 toolSpecification，跳过该条而非让整条请求 500。
+    if (!name || typeof name !== 'string') return []
+    let description = fn.description || `Tool: ${name}`
     // 截断过长的描述
     if (description.length > KIRO_MAX_TOOL_DESC_LEN) {
       description = description.substring(0, KIRO_MAX_TOOL_DESC_LEN) + '...'
     }
     const kiroTool: KiroToolWrapper = {
       toolSpecification: {
-        name: shortenToolName(tool.function.name, toolNameRegistry),
+        name: shortenToolName(name, toolNameRegistry),
         description,
-        inputSchema: { json: normalizeCustomToolSchema(tool.function.parameters) }
+        inputSchema: { json: normalizeCustomToolSchema(fn.parameters) }
       }
     }
     const cachePoint = toKiroCachePoint(tool.cache_control)

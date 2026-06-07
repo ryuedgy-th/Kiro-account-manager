@@ -139,7 +139,18 @@ npm run typecheck
 
 ## 📋 Changelog
 
-### v1.7.7
+### v1.7.5
+
+#### 🔌 Reverse Proxy: Upstream v1.7.5 Sync + Reliability
+- **Cursor / flat tool-shape compatibility** — Some clients (e.g. Cursor Agent mode) send OpenAI tools flattened (`{type:'function', name, description, parameters}`) instead of nested under `function`. The converter now accepts both shapes, so requests no longer crash with `ERROR_PROVIDER_ERROR` ("Cannot read properties of undefined (reading 'description')").
+- **Thinking mode — dual schema paths** — Model thinking capability now records `schemaPath` (`output_config` vs `reasoning`), so reasoning-effort models are driven by the schema each model actually advertises.
+- **THINKING_SIGNATURE_INVALID auto-retry** — On an invalid thinking-signature error, the reasoning content is stripped from the assistant message and the request is retried instead of failing outright.
+- **Enterprise/IdC profileArn self-healing** — For external-IdP accounts with a missing/placeholder profileArn, the proxy fetches the real ARN via `ListAvailableProfiles`, writes it back, and notifies the UI to persist it. Adds a 5-minute cooldown so it re-heals after token refresh rather than pinning a fallback permanently.
+- **tool_use XML stripping** — Strays `<tool_use>...</tool_use>` XML that leaks into the text stream is removed — guarded so normal chunk-boundary whitespace is preserved.
+- **Agent mode (vibe/spec)** — Configurable agent mode forwarded as a header to Kiro instead of being inferred from identity.
+- **Steering files** — `.kiro/steering/*.md` from the workspace are auto-injected as a system prompt so the proxy honors project context like the real Kiro.
+- **Payload size limit** — Raised to 150 MB (clamped 256 KB–200 MB); fixed a fallback that previously collapsed to 1.5 MB.
+- **Delete-accounts UI** — "Delete accounts" checkbox when removing failed accounts on the Subscription page.
 
 #### 🐞 Fixes
 - **Customer portal blank page** — A literal `</script>` inside a JS comment in the Getting-Started snippet code prematurely closed the page's script block, breaking the whole `/portal` page. Fixed and made structurally impossible going forward (see below).
