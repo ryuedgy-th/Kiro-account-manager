@@ -12,6 +12,7 @@ import type {
   OpenAIResponsesRequest,
   ClaudeRequest,
   ClaudeContentBlock,
+  ClaudeSystemBlock,
   ClaudeCacheControl,
   ClaudeStreamEvent,
   ProxyConfig,
@@ -41,6 +42,7 @@ import { promptCacheTracker } from './promptCacheTracker'
 import { estimateBase64DocumentTokens, IMAGE_TOKEN_ESTIMATE } from './tokenCounter'
 import { isServerWebTool, type WebToolConfig } from './webTools'
 import { perfDiag, PerfEvent, PerfPhase } from './perfDiag'
+import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 import * as portal from './portal'
 import type { Customer, CustomerView, SlipTopupRecord } from './types'
 import { fetch as undiciFetch, FormData as UndiciFormData, type Dispatcher } from 'undici'
@@ -272,35 +274,56 @@ function modelCapabilityMap(modalities: ModelModality[]): Record<ModelModality, 
 }
 
 function extractThinkingEfforts(schema?: Record<string, unknown> | null): string[] | undefined {
+  return extractThinkingSchema(schema)?.efforts
+}
+
+// 从模型 schema 读取 effort 枚举 + effort 字段所在的 schema 路径。
+//   - output_config 路径（Claude 4.5/4.6+ 新模型）：{ thinking:{type}, output_config:{ effort:{enum} } }
+//   - reasoning 路径（备用，部分模型）：{ reasoning:{ effort:{enum} } }，无 thinking 属性
+// 返回 schemaPath 供 translator.buildAdditionalModelRequestFields 决定下发 output_config 还是 reasoning。
+function extractThinkingSchema(
+  schema?: Record<string, unknown> | null
+): { efforts?: string[]; schemaPath?: 'output_config' | 'reasoning' } | undefined {
   if (!schema) return undefined
   const props = schema.properties as Record<string, unknown> | undefined
-  if (!props?.thinking) return undefined
-  const thinking = props.thinking as Record<string, unknown>
-  const thinkingProps = thinking.properties as Record<string, unknown> | undefined
-  const typeField = thinkingProps?.type as Record<string, unknown> | undefined
-  const enumValues = typeField?.enum as string[] | undefined
-  if (enumValues?.includes('adaptive') || enumValues?.includes('disabled')) {
-    const effortField = (props.output_config as Record<string, unknown> | undefined)?.properties as Record<string, unknown> | undefined
+  if (!props) return undefined
+  // output_config 路径（Claude 4.6+ 新模型）
+  if (props.output_config) {
+    const effortField = (props.output_config as Record<string, unknown>)?.properties as Record<string, unknown> | undefined
     const effortEnum = (effortField?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
-    return effortEnum || undefined
+    if (effortEnum && effortEnum.length > 0) {
+      return { efforts: effortEnum, schemaPath: 'output_config' }
+    }
+  }
+  // reasoning 路径（备用）
+  if (props.reasoning) {
+    const reasoningProps = (props.reasoning as Record<string, unknown>)?.properties as Record<string, unknown> | undefined
+    const effortEnum = (reasoningProps?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
+    if (effortEnum && effortEnum.length > 0) {
+      return { efforts: effortEnum, schemaPath: 'reasoning' }
+    }
   }
   return undefined
 }
 
 // 从 Kiro 模型的 additionalModelRequestFieldsSchema 读取该模型是否支持 thinking。
+// thinking 字段或 output_config 字段任一存在即视为支持（reasoning 路径模型也以 output_config/thinking 暴露能力）。
 function schemaSupportsThinking(schema?: Record<string, unknown> | null): boolean {
-  return !!(schema?.properties as Record<string, unknown> | undefined)?.thinking
+  const props = schema?.properties as Record<string, unknown> | undefined
+  return !!(props?.thinking || props?.output_config || props?.reasoning)
 }
 
 // 将后端返回的模型真实能力同步进 translator 的能力注册表，
-// 供 buildAdditionalModelRequestFields 按真实 schema 决定是否下发 thinking / 哪些 effort 合法。
+// 供 buildAdditionalModelRequestFields 按真实 schema 决定是否下发 thinking / 哪些 effort 合法 / 用哪个 schema 路径。
 function syncModelThinkingCapabilities(models: KiroModel[]): void {
   clearModelThinkingCapabilities()
   for (const m of models) {
     if (!m.modelId) continue
+    const ts = extractThinkingSchema(m.additionalModelRequestFieldsSchema)
     setModelThinkingCapability(m.modelId, {
       supportsThinking: schemaSupportsThinking(m.additionalModelRequestFieldsSchema),
-      thinkingEfforts: extractThinkingEfforts(m.additionalModelRequestFieldsSchema) ?? []
+      thinkingEfforts: ts?.efforts ?? [],
+      schemaPath: ts?.schemaPath
     })
   }
 }
@@ -366,7 +389,7 @@ function buildClientModel(input: {
     inputTypes: input.supportedInputTypes,
     rateMultiplier: input.rateMultiplier,
     rateUnit: input.rateUnit,
-    supportsThinking: !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking,
+    supportsThinking: schemaSupportsThinking(input.additionalModelRequestFieldsSchema),
     thinkingEfforts: extractThinkingEfforts(input.additionalModelRequestFieldsSchema),
     supportsPromptCaching: input.promptCaching?.supportsPromptCaching || false,
     modelProvider: input.modelProvider || undefined,
@@ -397,6 +420,9 @@ export class ProxyServer {
   private isStopping: boolean = false
   private activeRequests: Set<AbortController> = new Set()
   private sockets: Set<Socket> = new Set()
+  /** Steering 文件缓存（从 config.workspacePath 的 .kiro/steering/*.md 加载） */
+  private steeringDocs: SteeringDocument[] = []
+  private steeringPrompt: string = ''
   /** P1-7 按 API Key/IP 的滑动窗口限流（每分钟桶） */
   private rateLimitBuckets: Map<string, { count: number; windowStart: number }> = new Map()
   /** 门户登录按 IP 的失败限流桶（每分钟），独立于业务限流，防暴力破解 */
@@ -546,6 +572,57 @@ export class ProxyServer {
       this.config.portalSessionSecret = crypto.randomBytes(32).toString('hex')
       this.events.onConfigChanged?.(this.config)
     }
+    // 初次加载 steering 文件（若配置了 workspacePath）
+    this.loadSteering()
+  }
+
+  // ============ Steering 文件 + Thinking 配置 ============
+
+  /** 加载/刷新 steering 文件缓存。config.workspacePath 变化时调用（见 updateConfig）。 */
+  loadSteering(): void {
+    if (!this.config.workspacePath) {
+      this.steeringDocs = []
+      this.steeringPrompt = ''
+      return
+    }
+    try {
+      this.steeringDocs = loadSteeringDocuments(this.config.workspacePath)
+      this.steeringPrompt = formatSteeringForPrompt(this.steeringDocs)
+      if (this.steeringPrompt) {
+        const alwaysCount = this.steeringDocs.filter(d => d.inclusion === 'always').length
+        console.log(`[ProxyServer] Loaded ${alwaysCount} steering file(s) from ${this.config.workspacePath}`)
+      }
+    } catch (e) {
+      this.steeringDocs = []
+      this.steeringPrompt = ''
+      proxyLogger.warn('ProxyServer', `loadSteering failed: ${formatError(e)}`)
+    }
+  }
+
+  /** 获取格式化后的 steering prompt（注入到 system message 前面） */
+  getSteeringPrompt(): string {
+    return this.steeringPrompt
+  }
+
+  /** 注入 steering 到 OpenAI 格式请求的 messages（prepend 到首个 system 消息，或新增 system 消息） */
+  private injectSteeringOpenAI(messages: OpenAIMessage[]): OpenAIMessage[] {
+    if (!this.steeringPrompt) return messages
+    const sysIdx = messages.findIndex(m => m.role === 'system')
+    if (sysIdx >= 0) {
+      const sys = messages[sysIdx]
+      const existingContent = typeof sys.content === 'string' ? sys.content : ''
+      const merged: OpenAIMessage = { ...sys, content: `${this.steeringPrompt}\n\n${existingContent}` }
+      return [...messages.slice(0, sysIdx), merged, ...messages.slice(sysIdx + 1)]
+    }
+    return [{ role: 'system', content: this.steeringPrompt }, ...messages]
+  }
+
+  /** 注入 steering 到 Claude 格式请求的 system 字段 */
+  private injectSteeringClaude(system?: string | ClaudeSystemBlock[]): string | ClaudeSystemBlock[] | undefined {
+    if (!this.steeringPrompt) return system
+    if (!system) return this.steeringPrompt
+    if (typeof system === 'string') return `${this.steeringPrompt}\n\n${system}`
+    return [{ type: 'text', text: this.steeringPrompt } as ClaudeSystemBlock, ...system]
   }
 
   /**
@@ -906,6 +983,10 @@ export class ProxyServer {
       else if (!willOn && wasOn) perfDiag.stop()
     }
     this.config = { ...this.config, ...config }
+    // workspacePath 变化时重新加载 steering 文件
+    if ('workspacePath' in config) {
+      this.loadSteering()
+    }
     // 门户启用时若未设签名密钥，自动生成一份（持久化靠 onConfigChanged）。
     // 缺少密钥会导致 /portal/login 返回 503，故在此兜底初始化。
     if (this.config.portalEnabled && !this.config.portalSessionSecret) {
@@ -4775,6 +4856,12 @@ export class ProxyServer {
     try {
       const toolNameRegistry = new ToolNameRegistry()
 
+      // 注入 steering 文件到 system message（若配置了 workspacePath 且有 always 文档）。
+      // 就地改写 processedRequest，retry 路径复用同一对象时自动继承。
+      if (this.steeringPrompt) {
+        processedRequest.messages = this.injectSteeringOpenAI(processedRequest.messages)
+      }
+
       // 转换为 Kiro 格式
       const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry)
 
@@ -5290,6 +5377,11 @@ export class ProxyServer {
       const toolNameRegistry = new ToolNameRegistry()
       const webToolConfig = this.getWebToolConfig()
       const useWebTools = !!webToolConfig && this.claudeRequestUsesWebTools(request)
+
+      // 注入 steering 文件到 Claude system 字段（若配置了 workspacePath 且有 always 文档）。
+      if (this.steeringPrompt) {
+        processedRequest.system = this.injectSteeringClaude(processedRequest.system)
+      }
 
       const _tTranslate = perfDiag.enabled ? perfDiag.now() : 0
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, useWebTools)

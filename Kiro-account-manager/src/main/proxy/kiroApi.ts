@@ -39,14 +39,22 @@ export function setUseKProxyForApiInProxy(enabled: boolean): void {
   useKProxyForApi = enabled
 }
 
+// profileArn 自愈持久化回调：当 Enterprise 账号在运行时首次解析出真实 profileArn 时，
+// 通过该回调通知主进程回写到 renderer store + 磁盘，避免每次请求都重新获取。
+type ProfileArnPersistCallback = (accountId: string, profileArn: string) => void
+let profileArnPersistCallback: ProfileArnPersistCallback | undefined
+export function setProfileArnPersistCallback(cb: ProfileArnPersistCallback | undefined): void {
+  profileArnPersistCallback = cb
+}
+
 export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
 
 // Payload 大小限制（KB），用户可在高级设置中调整
-let payloadSizeLimitKB = 1536 // 默认 1.5MB
+let payloadSizeLimitKB = 153600 // 默认 150MB（支持大图片附件）
 export function setPayloadSizeLimitKB(limitKB: number): void {
-  payloadSizeLimitKB = Math.max(256, Math.min(10240, limitKB))
+  payloadSizeLimitKB = Math.max(256, Math.min(204800, limitKB))
 }
 
 // Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
@@ -263,8 +271,7 @@ type KiroEndpoint = typeof KIRO_ENDPOINTS[number]
 // 按账号 region 解析端点 URL（仅 regional 端点替换 {region}）
 function resolveEndpointUrl(endpoint: KiroEndpoint, account: ProxyAccount): string {
   if (!('regional' in endpoint) || !endpoint.regional) return endpoint.url
-  const region = account.region?.startsWith('eu') ? 'eu-central-1' : 'us-east-1'
-  return endpoint.url.replace('{region}', region)
+  return endpoint.url.replace('{region}', normalizeKiroRegion(account.region))
 }
 
 // Kiro 版本号（跟随官方 IDE 更新）
@@ -302,13 +309,27 @@ const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/${KIRO_CLI_SDK_VERSION} ua/2.1 api
 const AGENT_MODE_SPEC = 'spec' // IDE 模式
 const AGENT_MODE_VIBE = 'vibe' // CLI 模式
 
+// 用户可配置的 Agent 模式覆盖（vibe=对话优先 / spec=计划优先）。
+// 默认 undefined = 不覆盖，沿用「按端点身份决定」的逻辑（见 getAuthHeaders）——
+// 这保留了 fork 对 IdC/Enterprise 订阅的 403 修复：CLI 端点强制 vibe、IDE 端点强制 spec。
+// 一旦用户在 UI 显式选择模式，则以该选择为准（写入 x-amzn-kiro-agent-mode）。
+let configuredAgentMode: 'vibe' | 'spec' | undefined
+export function setAgentMode(mode: 'vibe' | 'spec' | undefined): void {
+  configuredAgentMode = mode === 'vibe' || mode === 'spec' ? mode : undefined
+}
+export function getAgentMode(): 'vibe' | 'spec' | undefined {
+  return configuredAgentMode
+}
+
 // profileArn 决策中心已迁移到 ../kiroAuthSync，反代和账号管理器主进程共用同一份定义，
 // 防止多处常量漂移。注意 KIRO_BUILDER_ID_PLACEHOLDER_ARN 仍以本模块为出口 re-export，
 // 这样 main/index.ts 等老 import 路径不需要改。
 import {
   KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
   KIRO_SOCIAL_PROFILE_ARN,
-  isPlaceholderProfileArn as _isPlaceholderProfileArn
+  isPlaceholderProfileArn as _isPlaceholderProfileArn,
+  getEnterpriseFallbackArn,
+  normalizeKiroRegion
 } from '../kiroAuthSync'
 
 export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
@@ -316,9 +337,13 @@ export const isPlaceholderProfileArn = _isPlaceholderProfileArn
 
 /**
  * 反代调 Kiro API 时使用的 profileArn 决策（流式端点用）。
- * BuilderId 使用占位符 ARN，Social 使用固定 ARN。常量统一来自 ../kiroAuthSync 防漂移。
- * 注意：流式端点（generateAssistantResponse / SendMessageStreaming）对占位符 ARN 会 403，
- * 需在 callKiroApiStream 中额外用 isPlaceholderProfileArn 剥离。
+ * 优先级：真实 ARN（自愈获取） > 按账号类型的固定/兜底 ARN。常量统一来自 ../kiroAuthSync 防漂移。
+ *   - 已有真实 ARN（非占位符） → 直接用
+ *   - Social（Github/Google） → 固定 social ARN
+ *   - Enterprise/external_idp → 区域化 Enterprise 兜底 ARN（自愈获取失败时兜底）
+ *   - BuilderId → 占位符 ARN
+ * 注意：流式端点（generateAssistantResponse / SendMessageStreaming）对 BuilderId 占位符 ARN 会 403，
+ * 需在 callKiroApiStream 中额外用 isPlaceholderProfileArn 剥离（Enterprise 兜底 ARN 非占位符，照常下发）。
  */
 function resolveProfileArn(account: ProxyAccount): string | undefined {
   if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
@@ -326,6 +351,9 @@ function resolveProfileArn(account: ProxyAccount): string | undefined {
   }
   if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
     return KIRO_SOCIAL_PROFILE_ARN
+  }
+  if (account.provider === 'Enterprise' || account.authMethod === 'external_idp') {
+    return getEnterpriseFallbackArn(account.region)
   }
   return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
@@ -1255,8 +1283,8 @@ export function buildKiroPayload(
 
   // ====== 第二阶段：按 byte 截断 tool result 内容 ======
   // 避免 HTTP body 过大被 Kiro 网关拒绝
-  // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
-  const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
+  // 用户可在高级设置中调整限制值（默认 150MB，见 payloadSizeLimitKB / setPayloadSizeLimitKB）
+  const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB ?? 153600) * 1024
   const TOOL_RESULT_TRUNCATE_LENGTH = 4000
   // 热路径优化：先用 binary-aware 廉价估算预判；只有逼近上限时才付出整 payload JSON.stringify 的代价
   // （这段 byte 截断实测几乎从不触发——真正的限制由下面第三阶段 token 预算处理，见其注释）。
@@ -1437,7 +1465,9 @@ function getAuthHeaders(account: ProxyAccount, endpoint: KiroEndpoint): Record<s
   // CLI 身份用于 AmazonQCLI 端点与新的 KiroRuntime(runtime.kiro.dev) 端点（identity:'cli'）。
   const useCliIdentity = endpoint.name === 'AmazonQCLI' || ('identity' in endpoint && endpoint.identity === 'cli')
   const machineId = getAccountMachineId(account.id, account.machineId)
-  const agentMode = useCliIdentity ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
+  // Agent 模式：用户显式配置优先；未配置时沿用「按端点身份决定」的 fork 默认逻辑
+  //（CLI 端点 → vibe，IDE 端点 → spec），保留对 IdC/Enterprise 订阅的 403 修复。
+  const agentMode = configuredAgentMode ?? (useCliIdentity ? AGENT_MODE_VIBE : AGENT_MODE_SPEC)
   // RPC 端点（runtime.kiro.dev）：AWS JSON-1.0 协议——path '/' + x-amz-target 头 + 专用 content-type。
   // 抓包确认 runtime.kiro.dev 即用此风格，与旧 REST 端点（path 含动词）不同。
   const isRpc = 'rpc' in endpoint && endpoint.rpc === true
@@ -1450,6 +1480,10 @@ function getAuthHeaders(account: ProxyAccount, endpoint: KiroEndpoint): Record<s
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${account.accessToken}`
+  }
+  // Enterprise External IdP 需要额外的 TokenType header（官方 addExternalIdpTokenTypeMiddleware）
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
   }
   if (isRpc) {
     // x-amz-target 把目标 operation 放进 header（RPC 风格的核心），抓包确认必带
@@ -1528,6 +1562,10 @@ export async function callKiroApiStream(
   const endpoints = getSortedEndpoints(preferredEndpoint)
   let lastError: Error | null = null
 
+  // Enterprise/external_idp 缺真实 profileArn 时，先调 ListAvailableProfiles 自愈获取并持久化（带失败冷却）。
+  // BuilderId/Social 不需要（resolveProfileArn 会兜底，且对这些类型调该 API 会 403）。
+  await maybeHealEnterpriseProfileArn(account)
+
   for (const endpoint of endpoints) {
     try {
       throwIfAborted(signal)
@@ -1535,7 +1573,7 @@ export async function callKiroApiStream(
       const _tClone = _diag ? perfDiag.now() : 0
       const requestPayload = clonePayload(payload)
       if (_diag) perfDiag.recordTiming(PerfPhase.Clone, perfDiag.now() - _tClone)
-      // 流式端点对 BuilderId 占位符 ARN 返回 403，仅传真实 ARN 或 Social ARN
+      // 流式端点对 BuilderId 占位符 ARN 返回 403，仅传真实 ARN / Social ARN / Enterprise 兜底 ARN（均非占位符）
       const resolvedArn = resolveProfileArn(account)
       if (resolvedArn && !isPlaceholderProfileArn(resolvedArn)) {
         requestPayload.profileArn = resolvedArn
@@ -1661,11 +1699,66 @@ export async function callKiroApiStream(
       }
       lastError = error as Error
       console.error(`[KiroAPI] Endpoint ${endpoint.name} failed: ${formatError(error)}`)
-      
+
       // 如果是认证错误，不继续尝试其他端点
       if ((error as Error).message.includes('Auth error')) {
         onError(error as Error)
         return
+      }
+
+      // THINKING_SIGNATURE_INVALID：剥离 history 中的 reasoningContent 后，就地同端点重试一次（官方 IDE 同策略）。
+      // thinking 模式下，若历史里的 reasoningContent.signature 失效（跨会话/模型切换/签名过期），后端返回该
+      // 错误；去掉历史推理内容后重发通常即可成功。仅在 stream 尚未开始时进入此 catch，故重试是安全的。
+      // 复用 fork 的 helper（resolveEndpointUrl / RPC-aware getAuthHeaders / getNetworkAgent / parseEventStream），
+      // 而非 paste upstream 的简化版，确保与 fork 重写过的流式/诊断路径一致。
+      const errMsg = (error as Error).message || ''
+      if (errMsg.includes('THINKING_SIGNATURE_INVALID')) {
+        proxyLogger.warn('KiroAPI', `THINKING_SIGNATURE_INVALID on ${endpoint.name}, retrying with reasoningContent stripped`)
+        try {
+          throwIfAborted(signal)
+          const retryPayload = clonePayload(payload)
+          // 剥离 history 中所有 assistantResponseMessage.reasoningContent
+          for (const msg of retryPayload.conversationState.history ?? []) {
+            if (msg.assistantResponseMessage?.reasoningContent !== undefined) {
+              delete msg.assistantResponseMessage.reasoningContent
+            }
+          }
+          // profileArn 决策与主流程一致（占位符剥离，Enterprise 兜底 ARN 照常下发）
+          const retryArn = resolveProfileArn(account)
+          if (retryArn && !isPlaceholderProfileArn(retryArn)) {
+            retryPayload.profileArn = retryArn
+          } else {
+            delete retryPayload.profileArn
+          }
+          if (endpoint.name === 'CodeWhisperer') {
+            applyPayloadModelId(retryPayload, await resolveCodeWhispererModelId(account, getPayloadModelId(retryPayload), signal))
+          }
+          applyPayloadOrigin(retryPayload, endpoint.origin)
+          if (endpoint.name === 'AmazonQCLI') {
+            delete (retryPayload.conversationState as unknown as Record<string, unknown>).agentContinuationId
+            delete (retryPayload.conversationState as unknown as Record<string, unknown>).agentTaskType
+          }
+          const retryUrl = resolveEndpointUrl(endpoint, account)
+          const retryStr = JSON.stringify(retryPayload)
+          const retryHeaders = getAuthHeaders(account, endpoint)
+          const retryAgent = getNetworkAgent(account)
+          const retryResponse = retryAgent
+            ? await undiciFetch(retryUrl, { method: 'POST', headers: retryHeaders, body: retryStr, signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
+            : await undiciFetch(retryUrl, { method: 'POST', headers: retryHeaders, body: retryStr, signal } as UndiciRequestInit) as unknown as Response
+          if (retryResponse.ok) {
+            const retryBootstrap = estimatePayloadTokens(retryPayload)
+            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryBootstrap, signal, clientModelId || getPayloadModelId(retryPayload))
+            return
+          }
+          const retryBody = await retryResponse.text().catch(() => '')
+          console.error(`[KiroAPI] THINKING_SIGNATURE_INVALID retry also failed: ${retryResponse.status} ${retryBody.slice(0, 200)}`)
+          // 用重试的真实失败覆盖 lastError，避免最终 onError 误报原始 SIGNATURE_INVALID
+          lastError = new Error(`API error ${retryResponse.status}: ${retryBody}`)
+        } catch (retryErr) {
+          if (signal?.aborted) { onError(getAbortError(signal)); return }
+          console.error('[KiroAPI] THINKING_SIGNATURE_INVALID retry error:', retryErr)
+          lastError = retryErr as Error
+        }
       }
     }
   }
@@ -1730,6 +1823,11 @@ export function estimateTokens(text: string): number {
   return countTokens(text)
 }
 
+// Kiro 后端偶尔在文本里夹带 <tool_use ...>...</tool_use> XML（结构化 toolUseEvent 已单独处理）。
+// 仅在 chunk 含 '<tool_use' 子串时才用此正则剥离——模块级单例（.replace 每次自动重置 lastIndex），
+// 避免每个 content chunk 重新编译正则。
+const TOOL_USE_XML_RE = /<tool_use\b[^>]*>[\s\S]*?<\/tool_use>/g
+
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
@@ -1746,9 +1844,9 @@ async function parseEventStream(
   }
   let buffer = new Uint8Array(0)
   let bufStart = 0   // 读取游标：已消费数据的边界，避免每条消息 slice 整个 buffer（O(n²)→O(n)）
-  let usage = { 
-    inputTokens: 0, 
-    outputTokens: 0, 
+  let usage: KiroUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
     credits: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
@@ -1839,13 +1937,21 @@ async function parseEventStream(
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
               const assistantResp = event.assistantResponseEvent || event
-              const content = assistantResp.content
+              let content = assistantResp.content as string | undefined
               if (content) {
-                onChunk(content)
-                // 累积输出字符长度（兜底估算用）
-                totalOutputChars += content.length
-                // 累积输出文本（tiktoken 精确计算用）
-                collectedOutputText += content
+                // 仅当文本里夹带 <tool_use> XML 时才过滤（结构化 toolUseEvent 已单独处理）。
+                // 关键：普通 chunk 不经 replace/trim，避免误删 chunk 边界的合法空白
+                //（如 "hello " + "world" 被 trim 成 "helloworld"），也避免每个 chunk 都跑正则。
+                if (content.includes('<tool_use')) {
+                  content = content.replace(TOOL_USE_XML_RE, '').trim()
+                }
+                if (content) {
+                  onChunk(content)
+                  // 累积输出字符长度（兜底估算用）
+                  totalOutputChars += content.length
+                  // 累积输出文本（tiktoken 精确计算用）
+                  collectedOutputText += content
+                }
               }
             }
 
@@ -1854,11 +1960,16 @@ async function parseEventStream(
             // CodeWhisperer/AmazonQ 端点用 AssistantResponseEvent 包代码，CLI 端点单独用 CodeEvent
             if (eventType === 'codeEvent' || event.codeEvent) {
               const codeResp = event.codeEvent || event
-              const content = codeResp.content
+              let content = codeResp.content as string | undefined
               if (content) {
-                onChunk(content)
-                totalOutputChars += content.length
-                collectedOutputText += content
+                if (content.includes('<tool_use')) {
+                  content = content.replace(TOOL_USE_XML_RE, '').trim()
+                }
+                if (content) {
+                  onChunk(content)
+                  totalOutputChars += content.length
+                  collectedOutputText += content
+                }
               }
             }
             
@@ -2061,11 +2172,20 @@ async function parseEventStream(
               proxyLogger.debug('Kiro', 'supplementaryWebLinksEvent', JSON.stringify(webLinksEvent).slice(0, 300))
             }
             
-            // 处理 contextUsageEvent - 上下文使用百分比（反推真实 inputTokens）
+            // 处理 contextUsageEvent - 上下文使用百分比（反推真实 inputTokens）+ breakdown
             if (eventType === 'contextUsageEvent' || event.contextUsageEvent) {
               const contextEvent = event.contextUsageEvent || event
               if (contextEvent.contextUsagePercentage !== undefined) {
                 const percentage = contextEvent.contextUsagePercentage
+                // 捕获 breakdown（Conversation / MCP tools / Steering files）存入 usage.contextUsage
+                usage.contextUsage = {
+                  percentage,
+                  breakdown: contextEvent.breakdown ? {
+                    conversation: contextEvent.breakdown.conversation,
+                    mcpTools: contextEvent.breakdown.mcpTools,
+                    steeringFiles: contextEvent.breakdown.steeringFiles
+                  } : undefined
+                }
                 // 若已拿到真实 tokenUsage，仅记录百分比，不覆盖 inputTokens
                 if (hasRealTokenUsage) {
                   proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}% (real tokenUsage already received)`)
@@ -2079,6 +2199,9 @@ async function parseEventStream(
                   } else {
                     proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}%`)
                   }
+                }
+                if (usage.contextUsage.breakdown) {
+                  proxyLogger.info('Kiro', `contextUsage breakdown: conversation=${usage.contextUsage.breakdown.conversation || 0}% mcpTools=${usage.contextUsage.breakdown.mcpTools || 0}% steering=${usage.contextUsage.breakdown.steeringFiles || 0}%`)
                 }
                 // 如果上下文使用率超过 80%，发送警告
                 if (percentage > 80) {
@@ -2097,7 +2220,7 @@ async function parseEventStream(
                 proxyLogger.debug('Kiro', `reasoning chunk (isThinking=true), len=${reasoning.text.length}`)
                 onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
-                usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length * 0.4))
+                usage.reasoningTokens = (usage.reasoningTokens || 0) + Math.max(1, Math.round(reasoning.text.length * 0.4))
               } else if (reasoning.signature && !reasoning.redactedContent) {
                 onChunk('', undefined, true, reasoning.signature, undefined)
               }
@@ -2485,15 +2608,111 @@ export interface KiroModel {
 
 // 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
 function getQServiceEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
-  return 'https://q.us-east-1.amazonaws.com'
+  return `https://q.${normalizeKiroRegion(region)}.amazonaws.com`
+}
+
+// 根据账号区域获取 CodeWhisperer Runtime 端点（用于 ListAvailableProfiles）
+function getCodeWhispererEndpoint(region?: string): string {
+  return `https://codewhisperer.${normalizeKiroRegion(region)}.amazonaws.com`
+}
+
+/**
+ * Enterprise/IdC 账号获取「真实」profileArn（通过 CodeWhisperer Runtime 的 /ListAvailableProfiles）。
+ * 官方 IDE 在认证后通过此 API 获取可用 profiles，用户选择后存储 ARN；反代自动取第一个 profile。
+ * 只返回真实 ARN 或 undefined——兜底 ARN 由 resolveProfileArn 在请求时动态提供，
+ * 绝不在此把兜底 ARN 当成功结果返回（否则会被钉进 account.profileArn，导致瞬时 403 永久兜底）。
+ */
+export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
+  const baseUrl = getCodeWhispererEndpoint(account.region)
+  const url = `${baseUrl}/ListAvailableProfiles`
+  const machineId = getAccountMachineId(account.id, account.machineId)
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${account.accessToken}`,
+    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
+    'user-agent': getKiroUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
+  }
+  // external_idp 同样需要 TokenType header
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
+  }
+
+  try {
+    const response = await fetchWithProxy(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({})
+    }, account)
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '')
+      console.error(`[KiroAPI] ListAvailableProfiles failed: ${response.status}`, errBody.slice(0, 200))
+      // 包括 403（无 Enterprise entitlement / token 失效）在内一律返回 undefined：
+      // 请求仍由 resolveProfileArn 的区域化兜底 ARN 兜住，且不把兜底钉进账号（见 maybeHealEnterpriseProfileArn 的冷却）。
+      return undefined
+    }
+
+    const data = await response.json() as { profiles?: Array<{ arn?: string; profileName?: string }> }
+    const profiles = data.profiles || []
+    if (profiles.length === 0) {
+      console.warn('[KiroAPI] ListAvailableProfiles: no profiles returned')
+      return undefined
+    }
+
+    const arn = profiles[0].arn
+    if (arn) {
+      console.log(`[KiroAPI] Enterprise profileArn resolved: ${arn}`)
+    }
+    return arn || undefined
+  } catch (error) {
+    console.error('[KiroAPI] fetchEnterpriseProfileArn error:', error)
+    return undefined
+  }
+}
+
+// 自愈尝试的失败冷却（按 accountId）：避免「无 Enterprise entitlement / 持续 403」的账号每个请求都打一次
+// ListAvailableProfiles。失败后 ATTEMPT_COOLDOWN_MS 内不再尝试；期间请求仍由 resolveProfileArn 的区域化兜底
+// ARN 兜住。冷却到期后会再次尝试——所以 token 刷新恢复 entitlement 后能自动重新自愈（不会像旧逻辑那样把兜底
+// ARN 永久钉进账号）。
+const enterpriseHealCooldownUntil = new Map<string, number>()
+const ENTERPRISE_HEAL_COOLDOWN_MS = 5 * 60 * 1000
+
+/**
+ * Enterprise/external_idp 账号若缺真实 profileArn，则尝试自愈获取并回写（内存 + 持久化回调）。
+ * 统一封装两处调用点（callKiroApiStream / fetchKiroModels）的「判断 + 冷却 + 回写」逻辑，避免漂移。
+ * 返回是否真的写入了新的真实 ARN。
+ */
+async function maybeHealEnterpriseProfileArn(account: ProxyAccount): Promise<boolean> {
+  const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
+  if (!isEnterprise) return false
+  // 已有真实 ARN（非占位符、非空）→ 无需自愈
+  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) return false
+  // 冷却中（上次尝试失败且未到期）→ 跳过，用兜底 ARN
+  const until = account.id ? enterpriseHealCooldownUntil.get(account.id) : undefined
+  if (until !== undefined && Date.now() < until) return false
+
+  const fetchedArn = await fetchEnterpriseProfileArn(account)
+  if (fetchedArn) {
+    account.profileArn = fetchedArn
+    if (account.id) {
+      enterpriseHealCooldownUntil.delete(account.id)
+      profileArnPersistCallback?.(account.id, fetchedArn)
+    }
+    return true
+  }
+  // 失败：设置冷却，期间不再重试（请求走兜底 ARN）；到期后下次请求会再尝试（token 刷新后可恢复）
+  if (account.id) enterpriseHealCooldownUntil.set(account.id, Date.now() + ENTERPRISE_HEAL_COOLDOWN_MS)
+  return false
 }
 
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
   const baseUrl = getQServiceEndpoint(account.region)
   const machineId = getAccountMachineId(account.id, account.machineId)
-  
+
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${account.accessToken}`,
     'Content-Type': 'application/json',
@@ -2502,6 +2721,9 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
     'x-amzn-codewhisperer-optout': 'true'
   }
+
+  // Enterprise/external_idp 缺真实 profileArn 时先自愈获取（BuilderId/Social 由 resolveProfileArnForRead 兜底）
+  await maybeHealEnterpriseProfileArn(account)
 
   const allModels: KiroModel[] = []
   let nextToken: string | undefined

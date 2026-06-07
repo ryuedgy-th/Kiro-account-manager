@@ -534,6 +534,17 @@
             <div class="muted" style="margin-bottom:10px">โอนเงินมาที่บัญชีด้านล่าง แล้วแนบรูปสลิป — ระบบตรวจกับธนาคารและเติมเครดิตอัตโนมัติ</div>
             <div id="topupAccounts"></div>
             <div class="muted" id="topupLimits" style="font-size:12px; margin-top:8px"></div>
+            <div id="topupRateBox" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid var(--border,#e5e7eb)">
+              <div style="font-weight:600; font-size:13px; margin-bottom:8px">อัตราแลกเครดิต · <span id="topupRate" style="color:var(--accent,#10b981)"></span></div>
+              <div class="row" style="align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap">
+                <span class="muted" style="font-size:13px">เติม ฿</span>
+                <input id="topupCalcInput" type="number" inputmode="numeric" min="0" placeholder="100" style="max-width:130px; padding:8px 10px; border:1px solid var(--border,#cbd5e1); border-radius:8px; font-size:14px">
+                <span class="muted" style="font-size:13px">≈</span>
+                <strong id="topupCalcOut" style="font-variant-numeric:tabular-nums">–</strong>
+                <span class="muted" style="font-size:13px">เครดิต</span>
+              </div>
+              <div class="muted" id="topupExamples" style="font-size:12px"></div>
+            </div>
           </div>
           <div class="card" style="margin-top:14px">
             <label>แนบรูปสลิปโอนเงิน</label>
@@ -950,6 +961,39 @@
       if (slipTopup.minAmountThb) parts.push('ขั้นต่ำ ฿' + fmtBaht(slipTopup.minAmountThb));
       if (slipTopup.maxAmountThb) parts.push('สูงสุด ฿' + fmtBaht(slipTopup.maxAmountThb));
       lim.textContent = parts.join(' · ');
+    }
+    // อัตราแลกเครดิต + เครื่องคิดเลข (ใช้ bahtPerCredit จริงจาก config; โชว์เฉพาะเมื่อเปิด pricing)
+    var rateBox = $('topupRateBox');
+    if (rateBox){
+      var bpc = (pricing && pricing.enabled && pricing.bahtPerCredit > 0) ? pricing.bahtPerCredit : 0;
+      if (bpc > 0){
+        rateBox.style.display = '';
+        // "฿1 = N เครดิต" — ถ้าหาร 1/bpc ไม่ลงตัวก็ fallback เป็น "฿X = 1 เครดิต"
+        var perBaht = 1 / bpc;
+        $('topupRate').textContent = (perBaht >= 1 && Math.abs(perBaht - Math.round(perBaht)) < 1e-9)
+          ? ('฿1 = ' + fmt(perBaht) + ' เครดิต')
+          : ('฿' + fmtBaht(bpc) + ' = 1 เครดิต');
+        // ตัวอย่างจำนวนเงิน → เครดิต (กรองให้อยู่ในลิมิต min/max ถ้ามี)
+        var mn = slipTopup.minAmountThb || 0, mx = slipTopup.maxAmountThb || 0;
+        var ex = [10, 100, 500, 1000].filter(function(b){ return (!mn || b >= mn) && (!mx || b <= mx); });
+        if (!ex.length) ex = [mn || 100];
+        $('topupExamples').textContent = ex.map(function(b){ return '฿' + fmtBaht(b) + ' ≈ ' + fmt(b / bpc); }).join(' · ');
+        // เครื่องคิดเลขสด: พิมพ์บาท → โชว์เครดิต
+        var ci = $('topupCalcInput'), co = $('topupCalcOut');
+        if (ci && co && !ci.dataset.bound){
+          ci.dataset.bound = '1';
+          ci.addEventListener('input', function(){
+            var v = parseFloat(ci.value);
+            co.textContent = (isFinite(v) && v > 0) ? fmt(v / bpc) : '–';
+          });
+        }
+        if (ci && co){
+          var v0 = parseFloat(ci.value);
+          co.textContent = (isFinite(v0) && v0 > 0) ? fmt(v0 / bpc) : '–';
+        }
+      } else {
+        rateBox.style.display = 'none';
+      }
     }
   }
 

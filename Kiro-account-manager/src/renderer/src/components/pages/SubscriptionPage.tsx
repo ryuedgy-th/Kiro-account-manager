@@ -134,7 +134,7 @@ function parseImportedLinks(text: string): Array<{ email: string; url: string }>
 }
 
 export function SubscriptionPage() {
-  const { accounts, selectedIds, updateAccount } = useAccountsStore()
+  const { accounts, selectedIds, updateAccount, removeAccount } = useAccountsStore()
   const { actualLanguage } = useTranslation()
   const isEn = actualLanguage === 'en'
 
@@ -276,6 +276,9 @@ export function SubscriptionPage() {
 
   // 并发数
   const [concurrency, setConcurrency] = useState(5)
+
+  // 删除失败链接时是否同时删除账号本身（封号账号清理）
+  const [deleteAlsoAccount, setDeleteAlsoAccount] = useState(false)
 
   // 批量并发获取订阅链接
   const handleBatchFetch = async () => {
@@ -449,18 +452,31 @@ export function SubscriptionPage() {
     setSelectedLinkIds(new Set())
   }
 
-  // 批量删除"失败 + 过期"：清理无效项，保留可用链接
+  // 批量删除"失败 + 过期"：清理无效项，保留可用链接；勾选 deleteAlsoAccount 时连带删除账号
   const handleDeleteFailed = () => {
-    const count = links.filter(l => l.status === 'error' || l.status === 'expired').length
+    const failedLinks = links.filter(l => l.status === 'error' || l.status === 'expired')
+    const count = failedLinks.length
     if (count === 0) return
-    if (!confirm(isEn
-      ? `Remove ${count} failed/expired links?`
-      : `移除 ${count} 个失败/过期的链接？`
-    )) return
+    const confirmMsg = deleteAlsoAccount
+      ? (isEn
+        ? `Remove ${count} failed/expired links AND delete their accounts permanently?`
+        : `移除 ${count} 个失败/过期的链接，并永久删除这些账号？`)
+      : (isEn
+        ? `Remove ${count} failed/expired links?`
+        : `移除 ${count} 个失败/过期的链接？`)
+    if (!confirm(confirmMsg)) return
+
+    const removedIds = failedLinks.map(l => l.accountId)
+
+    // 连带删除账号（封号账号清理）
+    if (deleteAlsoAccount && removedIds.length > 0) {
+      for (const id of removedIds) {
+        removeAccount(id)
+      }
+    }
+
     setLinks(prev => {
       const filtered = prev.filter(l => l.status !== 'error' && l.status !== 'expired')
-      // 移除的 ID 也从选择集里清掉
-      const removedIds = prev.filter(l => l.status === 'error' || l.status === 'expired').map(l => l.accountId)
       if (removedIds.length > 0) {
         setSelectedLinkIds(s => {
           const next = new Set(s)
@@ -1349,11 +1365,22 @@ export function SubscriptionPage() {
                 onClick={handleDeleteFailed}
                 disabled={isFetching || links.filter(l => l.status === 'error' || l.status === 'expired').length === 0}
                 title={isEn ? 'Remove failed and expired links' : '移除失败和过期的链接'}
+                className={deleteAlsoAccount ? 'text-destructive hover:text-destructive hover:bg-destructive/10' : ''}
               >
                 <Trash2 className="h-4 w-4 mr-1" />
                 {isEn ? 'Remove Failed' : '清失败'}
                 {' '}({links.filter(l => l.status === 'error' || l.status === 'expired').length})
               </Button>
+              {/* 勾选：清失败时同时删除账号 */}
+              <label className="inline-flex items-center gap-1 text-[11px] text-muted-foreground cursor-pointer select-none" title={isEn ? 'Also permanently delete the accounts (for banned accounts cleanup)' : '同时永久删除这些账号（用于清理封号账号）'}>
+                <input
+                  type="checkbox"
+                  checked={deleteAlsoAccount}
+                  onChange={(e) => setDeleteAlsoAccount(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-border"
+                />
+                {isEn ? 'Delete accounts' : '连删账号'}
+              </label>
 
               {/* 多选辅助操作（仅有结果时显示） */}
               {links.length > 0 && (

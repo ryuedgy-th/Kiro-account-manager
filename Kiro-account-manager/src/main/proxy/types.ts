@@ -396,6 +396,15 @@ export interface KiroUsage {
   cacheReadTokens?: number
   cacheWriteTokens?: number
   reasoningTokens?: number
+  /** Context usage breakdown（来自后端 ContextUsageEvent） */
+  contextUsage?: {
+    percentage: number
+    breakdown?: {
+      conversation?: number
+      mcpTools?: number
+      steeringFiles?: number
+    }
+  }
 }
 
 // ============ 账号和代理配置 ============
@@ -799,6 +808,12 @@ export interface ProxyConfig {
   fallbackPort?: number
   /** 启用审计日志（管理 API 操作、config 变更） */
   enableAuditLog?: boolean
+
+  // ============ Agent 模式 + Steering（v1.7.5 上游新增） ============
+  /** Agent 模式：vibe（对话优先）或 spec（计划优先）。未设 = 按端点身份自动决定（保留 IdC/Enterprise 403 修复） */
+  agentMode?: 'vibe' | 'spec'
+  /** 工作区路径：用于读取 .kiro/steering/*.md 规则文件注入到 system prompt */
+  workspacePath?: string
   /**
    * 可用账号数低于此阈值时触发 proxy-pool-low webhook 预警（提醒补充账号）。
    * 0 或未设 = 关闭预警。用于"账号会被风控、需持续补充"的运营场景：

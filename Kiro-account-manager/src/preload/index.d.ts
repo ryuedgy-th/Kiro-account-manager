@@ -777,6 +777,9 @@ interface KiroApi {
   // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
   onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
 
+  // 监听反代 profileArn 自愈事件：Enterprise 账号运行时首次解析出真实 profileArn 时回写持久化
+  onProxyAccountProfileArn: (callback: (info: { id: string; profileArn: string }) => void) => () => void
+
   // ============ Usage API 类型设置 ============
 
   // 获取 Usage API 类型

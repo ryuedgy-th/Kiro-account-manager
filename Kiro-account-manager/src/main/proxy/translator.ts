@@ -49,6 +49,10 @@ const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 interface ModelThinkingCapability {
   supportsThinking: boolean
   thinkingEfforts: string[] // 后端允许的 effort 枚举；为空表示该模型不接受 effort
+  // effort 字段在 additionalModelRequestFields 下的 schema 路径（由后端 schema 决定）：
+  //   - 'output_config'（默认）→ { thinking: {type:'adaptive'}, output_config: { effort } }（Claude 4.5/4.6+ 新模型）
+  //   - 'reasoning'           → { reasoning: { effort } }（备用 schema，部分模型用此路径，不接受 thinking 字段）
+  schemaPath?: 'output_config' | 'reasoning'
 }
 
 const modelCapabilityRegistry = new Map<string, ModelThinkingCapability>()
@@ -65,7 +69,8 @@ export function setModelThinkingCapability(
   if (!modelId) return
   modelCapabilityRegistry.set(capabilityKey(modelId), {
     supportsThinking: capability.supportsThinking,
-    thinkingEfforts: capability.thinkingEfforts ?? []
+    thinkingEfforts: capability.thinkingEfforts ?? [],
+    schemaPath: capability.schemaPath
   })
 }
 
@@ -141,6 +146,15 @@ function buildAdditionalModelRequestFields(
   // 注册表已知该模型：以真实能力为准
   if (capability) {
     if (!capability.supportsThinking) return undefined
+    // 'reasoning' schema 路径：effort 走 { reasoning: { effort } }，不下发 thinking 字段
+    //（该路径的模型 schema 没有 thinking 属性，下发会触发 400）。effort 必须落在后端枚举内。
+    if (capability.schemaPath === 'reasoning') {
+      if (normalizedEffort && capability.thinkingEfforts.includes(normalizedEffort)) {
+        return { reasoning: { effort: normalizedEffort } }
+      }
+      return undefined
+    }
+    // 默认 'output_config' 路径（含 schemaPath 未知的旧模型）
     const fields: Record<string, unknown> = {}
     if (thinking && thinking.type !== 'disabled') {
       fields.thinking = { type: 'adaptive' }

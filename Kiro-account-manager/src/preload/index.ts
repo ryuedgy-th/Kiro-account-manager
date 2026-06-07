@@ -920,6 +920,17 @@ const api = {
     }
   },
 
+  // 监听反代 profileArn 自愈事件：Enterprise 账号运行时首次解析出真实 profileArn 时回写持久化
+  onProxyAccountProfileArn: (callback: (info: { id: string; profileArn: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { id: string; profileArn: string }): void => {
+      callback(info)
+    }
+    ipcRenderer.on('proxy-account-profile-arn', handler)
+    return () => {
+      ipcRenderer.removeListener('proxy-account-profile-arn', handler)
+    }
+  },
+
   // ============ Usage API 类型设置 ============
 
   // 获取 Usage API 类型

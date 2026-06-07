@@ -39,6 +39,21 @@ export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = 'arn:aws:codewhisperer:us-east-1:
 // Social 登录（Github/Google）共用的 Kiro 后端固定 profileArn
 export const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
 
+// Kiro 后端只有两个区域桶：欧盟（eu-central-1）与其余（us-east-1）。
+// 统一的区域归一化：所有「按账号 region 决定端点/ARN」的地方都走这里，避免 'eu' vs 'eu-' 漂移。
+export function normalizeKiroRegion(region?: string): 'eu-central-1' | 'us-east-1' {
+  return region?.startsWith('eu') ? 'eu-central-1' : 'us-east-1'
+}
+
+// Enterprise/IdC 备用 profileArn（自动获取 ListAvailableProfiles 失败或返回 403 时兜底，区域动态替换）。
+// BuilderId 占位符 ARN 对 Enterprise 账号无效——IDE/流式端点会回 "Invalid token"，故需独立的兜底常量。
+const ENTERPRISE_FALLBACK_PROFILE_ID = 'VNECVYCYYAWN'
+const ENTERPRISE_FALLBACK_ACCOUNT_ID = '610548660232'
+export function getEnterpriseFallbackArn(region?: string): string {
+  const r = normalizeKiroRegion(region)
+  return `arn:aws:codewhisperer:${r}:${ENTERPRISE_FALLBACK_ACCOUNT_ID}:profile/${ENTERPRISE_FALLBACK_PROFILE_ID}`
+}
+
 const PLACEHOLDER_PROFILE_ARNS = new Set<string>([KIRO_BUILDER_ID_PLACEHOLDER_ARN])
 
 /** 检查给定 ARN 是不是已知占位符（旧版反代 / Kiro IDE 自身可能写入的脏数据） */
@@ -53,18 +68,24 @@ export function isPlaceholderProfileArn(arn: string | undefined | null): boolean
  * 规则（优先级）：
  *   1. 调用方显式给出 profileArn 且非已知占位符 → 直接用
  *   2. social/Github/Google → 用固定 Kiro Social profileArn
- *   3. BuilderId / 其它 → 使用 Kiro IDE 官方占位符 ARN（IDE 内部逻辑依赖此字段存在）
+ *   3. Enterprise/external_idp → 区域化 Enterprise 兜底 ARN（占位符对其无效，IDE 调接口会 Invalid token）
+ *   4. BuilderId / 其它 → 使用 Kiro IDE 官方占位符 ARN（IDE 内部逻辑依赖此字段存在）
  */
 export function resolveProfileArnForWrite(input: {
   profileArn?: string
   authMethod?: string
   provider?: string
+  region?: string
 }): string | undefined {
   if (input.profileArn && !isPlaceholderProfileArn(input.profileArn)) {
     return input.profileArn
   }
   if (input.authMethod === 'social' || input.provider === 'Github' || input.provider === 'Google') {
     return KIRO_SOCIAL_PROFILE_ARN
+  }
+  // Enterprise 不能用 BuilderId 占位符（IDE 调接口会 Invalid token）
+  if (input.provider === 'Enterprise' || input.authMethod === 'external_idp') {
+    return getEnterpriseFallbackArn(input.region)
   }
   return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }

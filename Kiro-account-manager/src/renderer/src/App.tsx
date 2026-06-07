@@ -28,7 +28,8 @@ function App(): React.JSX.Element {
     activeAccountId,
     setActiveAccount,
     checkAndRefreshExpiringTokens,
-    updateAccountStatus
+    updateAccountStatus,
+    updateAccount
   } = useAccountsStore()
 
   // 切换到下一个可用账户
@@ -257,6 +258,22 @@ function App(): React.JSX.Element {
       unsubscribe()
     }
   }, [updateAccountStatus])
+
+  // 监听反代 profileArn 自愈事件：Enterprise 账号首次解析出真实 profileArn 时持久化到 store，
+  // 避免每次请求都重新调 ListAvailableProfiles（也修复占位符 ARN 导致的 IDE 切换失败）
+  useEffect(() => {
+    const unsubscribe = window.api.onProxyAccountProfileArn?.((info) => {
+      if (!info?.id || !info?.profileArn) return
+      const current = useAccountsStore.getState().accounts.get(info.id)
+      if (current && current.profileArn !== info.profileArn) {
+        console.log(`[App] profileArn self-healed for ${current.email || info.id}: ${info.profileArn}`)
+        updateAccount(info.id, { profileArn: info.profileArn })
+      }
+    })
+    return () => {
+      unsubscribe?.()
+    }
+  }, [updateAccount])
 
   const renderPage = () => {
     switch (currentPage) {

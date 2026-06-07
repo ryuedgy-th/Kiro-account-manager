@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, setAgentMode, setProfileArnPersistCallback, callKiroApi } from './proxy/kiroApi'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -354,6 +354,8 @@ function initProxyServer(): ProxyServer {
   if (config.payloadSizeLimitKB) {
     setPayloadSizeLimitKB(config.payloadSizeLimitKB)
   }
+  // 恢复 Agent 模式（vibe/spec）；未设时由端点身份自动决定（保留 IdC/Enterprise 403 修复）
+  setAgentMode(config.agentMode)
   // 恢复 Token buffer reserve（开关 + 数值）
   setEnableTokenBufferReserve(config.enableTokenBufferReserve === true)
   if (config.tokenBufferReserve) {
@@ -519,6 +521,18 @@ function initProxyServer(): ProxyServer {
   proxyServer.setWebhookTrigger((event, payload) => {
     // 通过 IPC 转发到 renderer，由 useWebhookStore.triggerEvent 实际发送
     mainWindow?.webContents.send('proxy-webhook-trigger', { event, payload })
+  })
+
+  // profileArn 自愈持久化：Enterprise 账号在运行时首次解析出真实 profileArn 时，
+  // 回写到账号池（内存）并通知 renderer 持久化到 store（顶层 profileArn 字段，与 fork 既有口径一致）。
+  // 用独立 IPC 通道 'proxy-account-profile-arn'，不复用 'proxy-account-update'（后者只带 token 字段）。
+  setProfileArnPersistCallback((accountId, profileArn) => {
+    try {
+      proxyServer?.getAccountPool().updateAccount(accountId, { profileArn })
+    } catch (e) {
+      console.warn('[ProxyServer] profileArn persist to pool failed:', e)
+    }
+    mainWindow?.webContents.send('proxy-account-profile-arn', { id: accountId, profileArn })
   })
 
   // 恢复保存的累计 credits
@@ -1738,7 +1752,8 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
   const resolvedProfileArn = resolveProfileArnForWrite({
     profileArn: account.profileArn,
     authMethod: creds.authMethod,
-    provider: creds.provider
+    provider: creds.provider,
+    region: creds.region
   })
 
   // 1. 写磁盘（同步给 IDE）
@@ -2968,7 +2983,8 @@ app.whenReady().then(async () => {
           const resolvedProfileArn = resolveProfileArnForWrite({
             profileArn: account.profileArn,
             authMethod,
-            provider
+            provider,
+            region
           })
           await writeKiroAuthTokenFile({
             accessToken: newAccess,
@@ -3623,7 +3639,8 @@ app.whenReady().then(async () => {
                     const resolvedProfileArn = resolveProfileArnForWrite({
                       profileArn: diskToken?.profileArn,
                       authMethod,
-                      provider
+                      provider,
+                      region
                     })
                     await writeKiroAuthTokenFile({
                       accessToken: newAccessToken,
@@ -4730,7 +4747,8 @@ app.whenReady().then(async () => {
       const resolvedProfileArn = resolveProfileArnForWrite({
         profileArn,
         authMethod,
-        provider
+        provider,
+        region
       })
 
       // bug C 修复：用真实 expiresIn 算 expiresAt
@@ -4839,7 +4857,8 @@ app.whenReady().then(async () => {
       const resolvedProfileArn = resolveProfileArnForWrite({
         profileArn,
         authMethod: isSocial ? 'social' : 'IdC',
-        provider
+        provider,
+        region
       })
 
       // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
@@ -6117,6 +6136,10 @@ app.whenReady().then(async () => {
       // 同步 payload 大小限制
       if (config.payloadSizeLimitKB !== undefined) {
         setPayloadSizeLimitKB(config.payloadSizeLimitKB)
+      }
+      // 同步 Agent 模式（vibe/spec）；未设时由端点身份自动决定
+      if (config.agentMode !== undefined) {
+        setAgentMode(config.agentMode)
       }
       // 同步 Token buffer reserve（开关 + 数值）
       if (config.enableTokenBufferReserve !== undefined) {
