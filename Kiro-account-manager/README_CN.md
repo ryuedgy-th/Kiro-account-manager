@@ -143,6 +143,8 @@ npm run typecheck
 
 #### 🔌 反向代理：同步上游 v1.7.5 + 稳定性增强
 - **Cursor / 扁平工具结构兼容** — 部分客户端（如 Cursor Agent 模式）发送的 OpenAI 工具是扁平结构（`{type:'function', name, description, parameters}`），而非嵌套在 `function` 下。转换器现已同时兼容两种结构，请求不再因 `ERROR_PROVIDER_ERROR`（"Cannot read properties of undefined (reading 'description')"）而崩溃。
+- **额度耗尽返回 402 而非 429** — 客户额度耗尽时，代理现在返回 `402 Payment Required`（终态计费错误）而非 `429`。Claude Code / Cursor 等客户端会把 `429` 当成临时限流而无限重试，始终不暴露真正原因（"充值后仍卡在重试"）。真正的限流 / 并发路径仍用 `429`。
+- **充值可真正解封客户 Key** — 此前客户 Key 还受其 per-key `creditsLimit`（终身用量上限，充值不重置）约束，导致充值预付余额也无法恢复访问。现在客户 Key 仅由预付 `creditBalance` 控制；独立 Key 仍遵循 `creditsLimit`。
 - **思考模式 — 双 schema 路径** — 模型思考能力新增记录 `schemaPath`（`output_config` vs `reasoning`），使 reasoning-effort 类模型按各自声明的 schema 驱动。
 - **THINKING_SIGNATURE_INVALID 自动重试** — 遇到思考签名无效错误时，从助手消息中剥离 reasoning 内容并重试，而非整条请求失败。
 - **企业版/IdC profileArn 自愈** — 对于 profileArn 缺失/为占位符的外部 IdP 账号，代理通过 `ListAvailableProfiles` 获取真实 ARN、写回并通知 UI 持久化。新增 5 分钟冷却，使其在 token 刷新后可重新自愈，而非永久固定为 fallback。
