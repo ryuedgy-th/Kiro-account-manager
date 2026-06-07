@@ -37,6 +37,7 @@ jobs:
 
       - name: Extract changelog from README
         id: extract_changelog
+        working-directory: ${{ env.WORKING_DIR }}
         run: |
           # 提取英文更新日志（从 ### v 开始到下一个 ### 或文件结束）
           CHANGELOG_EN=$(awk '/^### v[0-9]+\.[0-9]+\.[0-9]+/{if(found) exit; found=1} found' README.md)
