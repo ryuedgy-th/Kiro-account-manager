@@ -17,6 +17,7 @@ import {
   type DeviceIdMapping
 } from './kproxy'
 import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, setAgentMode, setProfileArnPersistCallback, callKiroApi } from './proxy/kiroApi'
+import { withRefreshRetry } from './auth/tokenRefresh'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -196,6 +197,23 @@ async function fetchWithAppProxy(
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
   }
   return await fetch(url, options)
+}
+
+// fetchWithAppProxy + 单次超时：给 refresh 这类「建连阶段幂等请求」套 AbortController 超时，
+// 避免某条卡死的连接拖垮整批刷新。配合 withRefreshRetry 对瞬时网络错误重试（见 auth/tokenRefresh.ts）。
+async function fetchWithAppProxyTimeout(
+  url: string,
+  options: RequestInit,
+  overrideProxyUrl: string | undefined,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetchWithAppProxy(url, { ...options, signal: controller.signal }, overrideProxyUrl)
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // 兼容函数，指向 getNetworkAgent
@@ -686,14 +704,14 @@ async function refreshOidcToken(
   }
 
   try {
-    const response = await fetchWithAppProxy(url, {
+    const response = await withRefreshRetry((timeoutMs) => fetchWithAppProxyTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
-    }, proxyUrl)
-    
+    }, proxyUrl, timeoutMs))
+
     if (!response.ok) {
       const errorText = await response.text()
       console.error(`[OIDC] Refresh failed: ${response.status} - ${errorText}`)
@@ -726,15 +744,15 @@ async function refreshSocialToken(
   const machineId = getCurrentMachineId()
 
   try {
-    const response = await fetchWithAppProxy(url, {
+    const response = await withRefreshRetry((timeoutMs) => fetchWithAppProxyTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': getKiroUserAgent(machineId)
       },
       body: JSON.stringify({ refreshToken })
-    }, proxyUrl)
-    
+    }, proxyUrl, timeoutMs))
+
     if (!response.ok) {
       const errorText = await response.text()
       console.error(`[Social] Refresh failed: ${response.status} - ${errorText}`)
