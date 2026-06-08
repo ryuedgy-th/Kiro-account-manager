@@ -146,6 +146,7 @@ npm run typecheck
 - **Cursor 模型名归一** — Cursor 会给模型 ID 附加 effort 与 `thinking` 标记，且拼接顺序不一：版本在前（`claude-4.6-sonnet-max-thinking`），以及家族在前、`-thinking` 夹在中间（`claude-opus-4-8-thinking-max`，即其真实 Opus 串）。模型名归一现已改为【按 token 分词归类】—— 无论 family / version / effort / thinking 段以何种顺序或位置出现都能正确识别 —— 因此 Opus 不再因 `INVALID_MODEL_ID` 失败（此前夹在中间的 `-thinking` 会透传到后端），Sonnet/Opus 也不再静默降级到 Sonnet 4.5，且用户选择的 effort 档位会被保留。旧版 3.x 别名（`claude-3-opus`）保持不动。
 - **额度耗尽返回 402 而非 429** — 客户额度耗尽时，代理现在返回 `402 Payment Required`（终态计费错误）而非 `429`。Claude Code / Cursor 等客户端会把 `429` 当成临时限流而无限重试，始终不暴露真正原因（"充值后仍卡在重试"）。真正的限流 / 并发路径仍用 `429`。
 - **充值可真正解封客户 Key** — 此前客户 Key 还受其 per-key `creditsLimit`（终身用量上限，充值不重置）约束，导致充值预付余额也无法恢复访问。现在客户 Key 仅由预付 `creditBalance` 控制；独立 Key 仍遵循 `creditsLimit`。
+- **批量刷新 Token — 瞬时错误重试** — 此前「刷新全部」会随机有账号报 `fetch failed`，而单个账号逐一刷新却正常。原因是同时发起大量并行 TLS 握手时连接池尚冷，上游会重置部分 socket（`UND_ERR_SOCKET`/`ECONNRESET`），而刷新路径既无超时也无重试，一次建连阶段的瞬时抖动就会让该账号永久失败。现在刷新改为单次 15 秒超时 + 对瞬时网络错误最多重试 3 次（指数退避 + 抖动）。真正的鉴权失败（`401`/`403`/`invalid_grant`）不重试。由于批量 / 单个 / 反代 / 主动续期共用同一套刷新函数，此修复覆盖所有刷新路径。
 - **思考模式 — 双 schema 路径** — 模型思考能力新增记录 `schemaPath`（`output_config` vs `reasoning`），使 reasoning-effort 类模型按各自声明的 schema 驱动。
 - **THINKING_SIGNATURE_INVALID 自动重试** — 遇到思考签名无效错误时，从助手消息中剥离 reasoning 内容并重试，而非整条请求失败。
 - **企业版/IdC profileArn 自愈** — 对于 profileArn 缺失/为占位符的外部 IdP 账号，代理通过 `ListAvailableProfiles` 获取真实 ARN、写回并通知 UI 持久化。新增 5 分钟冷却，使其在 token 刷新后可重新自愈，而非永久固定为 fallback。
