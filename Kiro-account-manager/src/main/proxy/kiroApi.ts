@@ -460,6 +460,55 @@ function normalizeClaudeVersion(modelId: string): string {
   )
 }
 
+// effort 档位词（Cursor 等客户端会把它附在模型名里，如 ...-max-thinking）。与 proxyServer 的
+// EFFORT_VARIANT_SUFFIXES 同集合；此处仅用于剥离/归一，effort 的真正下发仍由各 handler 处理。
+const CLAUDE_EFFORT_WORDS = ['low', 'medium', 'high', 'xhigh', 'max']
+const CLAUDE_EFFORT_TAIL_RE = new RegExp(`-(${CLAUDE_EFFORT_WORDS.join('|')})$`, 'i')
+
+/**
+ * 把 Cursor 风格的「逆序」Claude 模型名归一成规范顺序 claude-{family}-{version}，并剥离
+ * `-thinking` / `-reasoning` 标记；**保留** effort 档位后缀（如 -max），便于后续 effort 流水线提取。
+ *
+ * 背景：Cursor 用内置模型清单，名字是【版本在前、家族在后】，可附带 effort 与 thinking 标记，例如
+ * `claude-4.6-sonnet-max-thinking`、`claude-4.8-opus-xhigh-thinking`。我们所有解析正则都假定规范顺序
+ * `claude-{family}-{version}`，逆序名一律解析失败 → mapModelId 兜底 default（静默降级 Sonnet 4.5），
+ * 或把 `-max-thinking` 透传后端触发 400 INVALID_MODEL_ID。在 handler 入口先归一，下游逻辑即可不变。
+ *
+ * 安全约束：
+ *   - 仅当版本 major ≥ 4 才交换。Claude 3.x（claude-3-opus / claude-3-5-sonnet）是既有别名，本就版本在前，
+ *     由 MODEL_ID_MAP 处理，绝不能动。
+ *   - family 必须是 opus/sonnet/haiku；其余原样返回，避免误伤第三方/路由别名。
+ *   - 结果是规范顺序但可能仍带 effort 后缀（claude-sonnet-4.6-max）——交给 splitEffortSuffix / mapModelId。
+ */
+export function toCanonicalClaudeOrder(modelId: string): string {
+  let id = (modelId || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
+  // 剥离 thinking / reasoning 标记（可能重复，如 ...-thinking-reasoning）
+  id = id.replace(/-(?:thinking|reasoning)$/i, '').replace(/-(?:thinking|reasoning)$/i, '')
+  // 逆序匹配：claude-{ver}-{family}[-{effort}]，ver 允许 4 / 4.6 / 4-6 三种写法
+  const m = id.match(
+    new RegExp(`^claude-(\\d+)(?:[.-](\\d{1,2}))?-(opus|sonnet|haiku)(-(?:${CLAUDE_EFFORT_WORDS.join('|')}))?$`, 'i')
+  )
+  if (m && parseInt(m[1], 10) >= 4) {
+    const ver = m[2] !== undefined ? `${m[1]}.${m[2]}` : m[1]
+    const effort = m[4] ? m[4].toLowerCase() : ''
+    return `claude-${m[3].toLowerCase()}-${ver}${effort}`
+  }
+  return id
+}
+
+/**
+ * 在 toCanonicalClaudeOrder 基础上再剥离尾部 effort 档位词，得到可用于后端调用 / 白名单比对的
+ * 规范【基名】（claude-sonnet-4.6）。供 mapModelId / canonicalizeModelId 作为安全网：即便 handler 入口
+ * 漏归一，或 effort 变体未启用导致 effort 后缀残留，也不会把 `-max` 透传后端触发 400。
+ */
+function normalizeReversedClaudeName(modelId: string): string {
+  const canonical = toCanonicalClaudeOrder(modelId)
+  if (/^claude-(opus|sonnet|haiku)-/i.test(canonical)) {
+    return canonical.replace(CLAUDE_EFFORT_TAIL_RE, '')
+  }
+  return canonical
+}
+
 /**
  * 规范化模型 ID，用于白名单/费率表比对：剥离客户端能力后缀（如 [1m]）+ 版本短横转点号 +
  * 剥离日期快照后缀（-YYYYMMDD）+ 转小写。
@@ -473,7 +522,9 @@ function normalizeClaudeVersion(modelId: string): string {
  */
 export function canonicalizeModelId(model: string): string {
   const stripped = (model || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
-  let id = normalizeClaudeVersion(stripped).toLowerCase()
+  // 先归一 Cursor 逆序名（claude-4.6-sonnet-max-thinking → claude-sonnet-4.6），再走既有归一。
+  const reordered = normalizeReversedClaudeName(stripped)
+  let id = normalizeClaudeVersion(reordered).toLowerCase()
   // 剥离 Claude 日期快照后缀（-YYYYMMDD），仅对 Claude 家族，避免误伤其他模型命名
   if (/^claude-(sonnet|haiku|opus)-/.test(id)) {
     id = id.replace(/-\d{8}$/, '')
@@ -486,7 +537,11 @@ export function mapModelId(model: string): string {
   let modelId = model.trim().replace(/\[[^\]]*\]\s*$/, '').trim()
   if (!modelId) return MODEL_ID_MAP.default
   if (isCodeWhispererModelId(modelId)) return modelId
-  // 0) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
+  // 0a) 归一 Cursor 逆序名 + 剥离 effort/thinking 标记（claude-4.8-opus-xhigh-thinking → claude-opus-4.8）。
+  //     安全网：即便 handler 入口漏归一，也不会把逆序名兜底成 default（静默降级 Sonnet 4.5）
+  //     或把 -max-thinking 透传后端触发 400。仅对 major≥4 的 opus/sonnet/haiku 生效。
+  modelId = normalizeReversedClaudeName(modelId)
+  // 0b) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
   modelId = normalizeClaudeVersion(modelId)
   const lower = modelId.toLowerCase()
   // 1) 显式 alias 映射优先

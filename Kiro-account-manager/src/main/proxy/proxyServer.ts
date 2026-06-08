@@ -21,7 +21,7 @@ import type {
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, canonicalizeModelId, isTransientNetworkError, type KiroModel, type WebToolSearchRecord } from './kiroApi'
+import { callKiroApiStream, callKiroApi, runWebToolLoop, fetchKiroModels, setModelContextWindow, canonicalizeModelId, toCanonicalClaudeOrder, isTransientNetworkError, type KiroModel, type WebToolSearchRecord } from './kiroApi'
 import { proxyLogger, formatError } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -2439,10 +2439,19 @@ export class ProxyServer {
    * 仅当 effortVariantsExposed=true 且 ID 形如「{Claude base}-{effort}」时拆分，否则原样返回。
    * 调用点：每个请求 path 在 applyModelMapping / isModelAllowed 之前调用，把 model 还原成 base，
    * 并把 effort 注入请求体（见各 handler）。这样 base 走原有白名单 / 映射逻辑，零额外改动。
+   *
+   * Cursor 兼容：Cursor 用逆序名 claude-{ver}-{family}[-{effort}]-thinking（如 claude-4.6-sonnet-max-thinking）。
+   * 先用 toCanonicalClaudeOrder 归一成规范顺序并剥离 -thinking（保留 effort 后缀），再走拆分逻辑。
+   * 关键：逆序名里的 effort 是用户在 Cursor 显式选的（"max thinking"），故即便 effortVariantsExposed=false
+   * 也对【逆序名】拆出 effort（否则静默降级到默认 effort）；而【本就规范的名字】仍遵守 exposed 开关，保持原行为。
    */
   private resolveEffortVariant(modelId: string): { baseId: string; effort?: string } {
-    if (this.config.effortVariantsExposed !== true) return { baseId: modelId }
-    return splitEffortSuffix(modelId)
+    const canonical = toCanonicalClaudeOrder(modelId)
+    const stripped = (modelId || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
+    const wasReversed = canonical !== stripped
+    // 规范名 + 未开启变体 → 保持原行为（不拆 effort）。逆序名始终拆（Cursor 显式选择）。
+    if (this.config.effortVariantsExposed !== true && !wasReversed) return { baseId: canonical }
+    return splitEffortSuffix(canonical)
   }
 
   /**
