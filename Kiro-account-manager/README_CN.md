@@ -143,7 +143,7 @@ npm run typecheck
 
 #### 🔌 反向代理：同步上游 v1.7.5 + 稳定性增强
 - **Cursor / 扁平工具结构兼容** — 部分客户端（如 Cursor Agent 模式）发送的 OpenAI 工具是扁平结构（`{type:'function', name, description, parameters}`），而非嵌套在 `function` 下。转换器现已同时兼容两种结构，请求不再因 `ERROR_PROVIDER_ERROR`（"Cannot read properties of undefined (reading 'description')"）而崩溃。
-- **Cursor 逆序模型名** — Cursor 发送的模型 ID 是【版本在前】（`claude-4.6-sonnet-max-thinking`），而非规范的【家族在前】（`claude-sonnet-4.6`）。代理现在会重排顺序、剥离 `-thinking`/`-reasoning` 标记并保留 effort 档位 —— Opus 不再因 `INVALID_MODEL_ID` 失败，Sonnet/Opus 也不再静默降级到 Sonnet 4.5。旧版 3.x 别名（`claude-3-opus`）保持不动。
+- **Cursor 模型名归一** — Cursor 会给模型 ID 附加 effort 与 `thinking` 标记，且拼接顺序不一：版本在前（`claude-4.6-sonnet-max-thinking`），以及家族在前、`-thinking` 夹在中间（`claude-opus-4-8-thinking-max`，即其真实 Opus 串）。模型名归一现已改为【按 token 分词归类】—— 无论 family / version / effort / thinking 段以何种顺序或位置出现都能正确识别 —— 因此 Opus 不再因 `INVALID_MODEL_ID` 失败（此前夹在中间的 `-thinking` 会透传到后端），Sonnet/Opus 也不再静默降级到 Sonnet 4.5，且用户选择的 effort 档位会被保留。旧版 3.x 别名（`claude-3-opus`）保持不动。
 - **额度耗尽返回 402 而非 429** — 客户额度耗尽时，代理现在返回 `402 Payment Required`（终态计费错误）而非 `429`。Claude Code / Cursor 等客户端会把 `429` 当成临时限流而无限重试，始终不暴露真正原因（"充值后仍卡在重试"）。真正的限流 / 并发路径仍用 `429`。
 - **充值可真正解封客户 Key** — 此前客户 Key 还受其 per-key `creditsLimit`（终身用量上限，充值不重置）约束，导致充值预付余额也无法恢复访问。现在客户 Key 仅由预付 `creditBalance` 控制；独立 Key 仍遵循 `creditsLimit`。
 - **思考模式 — 双 schema 路径** — 模型思考能力新增记录 `schemaPath`（`output_config` vs `reasoning`），使 reasoning-effort 类模型按各自声明的 schema 驱动。

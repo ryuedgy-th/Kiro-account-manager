@@ -107,9 +107,25 @@ check('claude-4.5-haiku → claude-haiku-4.5', mapModelId('claude-4.5-haiku') ==
 check('claude-4.6-sonnet-thinking (no effort) → claude-sonnet-4.6', mapModelId('claude-4.6-sonnet-thinking') === 'claude-sonnet-4.6')
 check('dash-version reversed claude-4-8-opus → claude-opus-4.8', mapModelId('claude-4-8-opus') === 'claude-opus-4.8')
 
+// Cursor's ACTUAL strings (confirmed from a live request): family-first, dash version,
+// with -thinking sitting BEFORE the effort word — claude-opus-4-8-thinking-max. The earlier
+// anchored-suffix stripper only removed -thinking at the very end, so mid-string -thinking
+// survived → leaked claude-opus-4.8-thinking to the backend → 400 INVALID_MODEL_ID (the
+// "Opus just fails" symptom). toCanonicalClaudeOrder is now token-based: family/version/
+// effort/thinking are classified regardless of order/position.
+console.log('mapModelId — Cursor real strings (family-first, mid-string -thinking):')
+check('claude-opus-4-8-thinking-max → claude-opus-4.8', mapModelId('claude-opus-4-8-thinking-max') === 'claude-opus-4.8')
+check('claude-sonnet-4-6-thinking-max → claude-sonnet-4.6', mapModelId('claude-sonnet-4-6-thinking-max') === 'claude-sonnet-4.6')
+check('claude-opus-4-8-thinking (no effort) → claude-opus-4.8', mapModelId('claude-opus-4-8-thinking') === 'claude-opus-4.8')
+check('dot-version family-first claude-opus-4.8-thinking-max → claude-opus-4.8', mapModelId('claude-opus-4.8-thinking-max') === 'claude-opus-4.8')
+check('canonical with [1m] still maps (regression)', mapModelId('claude-opus-4-8[1m]') === 'claude-opus-4.8')
+check('family-first w/ date+thinking claude-haiku-4-5-20251001-thinking → claude-haiku-4.5',
+  mapModelId('claude-haiku-4-5-20251001-thinking') === 'claude-haiku-4.5')
+
 console.log('mapModelId — reversed naming must NOT touch legacy 3.x aliases:')
 check('claude-3-opus stays mapped (NOT reordered)', mapModelId('claude-3-opus') === 'claude-sonnet-4.5')
 check('claude-3-5-sonnet stays mapped', mapModelId('claude-3-5-sonnet') === 'claude-sonnet-4.5')
+check('claude-3-7-sonnet stays mapped (3.x, major<4 untouched)', mapModelId('claude-3-7-sonnet') === 'claude-sonnet-4.5')
 
 console.log('canonicalizeModelId — reversed names match canonical allowlist entries:')
 check('reversed sonnet matches canonical', canonEq('claude-4.6-sonnet-max-thinking', 'claude-sonnet-4.6'))

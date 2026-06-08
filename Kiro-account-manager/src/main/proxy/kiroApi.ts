@@ -465,35 +465,57 @@ function normalizeClaudeVersion(modelId: string): string {
 const CLAUDE_EFFORT_WORDS = ['low', 'medium', 'high', 'xhigh', 'max']
 const CLAUDE_EFFORT_TAIL_RE = new RegExp(`-(${CLAUDE_EFFORT_WORDS.join('|')})$`, 'i')
 
+const CLAUDE_FAMILY_WORDS = ['opus', 'sonnet', 'haiku']
+
 /**
- * 把 Cursor 风格的「逆序」Claude 模型名归一成规范顺序 claude-{family}-{version}，并剥离
+ * 把各类客户端（尤其 Cursor）发来的 Claude 模型名归一成规范顺序 claude-{family}-{version}，并剥离
  * `-thinking` / `-reasoning` 标记；**保留** effort 档位后缀（如 -max），便于后续 effort 流水线提取。
  *
- * 背景：Cursor 用内置模型清单，名字是【版本在前、家族在后】，可附带 effort 与 thinking 标记，例如
- * `claude-4.6-sonnet-max-thinking`、`claude-4.8-opus-xhigh-thinking`。我们所有解析正则都假定规范顺序
- * `claude-{family}-{version}`，逆序名一律解析失败 → mapModelId 兜底 default（静默降级 Sonnet 4.5），
- * 或把 `-max-thinking` 透传后端触发 400 INVALID_MODEL_ID。在 handler 入口先归一，下游逻辑即可不变。
+ * 背景：不同客户端把 family / version / effort / thinking 这几段拼成的顺序与写法各不相同：
+ *   - Claude Code：规范顺序 `claude-opus-4-8`（family 在前、短横版本，可带 [1m] / -YYYYMMDD 后缀）
+ *   - Cursor（版本在前）：`claude-4.6-sonnet-max-thinking`、`claude-4.8-opus-xhigh-thinking`
+ *   - Cursor（family 在前、thinking 夹在中间）：`claude-opus-4-8-thinking-max`（真实 Opus 串！）
+ * 我们所有解析正则都假定规范顺序 `claude-{family}-{version}` 且无 thinking/effort 杂质。任何偏离都会
+ * 解析失败 → mapModelId 兜底 default（静默降级 Sonnet 4.5），或把 `-thinking-max` 透传后端触发
+ * 400 INVALID_MODEL_ID。早期实现只用「锚定尾部」的正则剥 -thinking，无法处理 thinking 夹在中间的
+ * 真实 Opus 串。改为【按 `-` 分词、按 token 语义归类】，与 family/version/effort/thinking 的出现
+ * 顺序无关，从根上解决。
  *
  * 安全约束：
- *   - 仅当版本 major ≥ 4 才交换。Claude 3.x（claude-3-opus / claude-3-5-sonnet）是既有别名，本就版本在前，
- *     由 MODEL_ID_MAP 处理，绝不能动。
- *   - family 必须是 opus/sonnet/haiku；其余原样返回，避免误伤第三方/路由别名。
+ *   - 仅当版本 major ≥ 4 才重排/归一。Claude 3.x（claude-3-opus / claude-3-5-sonnet / claude-3-7-sonnet）
+ *     是既有别名，由 MODEL_ID_MAP 处理，绝不能动。
+ *   - 必须含 family(opus/sonnet/haiku) + 数字 major；缺任一、或出现无法归类的 token → 原样返回，
+ *     避免误伤第三方 / 路由别名（auto / deepseek / glm 等）。
+ *   - 8 位纯数字 token 视为日期快照（-YYYYMMDD）丢弃（与下游 mapModelId / canonicalizeModelId 口径一致）。
  *   - 结果是规范顺序但可能仍带 effort 后缀（claude-sonnet-4.6-max）——交给 splitEffortSuffix / mapModelId。
  */
 export function toCanonicalClaudeOrder(modelId: string): string {
-  let id = (modelId || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
-  // 剥离 thinking / reasoning 标记（可能重复，如 ...-thinking-reasoning）
-  id = id.replace(/-(?:thinking|reasoning)$/i, '').replace(/-(?:thinking|reasoning)$/i, '')
-  // 逆序匹配：claude-{ver}-{family}[-{effort}]，ver 允许 4 / 4.6 / 4-6 三种写法
-  const m = id.match(
-    new RegExp(`^claude-(\\d+)(?:[.-](\\d{1,2}))?-(opus|sonnet|haiku)(-(?:${CLAUDE_EFFORT_WORDS.join('|')}))?$`, 'i')
-  )
-  if (m && parseInt(m[1], 10) >= 4) {
-    const ver = m[2] !== undefined ? `${m[1]}.${m[2]}` : m[1]
-    const effort = m[4] ? m[4].toLowerCase() : ''
-    return `claude-${m[3].toLowerCase()}-${ver}${effort}`
+  const id = (modelId || '').trim().replace(/\[[^\]]*\]\s*$/, '').trim()
+  if (!/^claude-/i.test(id)) return id
+  const tokens = id.slice('claude-'.length).split('-').filter(Boolean)
+
+  let family = ''
+  let effort = ''
+  const verNums: number[] = []
+  for (const tok of tokens) {
+    const low = tok.toLowerCase()
+    if (CLAUDE_FAMILY_WORDS.includes(low)) { family = low; continue }
+    if (low === 'thinking' || low === 'reasoning') continue          // 推理标记：丢弃
+    if (CLAUDE_EFFORT_WORDS.includes(low)) { effort = low; continue } // effort 档位：保留到最后
+    if (/^\d{8}$/.test(tok)) continue                                // 日期快照（-YYYYMMDD）：丢弃
+    if (/^\d{1,2}\.\d{1,2}$/.test(tok)) {                            // 点号版本（4.6）
+      const [maj, min] = tok.split('.')
+      verNums.push(parseInt(maj, 10), parseInt(min, 10))
+      continue
+    }
+    if (/^\d{1,2}$/.test(tok)) { verNums.push(parseInt(tok, 10)); continue } // 短横版本段（4 / 8）
+    return id // 无法归类的 token（未知后缀/第三方别名）→ 原样返回，绝不臆测
   }
-  return id
+
+  // 必须 family + major，且 major ≥ 4 才归一；否则保持原样（含 legacy 3.x）。
+  if (!family || verNums.length === 0 || verNums[0] < 4) return id
+  const ver = verNums.length >= 2 ? `${verNums[0]}.${verNums[1]}` : `${verNums[0]}`
+  return `claude-${family}-${ver}${effort ? `-${effort}` : ''}`
 }
 
 /**
