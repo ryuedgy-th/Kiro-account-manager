@@ -35,6 +35,7 @@ export interface OpenAIContentPart {
   file?: { filename?: string; file_data?: string }
   source?: ClaudeDocumentSource
   name?: string
+  title?: string
   cache_control?: ClaudeCacheControl
 }
 
@@ -199,6 +200,8 @@ export interface ClaudeContentBlock {
   source?: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | ClaudeDocumentSource
   id?: string
   name?: string
+  // Anthropic 原生 document block 的标题字段（可选）；用作 Kiro document.name 的来源之一
+  title?: string
   input?: unknown
   tool_use_id?: string
   content?: string | ClaudeContentBlock[] | ClaudeWebSearchResultBlock[] | ClaudeWebSearchToolResultError

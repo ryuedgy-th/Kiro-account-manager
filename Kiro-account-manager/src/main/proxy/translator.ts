@@ -637,16 +637,16 @@ function extractOpenAIContent(msg: OpenAIMessage): { content: string; images: Ki
         }
       } else if (part.type === 'file' || part.type === 'document') {
         if (part.file?.file_data) {
+          // filename/name 都可能缺；缺名时按 data URL 的 media_type 合成占位名而非抛错。
+          const fileDataMedia = part.file.file_data.match(/^data:([^;]+);/)?.[1]
           const name = part.file.filename || part.name
-          if (!name) {
-            throw new Error(`${part.type} requires filename or name`)
-          }
+            || fallbackDocumentName(fileDataMedia, documents.length + 1)
           documents.push(parseOpenAIFileData(part.file.file_data, name))
         } else if (part.source) {
-          if (!part.name) {
-            throw new Error(`${part.type} requires name`)
-          }
-          documents.push(parseClaudeDocumentSource(part.source, part.name))
+          const name = part.name
+            || part.title
+            || fallbackDocumentName((part.source as { media_type?: string }).media_type, documents.length + 1)
+          documents.push(parseClaudeDocumentSource(part.source, name))
         } else {
           throw new Error(`${part.type} requires file_data or source`)
         }
@@ -737,6 +737,15 @@ function normalizeDocumentFormat(mediaType: string | undefined, name: string): s
   if (extension === 'csv') return 'csv'
   if (extension === 'html' || extension === 'htm') return 'html'
   return 'txt'
+}
+
+// Kiro 后端要求 document.name 必填，但 Anthropic 原生 document block 的标题字段是 title（且可选），
+// OpenAI file part 用 filename（也可选）。客户端（如 Claude Code 附带 PDF）常常不带任何名字 →
+// 旧实现直接抛 "document requires name" → 整条请求 500。这里改为：缺名时按 media_type 推断扩展名、
+// 合成一个稳定的占位名（document-<seq>.<ext>），让文档照常透传给后端，而不是让请求失败。
+function fallbackDocumentName(mediaType: string | undefined, seq: number): string {
+  const ext = normalizeDocumentFormat(mediaType, '')
+  return `document-${seq}.${ext}`
 }
 
 
@@ -1151,10 +1160,12 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
           source: { bytes: block.source.data }
         })
       } else if (block.type === 'document' && block.source) {
-        if (!block.name) {
-          throw new Error('document requires name')
-        }
-        documents.push(parseClaudeDocumentSource(block.source, block.name))
+        // Anthropic 原生 document 的标题字段是 title（可选），name 是我们内部/OpenAI 习惯；都可能缺。
+        // 缺名时合成占位名而非抛错（旧行为会让整条请求 500 "document requires name"）。
+        const docName = block.name
+          || block.title
+          || fallbackDocumentName((block.source as { media_type?: string }).media_type, documents.length + 1)
+        documents.push(parseClaudeDocumentSource(block.source, docName))
       } else if (block.type === 'tool_result' && block.tool_use_id) {
         let resultContent = ''
         // Kiro tool_result.content 只支持 text，但用户层 images 可以承载图片。

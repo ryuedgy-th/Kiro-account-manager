@@ -147,6 +147,7 @@ npm run typecheck
 - **额度耗尽返回 402 而非 429** — 客户额度耗尽时，代理现在返回 `402 Payment Required`（终态计费错误）而非 `429`。Claude Code / Cursor 等客户端会把 `429` 当成临时限流而无限重试，始终不暴露真正原因（"充值后仍卡在重试"）。真正的限流 / 并发路径仍用 `429`。
 - **充值可真正解封客户 Key** — 此前客户 Key 还受其 per-key `creditsLimit`（终身用量上限，充值不重置）约束，导致充值预付余额也无法恢复访问。现在客户 Key 仅由预付 `creditBalance` 控制；独立 Key 仍遵循 `creditsLimit`。
 - **批量刷新 Token — 瞬时错误重试** — 此前「刷新全部」会随机有账号报 `fetch failed`，而单个账号逐一刷新却正常。原因是同时发起大量并行 TLS 握手时连接池尚冷，上游会重置部分 socket（`UND_ERR_SOCKET`/`ECONNRESET`），而刷新路径既无超时也无重试，一次建连阶段的瞬时抖动就会让该账号永久失败。现在刷新改为单次 15 秒超时 + 对瞬时网络错误最多重试 3 次（指数退避 + 抖动）。真正的鉴权失败（`401`/`403`/`invalid_grant`）不重试。由于批量 / 单个 / 反代 / 主动续期共用同一套刷新函数，此修复覆盖所有刷新路径。
+- **附件文档缺名不再 500** — 发送没有 `name`/`title`/`filename` 的 PDF/文档时（Anthropic 的 `title`、OpenAI 的 `filename` 都是可选，Claude Code 等客户端常常都不带），此前会让整条请求 `500 "document requires name"` 失败。现在代理会根据文档的 media type 合成占位名（如 `document-1.pdf`）让附件正常透传；显式的 name/title/filename 仍优先生效。
 - **思考模式 — 双 schema 路径** — 模型思考能力新增记录 `schemaPath`（`output_config` vs `reasoning`），使 reasoning-effort 类模型按各自声明的 schema 驱动。
 - **THINKING_SIGNATURE_INVALID 自动重试** — 遇到思考签名无效错误时，从助手消息中剥离 reasoning 内容并重试，而非整条请求失败。
 - **企业版/IdC profileArn 自愈** — 对于 profileArn 缺失/为占位符的外部 IdP 账号，代理通过 `ListAvailableProfiles` 获取真实 ARN、写回并通知 UI 持久化。新增 5 分钟冷却，使其在 token 刷新后可重新自愈，而非永久固定为 fallback。
