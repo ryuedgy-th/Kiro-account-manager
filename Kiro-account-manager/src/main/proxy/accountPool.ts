@@ -119,6 +119,24 @@ export class AccountPool {
     }
   }
 
+  // Token 刷新成功：写回新凭证并清除「刷新失败 latch」（errorCount + isAvailable=false）。
+  // 背景：markNeedsRefresh 在每次刷新失败时 bump errorCount 并置 isAvailable=false，把账号交给断路器退避。
+  // 但刷新成功若只 updateAccount（仅写 token），latch 不会被清——账号虽已拿到新 token，却仍 isAvailable=false
+  // 且背负退避 errorCount，要等到某次请求 recordSuccess 才翻身。在「批量主动刷新（无紧随请求）」场景下，
+  // 健康账号会被无谓地踢出轮询整个退避窗口。这里在刷新成功时即清 latch，让账号立刻回归。
+  // 关键：isAvailable 不可无条件置 true——若账号正被风控/quota 封禁（suspendedAt 在且未过期），必须保持
+  // 不可用，否则会把封禁账号误放回轮询。故按 isSuspended(merged) 决定可用性。
+  recordRefreshSuccess(accountId: string, updates: Partial<ProxyAccount>): void {
+    const account = this.accounts.get(accountId)
+    if (!account) return
+    const merged = { ...account, ...updates }
+    this.accounts.set(accountId, {
+      ...merged,
+      errorCount: 0,
+      isAvailable: !this.isSuspended(merged)
+    })
+  }
+
   // 获取下一个可用账号（粘滞 + 断路器 + 指数退避 + 概率重试）
   getNextAccount(excludeIds?: Set<string>): ProxyAccount | null {
     const accountList = Array.from(this.accounts.values())
@@ -146,6 +164,14 @@ export class AccountPool {
 
       // 检查账号是否可用（含断路器状态）
       if (this.isAccountAvailable(account, now)) {
+        // round-robin 模式下「选中即推进」指针：currentIndex 原本只在 recordSuccess（请求/整条 stream
+        // 完成后）才前移，导致并发 burst 内每次 getNextAccount 都读到同一 startIndex → 整波请求全压在
+        // 同一账号上，它最先撞 429、过早触发冷却、quota 烧不均，而其它账号闲置——正是高并发下负载均衡
+        // 最该生效却失效的场景（Claude Code/Cursor 并行 subagent + 工具调用即此类 burst）。
+        // 在选中时即把指针指向下一个，让 burst 真正扇出。sticky 模式保持原状（粘滞靠 recordSuccess 固定）。
+        if (this.strategy === 'round-robin' && accountList.length > 0) {
+          this.currentIndex = (idx + 1) % accountList.length
+        }
         return this.reviveExpiredSuspension(account)
       }
     }
@@ -228,13 +254,18 @@ export class AccountPool {
       return false
     }
 
-    if (account.isAvailable === false && !expiredTempSuspend) {
+    // isAvailable=false 在此处只可能来自刷新失败 latch（isSuspended 已在上方返回 false 排除封禁来源）。
+    //   - markNeedsRefresh 已同时补 errorCount/lastUsed，故交由下方断路器做指数退避 half-open 探测：
+    //     冷却期过后允许重新选中，成功则 recordSuccess 清除 latch。修复「一次刷新失败 → 账号被永久踢出
+    //     轮询、pool 持续缩水到重启」——其它健康账号在时，旧实现下该账号永远等不到一次成功来翻身。
+    //   - 无 errorCount 依据时（理论上不出现，兜底极旧状态/外部直接置 false）：保守跳过，避免无退避空转。
+    const needsRefreshLatch = account.isAvailable === false && !expiredTempSuspend
+    // 断路器：指数退避 + 概率重试。临时封禁过期的账号视为全新回归（errorCount 归零），给一次干净探测。
+    const failures = expiredTempSuspend ? 0 : (account.errorCount || 0)
+    if (needsRefreshLatch && failures === 0) {
       return false
     }
 
-    // 断路器检查：指数退避 + 概率重试
-    // 临时封禁过期的账号视为全新回归（errorCount 归零），给一次干净的探测机会
-    const failures = expiredTempSuspend ? 0 : (account.errorCount || 0)
     if (failures > 0 && account.lastUsed) {
       const timeSinceFailure = now - account.lastUsed
       // 指数退避：base * 2^(failures-1)，封顶为 maxBackoffMultiplier
@@ -376,10 +407,10 @@ export class AccountPool {
         if (this.strategy === 'sticky') {
           // 粘滞: 成功后将全局索引固定在这个账号 (保留 prompt cache 命中)
           this.currentIndex = successIndex
-        } else {
-          // round-robin: 成功后指向下一个账号 (满足负载均衡)
-          this.currentIndex = (successIndex + 1) % accountList.length
         }
+        // round-robin: 指针已在 getNextAccount「选中即推进」(见 ~155)，是唯一的推进点。
+        // 这里不再二次推进——否则并发 burst 下，先完成的请求会把已扇出的指针拽回它的下一位，
+        // 导致后续 select 重复挑到同一账号、扇出失效（即本次修复要解决的不均衡）。
       }
     }
 
@@ -482,9 +513,14 @@ export class AccountPool {
   markNeedsRefresh(accountId: string): void {
     const account = this.accounts.get(accountId)
     if (account) {
+      // 补 errorCount + lastUsed 时间戳：让 isAccountAvailable 的指数退避 half-open 路径接管恢复，
+      // 冷却期过后账号可被重新探测；探测成功则 recordSuccess 清 latch。否则 isAvailable=false 没有
+      // 任何时间维度恢复，账号会被永久踢出轮询直到重启/手动 reset（pool 静默缩水）。
       this.accounts.set(accountId, {
         ...account,
-        isAvailable: false
+        isAvailable: false,
+        errorCount: (account.errorCount || 0) + 1,
+        lastUsed: Date.now()
       })
     }
   }

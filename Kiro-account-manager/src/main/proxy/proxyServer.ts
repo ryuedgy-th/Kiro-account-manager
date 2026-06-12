@@ -1589,8 +1589,9 @@ export class ProxyServer {
 
       const result = await this.abortable(this.events.onTokenRefresh!(account), signal)
       if (result.success && result.accessToken) {
-        // 更新账号池中的 Token
-        this.accountPool.updateAccount(account.id, {
+        // 更新账号池中的 Token，并清除刷新失败 latch（errorCount + isAvailable）——
+        // 否则刷新成功后账号仍可能背负退避计数 / isAvailable=false，被无谓踢出轮询（见 recordRefreshSuccess）。
+        this.accountPool.recordRefreshSuccess(account.id, {
           accessToken: result.accessToken,
           refreshToken: result.refreshToken || account.refreshToken,
           expiresAt: result.expiresAt
@@ -5620,36 +5621,48 @@ export class ProxyServer {
    *
    * X-Accel-Buffering:no —— 禁止 Cloudflare Tunnel / nginx 等中间层缓冲 SSE（否则 token 不实时、表现为「卡成一坨」）。
    * heartbeat —— 真正逐 token 流式的分支传 true（默认）；已 buffer 完一次性 replay 的分支传 false（无 idle 间隙）。
+   * heartbeatPayload —— 心跳载荷字符串。默认 ": hb\n\n"（SSE 注释行，OpenAI/Gemini SDK 丢弃）；
+   *   Claude path 传 Anthropic 原生 ping 事件（"event: ping\ndata: {...}\n\n"），Anthropic 客户端按规范识别并忽略。
+   *   两者都能让链路有字节流动，但选原生事件更稳——某些中间层（cloudflared）对「只有注释行」的流仍可能判定 idle。
    * 幂等性由调用点保证（如 handleClaudeStream 仅在 !headersSent 时调用），本方法不重复防护。
    */
-  private writeSseHead(res: http.ServerResponse, opts?: { heartbeat?: boolean }): void {
+  private writeSseHead(res: http.ServerResponse, opts?: { heartbeat?: boolean; heartbeatPayload?: string }): void {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no'
     })
-    if (opts?.heartbeat !== false) this.startSseHeartbeat(res)
+    if (opts?.heartbeat !== false) this.startSseHeartbeat(res, undefined, opts?.heartbeatPayload)
   }
 
   /**
    * SSE 心跳：流式响应在「上游长时间无输出」（如模型 thinking、工具循环间隙）时，链路上没有字节流动，
    * Cloudflare Tunnel / undici 等中间层会按 idle 超时（cloudflared 默认连接、undici bodyTimeout=300s）
-   * 主动关闭这条连接 → 客户端（Claude Code）看到 "socket connection closed unexpectedly"。
-   * 这里每 intervalMs 写一个 SSE 注释行（": hb\n\n"，SSE 规范允许、所有客户端忽略，不进入消息流），
-   * 保持链路有字节流动，避免被 idle 切断。与正常 content 写入互不干扰（注释行被客户端丢弃）。
+   * 主动关闭这条连接 → 客户端（Claude Code / Opencode）看到 "socket connection was closed unexpectedly"。
+   * 这里每 intervalMs 写一个心跳载荷，保持链路有字节流动，避免被 idle 切断。与正常 content 写入互不干扰
+   * （注释行/ping 事件都被客户端丢弃）。
+   *
+   * payload —— 默认 ": hb\n\n"（SSE 注释行）。Claude path 传 Anthropic 原生 "event: ping\ndata:{...}\n\n"。
+   * 关键设计（针对 thinking effort 高 + Cloudflare Tunnel 的 socket 早断）：
+   *   1. 立即先写一拍——不等满第一个 interval。thinking 在「首字节响应头之后、首个 content 之前」最易出现长静默，
+   *      若等 15s 才首拍，cloudflared 可能在首拍前就判 idle 切断。
+   *   2. interval 10s（旧 15s）——给中间层更短的 idle 阈值留足余量。
    * 自动停止：res 触发 finish/close、或已 writableEnded/destroyed 时清理 timer，绝不泄漏。
    * 返回一个手动 stop 函数（一般无需调用，依赖 finish/close 即可）。
    */
-  private startSseHeartbeat(res: http.ServerResponse, intervalMs = 15_000): () => void {
+  private startSseHeartbeat(res: http.ServerResponse, intervalMs = 10_000, payload = ': hb\n\n'): () => void {
     let timer: ReturnType<typeof setInterval> | null = null
     const stop = (): void => {
       if (timer) { clearInterval(timer); timer = null }
     }
-    timer = setInterval(() => {
-      if (res.writableEnded || res.destroyed) { stop(); return }
-      try { res.write(': hb\n\n') } catch { stop() }
-    }, intervalMs)
+    const beat = (): boolean => {
+      if (res.writableEnded || res.destroyed) { stop(); return false }
+      try { res.write(payload); return true } catch { stop(); return false }
+    }
+    // 立即先写一拍：覆盖「响应头已发、首个 content 未到」这段最长静默窗口（尤其 thinking effort 高时）。
+    if (!beat()) return stop
+    timer = setInterval(beat, intervalMs)
     // 心跳不应阻止进程退出
     timer.unref?.()
     res.once('close', stop)
@@ -5683,8 +5696,9 @@ export class ProxyServer {
     transientRetried: boolean = false
   ): Promise<void> {
     if (!headersSent) {
-      // 统一 SSE 头 + 心跳（auth 重试 headersSent=true 时不重复启动）
-      this.writeSseHead(res)
+      // 统一 SSE 头 + 心跳（auth 重试 headersSent=true 时不重复启动）。
+      // Claude path 用 Anthropic 原生 ping 事件做心跳——比裸注释行更稳，避免 cloudflared 对「仅注释行」的流判 idle。
+      this.writeSseHead(res, { heartbeatPayload: `event: ping\ndata: ${JSON.stringify(createClaudeStreamEvent('ping'))}\n\n` })
     }
 
     const id = msgId || `msg_${uuidv4()}`
@@ -6015,6 +6029,18 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           // mid-stream 报错但 Kiro 已计 credit（meteringEvent 先于断开）：结算已消耗用量，防漏计费
           if (partialUsage) this.settleAbortedUsage(matchedApiKey, account.id, partialUsage, model, '/v1/messages', effort, kiroPayload.conversationState.conversationId)
+          // 必须主动以 error 事件收尾并 res.end()——与 OpenAI(5304)/Gemini(4600) 的 onError 对齐，且与本函数
+          // 的 outer .catch(6025) 同构。否则（旧实现）此分支只 settle+resolve，既不发 message_stop 也不发 error，
+          // 让 SSE 连接半开悬挂（心跳继续写到 idle 超时）——客户端（Opencode/undici）最终看到的是
+          // "socket connection was closed unexpectedly" 而非一个明确的错误。sentRealContent=true 时无法透明重试
+          // （已发出内容无法回退），故这里的职责仅是「干净收尾」，让客户端立即拿到终止信号。
+          if (!this.isResponseClosed(res)) {
+            const errorEvent = createClaudeStreamEvent('error', {
+              error: { type: 'api_error', message: error.message }
+            })
+            res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+            res.end()
+          }
           resolve()
         },
         signal,

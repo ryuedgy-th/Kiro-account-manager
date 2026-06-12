@@ -222,6 +222,26 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
   return await undiciFetch(url, options as unknown as UndiciRequestInit) as unknown as Response
 }
 
+// 给一次幂等 GET/POST 套「调用方 signal + 超时」合成 signal：避免某条连接静默卡死时拖到 undici 默认
+// 的 300s（直连走全局 dispatcher，不受 systemProxy.POOL_OPTS.headersTimeout=90s 约束）。
+// 超时与调用方主动 abort 二者任一触发都会取消请求；返回 cleanup 供 finally 清掉定时器。
+function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController()
+  const onAbort = () => controller.abort(signal?.reason)
+  if (signal) {
+    if (signal.aborted) controller.abort(signal.reason)
+    else signal.addEventListener('abort', onAbort, { once: true })
+  }
+  const timer = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs)
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+}
+
 // Kiro API 端点配置
 // 端点字段：
 //   - regional: true  → url 含 {region} 占位符，按账号 region 替换（kiro.dev 新端点）
@@ -1614,12 +1634,15 @@ function throwIfAborted(signal?: AbortSignal): void {
  */
 export function isTransientNetworkError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
-  const codes = ['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT']
+  // 与 tokenRefresh.ts 的 isTransientRefreshError 口径对齐：含 undici 的 headers/body 超时
+  // （配合 systemProxy.POOL_OPTS.headersTimeout=90s，超时后归类为瞬时 → 允许连接阶段重试 / proxyServer
+  //  透明 stream 重试）。body 超时若发生在已写出内容之后，仍由 !sentRealContent 守卫拦截，不会重复计费/重复输出。
+  const codes = ['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']
   const cause = (error as { cause?: { code?: string; message?: string } }).cause
   const code = cause?.code
   if (code && codes.includes(code)) return true
   const hay = `${error.message} ${cause?.message || ''}`
-  return /other side closed|socket hang up|terminated|fetch failed|network|ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(hay)
+  return /other side closed|socket hang up|terminated|fetch failed|network|timeout|ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(hay)
 }
 
 // 调用 Kiro API（流式）
@@ -1845,6 +1868,11 @@ export async function callKiroApiStream(
   }
 }
 
+// 共享 TextDecoder：流式响应每个事件含多个 header + 1 个 payload，单条响应可达数千~数万个事件。
+// 旧实现每处 decode 都 new TextDecoder()（每次启动一个 ICU 转换器），在反代最热的函数上造成大量
+// 分配 + GC 压力。decode() 在不传 {stream:true} 时是无状态、可重入的，单例复用安全且输出逐字节一致。
+const SHARED_DECODER = new TextDecoder()
+
 // 从 headers 中提取 event type
 function extractEventType(headers: Uint8Array): string {
   let offset = 0
@@ -1853,18 +1881,18 @@ function extractEventType(headers: Uint8Array): string {
     const nameLen = headers[offset]
     offset++
     if (offset + nameLen > headers.length) break
-    const name = new TextDecoder().decode(headers.slice(offset, offset + nameLen))
+    const name = SHARED_DECODER.decode(headers.slice(offset, offset + nameLen))
     offset += nameLen
     if (offset >= headers.length) break
     const valueType = headers[offset]
     offset++
-    
+
     if (valueType === 7) { // String type
       if (offset + 2 > headers.length) break
       const valueLen = (headers[offset] << 8) | headers[offset + 1]
       offset += 2
       if (offset + valueLen > headers.length) break
-      const value = new TextDecoder().decode(headers.slice(offset, offset + valueLen))
+      const value = SHARED_DECODER.decode(headers.slice(offset, offset + valueLen))
       offset += valueLen
       if (name === ':event-type') {
         return value
@@ -2008,7 +2036,7 @@ async function parseEventStream(
           const payloadBytes = buffer.slice(payloadStart, payloadEnd)
           
           try {
-            const payloadText = new TextDecoder().decode(payloadBytes)
+            const payloadText = SHARED_DECODER.decode(payloadBytes)
             const event = JSON.parse(payloadText)
             
             // 根据 event type 处理不同类型的事件
@@ -2814,7 +2842,14 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
       throwIfAborted(signal)
-      const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
+      // 每页 GET 套 30s 超时（合并调用方 signal）：避免单条卡死的 socket 把模型发现拖到 undici 默认 300s。
+      const { signal: pageSignal, cleanup } = withTimeout(signal, 30_000)
+      let response: Response
+      try {
+        response = await fetchWithProxy(url, { method: 'GET', headers, signal: pageSignal }, account)
+      } finally {
+        cleanup()
+      }
       throwIfAborted(signal)
       
       if (!response.ok) {
@@ -2902,10 +2937,17 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   })
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
+    // 套 20s 超时：listAvailableSubscriptions 是幂等读，单条卡死的 socket 不应拖到 undici 默认 300s。
+    const { signal: subSignal, cleanup } = withTimeout(undefined, 20_000)
+    let response: Response
+    try {
+      response = await fetchWithProxy(url, { method: 'POST', headers, body, signal: subSignal }, account)
+    } finally {
+      cleanup()
+    }
     const responseText = await response.text()
     console.log(`[KiroAPI] ListAvailableSubscriptions → ${response.status}`, JSON.parse(responseText))
-    
+
     if (!response.ok) {
       return {}
     }

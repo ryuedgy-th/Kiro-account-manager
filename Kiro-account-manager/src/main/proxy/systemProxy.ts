@@ -25,11 +25,18 @@ const SYSTEM_PROXY_CACHE_TTL = 30_000 // 30秒缓存
 //                                （NAT/LB）按 idle 静默切断 → 客户端见 "other side closed/UND_ERR_SOCKET" 的概率。
 //   connect.keepAliveInitialDelay 首个探针延迟 10s（undici 默认 60s，常追不上更短的中间层 idle 阈值）。
 //                                探针在 kernel/socket 层，应用层（含 AWS 端）看不到此值，且 10s 属常见客户端范围，不构成异常指纹。
+//   headersTimeout      到「首字节响应头」的上限 90s（undici 默认 300s）。背景：若上游 accept 了连接却
+//                                在发响应头前静默卡死（后端过载、TCP keepalive 没探到的半开链路），请求会整整挂
+//                                300s 才报 UND_ERR_HEADERS_TIMEOUT——对交互式客户端（Claude Code/Cursor）等于冻结 5 分钟。
+//                                90s 远高于正常 Kiro TTFB，能快速失败让 failover/重试接手。仅收紧「响应头」阶段。
+//   bodyTimeout         保持 undici 默认 300s：模型 extended-thinking / 工具循环间隙可能长时间无字节，
+//                                收紧 bodyTimeout 会误杀合法的长思考流（风险不对称，故只动 headersTimeout）。
 const POOL_OPTS = {
   keepAliveTimeout: 30_000,
   keepAliveMaxTimeout: 600_000,
   connections: 64,
   pipelining: 1,
+  headersTimeout: 90_000,
   connect: { keepAlive: true, keepAliveInitialDelay: 10_000 }
 } as const
 

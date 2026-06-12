@@ -3590,6 +3590,10 @@ app.whenReady().then(async () => {
       
       await Promise.allSettled(
         batch.map(async (account) => {
+          // 首次尝试加 0-300ms 随机错峰：同一 slice 内最多 concurrency 个账号原本会同刻发起 TLS 握手，
+          // 这种「同步连接 burst」正是 UND_ERR_SOCKET/ECONNRESET 的触发源（withRefreshRetry 只在重试时
+          // 抖动，首次不抖）。错峰从源头减少自伤式失败，也让出站流量不那么周期性 burst（利于反检测）。
+          await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 300)))
           try {
             const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
             const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
@@ -3948,6 +3952,8 @@ app.whenReady().then(async () => {
       
       await Promise.allSettled(
         batch.map(async (account) => {
+          // 首次尝试加 0-300ms 随机错峰，理由同刷新批次：分散同步连接 burst，减少 UND_ERR_SOCKET。
+          await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 300)))
           try {
             const { accessToken, authMethod, provider } = account.credentials
             
